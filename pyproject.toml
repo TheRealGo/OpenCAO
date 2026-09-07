@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cao-a2a-control-plane"
+version = "1.0.0"
+description = "OpenCAO: open-source agent supervision for macOS and Codex"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "TheRealGo" }]
+keywords = ["mcp", "a2a", "agents", "orchestration", "control-plane"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+  "pydantic>=2.9,<3",
+  "httpx>=0.27,<1",
+  "cryptography>=43,<50",
+  "PyJWT[crypto]>=2.10,<3",
+  "jsonschema>=4.23,<5",
+]
+
+[project.urls]
+Repository = "https://github.com/TheRealGo/OpenCAO"
+Issues = "https://github.com/TheRealGo/OpenCAO/issues"
+
+[project.optional-dependencies]
+dev = [
+  "mcp-types==2.1.0",
+  "httpx2>=2.12,<3",
+  "pytest>=8,<10",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.9,<1",
+  "mypy>=1.14,<2",
+  "types-jsonschema>=4.23,<5",
+  "build>=1.2,<2",
+]
+
+[project.scripts]
+cao-a2a = "cao_control_plane.cli:main"
+cao-dashboard = "cao_control_plane.dashboard_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/cao_control_plane/api.py" = ["B008"] # FastAPI dependency injection uses Depends in signatures.
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+packages = ["cao_control_plane"]
+
+[tool.setuptools.package-data]
+cao_control_plane = ["py.typed", "static/*.css", "static/*.html", "static/*.js"]

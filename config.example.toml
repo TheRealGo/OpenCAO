@@ -1,0 +1,88 @@
+[server]
+state_dir = "~/.local/state/cao-a2a"
+host = "127.0.0.1"
+port = 8768
+public_base_url = "http://127.0.0.1:8768"
+server_name = "CAO A2A Control Plane"
+enable_api_docs = false
+enable_dashboard = false
+max_request_bytes = 2097152
+
+[dashboard]
+# Dashboard access is a read-only projection and never a prerequisite for CAO
+# attachment or Worker supervision. This probe performs no browser or service
+# lifecycle effects. The credential remains in the checked 0600 file.
+enable_dashboard_access_probe = false
+# dashboard_credentials_file = "/absolute/owner-private/dashboard-credentials.json"
+# dashboard_bootstrap_record_dir = "/absolute/owner-private/dashboard-bootstrap"
+# dashboard_session_record_dir = "/absolute/owner-private/dashboard-sessions"
+dashboard_edge_base_url = "http://127.0.0.1:8769"
+dashboard_access_timeout_seconds = 10.0
+
+[security]
+trusted_hosts = ["127.0.0.1", "localhost", "[::1]"]
+allowed_origins = [
+  "http://127.0.0.1:8768",
+  "http://localhost:8768",
+]
+allow_remote_bind = false
+allow_insecure_remote_http = false
+allow_remote_callbacks = false
+
+[protocols]
+enable_a2a = true
+enable_a2a_push = true
+require_a2a_version = false
+mcp_private_cache_ttl_ms = 1000
+mcp_discovery_cache_ttl_ms = 60000
+sse_heartbeat_seconds = 15.0
+a2a_blocking_timeout_seconds = 300.0
+
+[runtime]
+# Short MCP/app-server startup boundary. This is not a Worker task deadline.
+runtime_mcp_startup_timeout_seconds = 30.0
+# A managed Worker may run longer while authenticated heartbeats or durable
+# milestone reports remain fresh.
+worker_inactivity_timeout_seconds = 900.0
+# Optional operator-owned emergency ceiling (1 second to 7 days). Omit for no
+# managed Worker wall-clock ceiling; task/Worker metadata cannot override it.
+# managed_worker_hard_timeout_seconds = 86400.0
+# Deadline for non-managed commands and short CAO wake turns.
+runtime_timeout_seconds = 120.0
+callback_timeout_seconds = 10.0
+# Bounded cross-process SQLite and lease-expiry recovery deadline. Normal
+# in-process commits wake the Dispatcher immediately; this is not polling.
+dispatcher_recovery_scan_seconds = 30.0
+dispatcher_lease_seconds = 30.0
+dispatcher_concurrency = 4
+max_dispatch_attempts = 5
+provider_rate_limit_cooldown_seconds = 300
+max_runtime_output_bytes = 262144
+cao_conversation_credential_ttl_seconds = 86400
+# Used only by the local stdio bridge to create/renew its one fixed CAO
+# attachment; this is not the CAO administrator bearer.
+cao_attachment_bootstrap_credential_ttl_seconds = 86400
+# Reject new Work without an exact existing CAO conversation attachment.
+# Historical unbound rows remain audit evidence and are never routed.
+require_cao_attachment_for_work = true
+
+# This is the complete server-owned managed Worker profile catalog. A custom
+# catalog replaces the built-in defaults; every model and effort remains an
+# explicit allow-list entry. Profiles never carry commands, paths, tokens, or
+# other launch metadata.
+[runtime.managed_worker_profiles.codex]
+adapter = "codex-app-server"
+models = ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5", "gpt-5.1", "gpt-5.2"]
+reasoning_efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+[runtime.managed_worker_profiles.claude]
+adapter = "claude"
+models = ["opus", "fable", "sonnet", "claude-fable-5"]
+reasoning_efforts = ["low", "medium", "high", "xhigh", "max"]
+
+[retention]
+event_retention_days = 30
+message_retention_days = 90
+
+[metadata]
+environment = "local"

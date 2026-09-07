@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "cao-conversation": {
+      "type": "stdio",
+      "command": "cao-a2a",
+      "args": ["mcp-stdio"],
+      "connectionTimeout": 10000,
+      "requestTimeout": 10000
+    },
+    "cao-shared-operator": {
+      "type": "stdio",
+      "command": "cao-a2a",
+      "args": ["mcp-stdio", "--operator"],
+      "connectionTimeout": 10000,
+      "requestTimeout": 10000
+    }
+  }
+}

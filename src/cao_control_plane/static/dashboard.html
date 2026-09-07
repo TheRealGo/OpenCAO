@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>OpenCAO ダッシュボード</title>
+    <link rel="stylesheet" href="/dashboard/static/dashboard.css">
+    <script src="/dashboard/static/dashboard.js" defer></script>
+  </head>
+  <body>
+    <main id="dashboard" aria-busy="true">
+      <header class="page-header">
+        <p class="eyebrow">OpenCAO</p>
+        <h1>OpenCAO ダッシュボード</h1>
+        <p id="connection" role="status" aria-live="polite">接続中…</p>
+      </header>
+      <section id="bootstrap" hidden aria-labelledby="bootstrap-title">
+        <h2 id="bootstrap-title">ダッシュボードへのアクセスが必要です</h2>
+        <p>Codexアプリから一回限りのアクセスリンクを開いてください。</p>
+      </section>
+      <section id="current-workers" hidden aria-labelledby="current-workers-title">
+        <div class="section-heading">
+          <h2 id="current-workers-title">現在の本番Worker</h2>
+          <p>いま進んでいる作業と、次に必要な対応。</p>
+        </div>
+        <section id="cao-processing-section" class="worker-group processing" hidden
+                 aria-labelledby="cao-processing-title">
+          <h3 id="cao-processing-title">CAOが処理中</h3>
+          <p class="group-description">CAOが自動で起動し、確認または判断を進めています。</p>
+          <ul id="cao-processing"></ul>
+        </section>
+        <section id="user-confirmation-section" class="worker-group confirmation" hidden
+                 aria-labelledby="user-confirmation-title">
+          <h3 id="user-confirmation-title">あなたの確認待ち</h3>
+          <ul id="user-confirmation"></ul>
+        </section>
+        <section id="stopped-or-failed-section" class="worker-group attention" hidden
+                 aria-labelledby="stopped-or-failed-title">
+          <h3 id="stopped-or-failed-title">停止・異常</h3>
+          <ul id="stopped-or-failed"></ul>
+        </section>
+        <section id="working-section" class="worker-group" hidden
+                 aria-labelledby="working-title">
+          <h3 id="working-title">Worker作業中</h3>
+          <ul id="working"></ul>
+        </section>
+        <section id="ready-section" class="worker-group" hidden
+                 aria-labelledby="ready-title">
+          <h3 id="ready-title">待機・再開可能</h3>
+          <ul id="ready"></ul>
+        </section>
+        <p id="empty-current" class="empty-state" hidden>
+          現在稼働中の本番Workerはありません
+        </p>
+      </section>
+      <section id="recently-completed-section" class="history-panel" hidden
+               aria-labelledby="recently-completed-title">
+        <div class="history-heading">
+          <div>
+            <h2 id="recently-completed-title">作業の履歴</h2>
+            <p>完了した作業も、指示・報告・レビューまで遡れます。</p>
+          </div>
+          <button id="history-refresh" type="button" hidden>履歴を更新</button>
+        </div>
+        <p id="history-status" class="reading-meta" role="status"></p>
+        <div class="history-layout">
+          <nav class="history-index" aria-label="作業を選択">
+            <label for="history-search">読み込んだ履歴を絞り込む</label>
+            <input id="history-search" type="search" placeholder="作業名・Worker名で絞り込み" autocomplete="off">
+            <p id="history-count" class="reading-meta"></p>
+            <ul id="recently-completed"></ul>
+            <p id="history-empty" class="reading-meta" hidden>該当する作業はありません。</p>
+            <button id="history-more" type="button" hidden>以前の作業を読み込む</button>
+          </nav>
+          <section id="work-reader" class="work-reader" tabindex="0" aria-label="選択した作業とやり取り">
+            <div class="reader-toolbar">
+              <p id="reader-status" class="reading-meta" role="status">作業を選ぶと記録を表示します。</p>
+              <button id="reader-older" type="button" hidden>以前のやり取りを読み込む</button>
+            </div>
+            <div id="reader-content"></div>
+          </section>
+        </div>
+      </section>
+      <details id="inactive-section" class="history-panel" hidden>
+        <summary>停止済み・移行Worker</summary>
+        <p>過去に接続した本番Workerの履歴です。</p>
+        <ul id="inactive-workers"></ul>
+      </details>
+      <details id="runtime-section" class="technical-panel" hidden>
+        <summary>技術状態</summary>
+        <dl id="runtime-summary"></dl>
+      </details>
+      <details id="history-section" class="technical-panel" hidden>
+        <summary>最近の変更</summary>
+        <ol id="history"></ol>
+      </details>
+    </main>
+  </body>
+</html>
