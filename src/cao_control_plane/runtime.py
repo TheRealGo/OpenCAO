@@ -2440,6 +2440,39 @@ def _managed_codex_notification_matches_turn(
     )
 
 
+async def read_cao_project_identity(settings: Settings, native_thread_id: str) -> str:
+    """Read the authoritative native workspace once for legacy scope migration.
+
+    This never resumes a thread or submits a model turn. The locator remains
+    within the owner edge and only its persistent identity leaves this call.
+    """
+    from .directory_identity import directory_identity
+
+    timeout = settings.runtime_mcp_startup_timeout_seconds
+    rpc = await _JsonRpcDesktopSocket.connect(_CODEX_DESKTOP_CONTROL_SOCKET, timeout=timeout)
+    try:
+        await rpc.request(
+            "initialize",
+            {"clientInfo": {"name": "cao-a2a-control-plane", "version": settings.server_version},
+             "capabilities": {"experimentalApi": True}},
+            timeout=timeout, timeout_error="project_identity_unavailable",
+        )
+        await rpc.send({"method": "initialized", "params": {}})
+        _, result = await rpc.request(
+            "thread/read", {"threadId": native_thread_id, "includeTurns": False},
+            timeout=timeout, timeout_error="project_identity_unavailable",
+        )
+        thread = result.get("thread")
+        if not isinstance(thread, Mapping) or thread.get("id") != native_thread_id:
+            raise RuntimeAdapterError("project_identity_unavailable")
+        cwd = thread.get("cwd")
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise RuntimeAdapterError("project_identity_unavailable")
+        return directory_identity(Path(cwd))
+    finally:
+        await rpc.close()
+
+
 class CodexAppServerAdapter(RuntimeAdapter):
     name = "codex-app-server"
 

@@ -161,9 +161,10 @@ fixed marker without editing files or using external services. Verify that the
 result appears in the conversation and Dashboard. A queued instruction or a
 Worker completion claim alone is not evidence of accepted completion.
 
-Codex model access belongs to your account. The default profile includes
-`gpt-5.6-terra`; select a supported model from your configured profile when
-needed. See [managed Worker provisioning](docs/managed-worker-provisioning.md)
+Model access belongs to your Codex or Claude account. Pass an exact provider
+model ID or alias when creating a Worker; no CAO model registration is required.
+If omitted, CAO uses the runner's `default_model` (`gpt-5.6-terra` for Codex).
+See [managed Worker provisioning](docs/managed-worker-provisioning.md)
 for profile and lifecycle details. Administrative `agent create`, `runtime
 register`, and `work assign` commands are advanced interfaces; ordinary Work
 uses the attached conversation route above.

@@ -40,6 +40,7 @@ from .goal_packets import (
     goal_packet_digest,
     task_packet_digest,
 )
+from .provider_models import model_identifier
 from .security import canonical_json, matches, redact_control_plane_secrets
 from .supervision_control import pause_view_tx
 
@@ -81,7 +82,6 @@ _OPERATOR_INTERNAL_ID = re.compile(
     r"(?i)\b(?:native[ _-]?(?:thread|session)|thread|session|runtime|work(?:[ _-]?item)?|"
     r"attempt|review|principal|database|db)[ _-]?id\s*[:=#]\s*[A-Za-z0-9._-]+"
 )
-_OPERATOR_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPERATOR_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -1143,7 +1143,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                ) AS managed_spec_scoped_count,
                (
@@ -1154,7 +1154,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                    LIMIT 1
                ) AS managed_spec_adapter,
@@ -1166,7 +1166,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                    LIMIT 1
                ) AS managed_spec_requested_model,
@@ -1178,7 +1178,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                    LIMIT 1
                ) AS managed_spec_effective_model,
@@ -1190,7 +1190,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                    LIMIT 1
                ) AS managed_spec_requested_reasoning_effort,
@@ -1202,7 +1202,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                    LIMIT 1
                ) AS managed_spec_effective_reasoning_effort,
@@ -1214,7 +1214,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                    LIMIT 1
                ) AS managed_spec_state,
@@ -1232,7 +1232,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                    LIMIT 1
                ) AS provider_condition,
@@ -1247,7 +1247,7 @@ def _work_items_projection(
                    WHERE scoped_spec.principal_id = a.worker_id
                      AND scoped_spec.runtime_session_id = a.runtime_session_id
                      AND scoped_attachment.principal_id = work_attachment.principal_id
-                     AND scoped_attachment.project_digest = work_attachment.project_digest
+                     AND scoped_attachment.project_scope_digest = work_attachment.project_scope_digest
                      AND scoped_spec.attachment_generation <= scoped_attachment.generation
                    LIMIT 1
                ) AS provider_retry_after_at,
@@ -2335,7 +2335,7 @@ def _operator_adapter(value: object) -> str | None:
 def _operator_model(value: object) -> str | None:
     """Allow only the bounded model identifier contract, never free text."""
 
-    return value if isinstance(value, str) and _OPERATOR_MODEL.fullmatch(value) else None
+    return model_identifier(value)
 
 
 def _managed_runner_projection(row: sqlite3.Row) -> dict[str, str | None]:
@@ -3560,7 +3560,9 @@ def _packet_violations(
                successor.supervisor_attachment_id AS successor_attachment_id,
                successor_attachment.generation AS successor_attachment_generation,
                prior_attachment.project_digest AS prior_project_digest,
+               prior_attachment.project_scope_digest AS prior_project_scope,
                successor_attachment.project_digest AS successor_project_digest,
+               successor_attachment.project_scope_digest AS successor_project_scope,
                prior_goal.packet_json AS prior_packet_json,
                successor_goal.packet_json AS successor_packet_json,
                successor_goal.source_intent_id AS successor_source_intent_id,
@@ -3911,8 +3913,8 @@ def _packet_violations(
              SELECT 1 FROM cao_session_attachments AS successor_spec_attachment
              WHERE successor_spec_attachment.id = successor_spec.attachment_id
                AND successor_spec_attachment.principal_id = successor.supervisor_id
-               AND successor_spec_attachment.project_digest =
-                   successor_attachment.project_digest
+               AND successor_spec_attachment.project_scope_digest =
+                   successor_attachment.project_scope_digest
          )
         LEFT JOIN runtime_sessions AS prior_runtime
           ON prior_runtime.id = prior_spec.runtime_session_id
@@ -4376,7 +4378,7 @@ def _packet_violations(
             )
             and row["prior_supervisor_id"] == row["successor_supervisor_id"]
             and row["prior_requester_id"] == row["successor_requester_id"]
-            and row["prior_project_digest"] == row["successor_project_digest"]
+            and row["prior_project_scope"] == row["successor_project_scope"]
             and row["prior_target_id"] == row["successor_target_id"]
             and row["prior_workspace_ref"] == row["successor_workspace_ref"]
             and row["prior_provider_scope"] == row["successor_provider_scope"]
@@ -4903,7 +4905,7 @@ def _provider_closed_source_takeover_sequence(
         JOIN cao_session_attachments AS candidate_attachment
           ON candidate_attachment.id = ?
          AND candidate_attachment.principal_id = source_attachment.principal_id
-         AND candidate_attachment.project_digest = source_attachment.project_digest
+         AND candidate_attachment.project_scope_digest = source_attachment.project_scope_digest
          AND candidate_attachment.state = 'active'
          AND candidate_attachment.lease_expires_at > ?
         JOIN runtime_sessions AS candidate_runtime
@@ -5422,7 +5424,7 @@ def _provider_runtime_circuit_violations(
                    spec.attachment_generation, spec.catalog_target_id,
                    spec.workspace_ref,
                    attachment.principal_id AS attachment_principal_id,
-                   attachment.project_digest, attachment.generation,
+                   attachment.project_scope_digest AS project_digest, attachment.generation,
                    attachment.state AS attachment_state,
                    runtime.principal_id AS runtime_principal_id,
                    cao_runtime.state AS cao_runtime_state
@@ -5507,7 +5509,7 @@ def _provider_runtime_circuit_violations(
                    enrollment.state AS enrollment_state,
                    work.assigned_worker_id, work.supervisor_id,
                    work.supervisor_attachment_id,
-                   supervisor_attachment.project_digest AS supervisor_project_digest,
+                   supervisor_attachment.project_scope_digest AS supervisor_project_digest,
                    supervisor_attachment.generation AS supervisor_attachment_generation,
                    supervisor_attachment.state AS supervisor_attachment_state,
                    supervisor_attachment.lease_expires_at AS supervisor_attachment_lease_expires_at,
@@ -5575,7 +5577,7 @@ def _provider_runtime_circuit_violations(
                    runtime.principal_id AS runtime_principal_id,
                    enrollment.principal_id AS enrollment_principal_id,
                    attachment.principal_id AS attachment_principal_id,
-                   attachment.project_digest,
+                   attachment.project_scope_digest AS project_digest,
                    attachment.generation AS current_attachment_generation,
                    attachment.state AS attachment_state,
                    attachment.lease_expires_at AS attachment_lease_expires_at

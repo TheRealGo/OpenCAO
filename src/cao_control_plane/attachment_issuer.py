@@ -20,7 +20,7 @@ import json
 import os
 import socket
 import stat
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
 
@@ -217,10 +217,12 @@ class AttachmentCapabilityIssuer:
         issue: AttachmentBootstrapIssuer,
         *,
         peer_identity_provider: AttachmentPeerIdentityProvider | None = None,
+        prepare_project: Callable[[str, str, str, int], Awaitable[None]] | None = None,
     ) -> None:
         self.path = attachment_issuer_path(state_dir)
         self._issue = issue
         self._peer_identity_provider = peer_identity_provider
+        self._prepare_project = prepare_project
         self._server: asyncio.AbstractServer | None = None
         self._owns_socket = False
 
@@ -308,6 +310,10 @@ class AttachmentCapabilityIssuer:
                 await _write_issuer_failure(writer, "catalog_refresh", retryable=False)
                 return
             try:
+                if self._prepare_project is not None:
+                    await self._prepare_project(
+                        native_thread_id, project_digest, proxy_catalog_digest, proxy_abi_version
+                    )
                 token = self._issue(
                     identity,
                     native_thread_id,
@@ -317,6 +323,9 @@ class AttachmentCapabilityIssuer:
                 )
             except AttachmentCatalogRefreshRequired:
                 await _write_issuer_failure(writer, "catalog_refresh", retryable=False)
+                return
+            except AttachmentIssuerError:
+                await _write_issuer_failure(writer, "context_invalid", retryable=False)
                 return
             writer.write(json.dumps({"token": token}, separators=(",", ":")).encode() + b"\n")
             await writer.drain()

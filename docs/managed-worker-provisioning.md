@@ -31,11 +31,22 @@ or owner policy may reject the concrete launch, but no saved Worker name,
 Directory match, prior Work, runtime, or native session is used to choose or
 veto the lifecycle operation.
 
-The server-owned runner profile validates model and reasoning effort. Omitted
-values use the current server default. Omitted display names use the bounded
-`Codex Worker` or `Claude Worker` label and never leak the Directory basename.
-The result exposes only the opaque Worker identifier, lifecycle state,
-generation, and safe labels.
+Model selection belongs to the selected provider. An explicit model ID or
+alias passes unchanged through New, the sealed Worker specification, and the
+[Codex App Server](https://developers.openai.com/codex/app-server) `model` field
+or [Claude Code](https://code.claude.com/docs/en/model-config) `--model` argument. CAO checks
+only the bounded selector format; it does not maintain a model allowlist or
+reject a selector because a discovery list omits it. New provider models need
+no CAO registration or release. Provider availability, account access, and
+model-specific capability errors remain provider outcomes; CAO never replaces
+an explicitly selected model to recover from a rejection.
+
+Runner profiles select the adapter, permitted reasoning efforts, and
+`default_model` used only when model is omitted. A legacy `models` array loads
+its first entry as that default; its remaining entries do not restrict model
+selection. Omitted display names use the bounded `Codex Worker` or
+`Claude Worker` label and never leak the Directory basename. The result exposes
+only the opaque Worker identifier, lifecycle state, generation, and safe labels.
 
 ## Instruction
 

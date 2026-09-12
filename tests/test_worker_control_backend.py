@@ -213,6 +213,42 @@ def test_minimal_new_creates_only_empty_worker_lineage(
     assert directory.name not in created["name"]
 
 
+@pytest.mark.parametrize(
+    ("runner", "model"),
+    [
+        ("codex", "provider-next-release"),
+        ("codex", "organization/model:release"),
+        ("claude", "claude-next-release"),
+        ("claude", "opus[1m]"),
+        ("claude", "provider.model@release"),
+    ],
+)
+def test_new_preserves_provider_model_without_registration(
+    system: dict[str, Any], tmp_path: Path, runner: str, model: str
+) -> None:
+    service = system["service"]
+    actor = _attached(service, system["cao"], suffix="provider-model")
+    before = _counts(service, _TASK_TABLES)
+    directory = tmp_path / "workspace"
+    directory.mkdir()
+    created = service.new_worker_thread(
+        actor,
+        NewWorkerThreadInput(
+            working_directory=str(directory),
+            runner=runner,
+            model=model,
+            reasoning_effort="xhigh",
+            idempotency_key="provider-model",
+        ),
+    )
+    _, spec, _ = _thread_rows(service, created["worker_thread_id"])
+    assert spec["requested_model"] == spec["effective_model"] == model
+    assert spec["effective_reasoning_effort"] == "xhigh"
+    assert _counts(service, _TASK_TABLES) == before
+    listed = service.list_managed_workers(actor)
+    assert listed[0]["effective_model"] == model
+
+
 def test_minimal_instruction_commits_one_unset_v1_assignment(
     system: dict[str, Any], tmp_path: Path
 ) -> None:

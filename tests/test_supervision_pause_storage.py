@@ -130,7 +130,7 @@ def _resume(system: dict[str, Any], paused: dict[str, Any]) -> dict[str, Any]:
 
 def test_pause_schema_is_typed_without_automatic_decision_fields(system) -> None:
     database = system["service"].db
-    assert database.fetchone("PRAGMA user_version")[0] == 44
+    assert database.fetchone("PRAGMA user_version")[0] == 45
     columns = {row["name"] for row in database.fetchall("PRAGMA table_info(boundary_dispositions)")}
     assert not columns.intersection(
         {"requested_kind", "continuation_fingerprint", "unchanged_count"}

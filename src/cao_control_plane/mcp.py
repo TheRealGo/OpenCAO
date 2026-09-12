@@ -12,6 +12,7 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import Any, Protocol, TypeGuard
 from urllib.parse import urlsplit, urlunsplit
 
@@ -29,6 +30,7 @@ from .connection_contract import CAO_CONVERSATION_PROXY_ABI_VERSION
 from .dashboard import DashboardReadModel
 from .dashboard_access import DashboardAccessResult
 from .dashboard_presentation import native_dashboard_snapshot
+from .directory_identity import directory_identity
 from .errors import ControlPlaneError, ValidationError
 from .models import (
     AckInput,
@@ -71,6 +73,7 @@ from .models import (
     WorkResumeInput,
 )
 from .projection import sanitize_operator_text
+from .provider_models import model_identifier
 from .release_identity import catalog_digest
 from .runtime_enrollment import (
     EnrollmentCapabilityError,
@@ -191,6 +194,7 @@ class AttachedCAOConversation:
     connection_id: str | None = None
     connection_generation: int | None = None
     peer_binding_digest: str | None = None
+    project_identity_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,12 +245,9 @@ def cao_conversation_context_for_thread(thread_id: str) -> CAOConversationContex
     if not thread_id:
         raise ValidationError("current Codex thread identity is invalid")
     try:
-        workspace = os.stat(".")
-    except OSError as error:
+        project_digest = directory_identity(Path.cwd())
+    except (OSError, RuntimeError, ValueError) as error:
         raise ValidationError("current project identity is unavailable") from error
-    project_digest = hashlib.sha256(
-        f"cao-project-inode-v1\0{workspace.st_dev}\0{workspace.st_ino}".encode()
-    ).hexdigest()
     return CAOConversationContext(
         native_thread_id=thread_id,
         project_digest=project_digest,
@@ -339,9 +340,9 @@ def _new_worker_thread_schema() -> dict[str, Any]:
             },
             "model": _string(
                 description=(
-                    "Optional exact model requested by the user. Omit this field when "
-                    "the user did not select a model; the Control Plane uses the first "
-                    "model in the selected runner's configured profile."
+                    "Optional exact provider model ID or alias requested by the user. "
+                    "It is passed unchanged to the selected runner and needs no CAO "
+                    "registration. Omit it to use the runner's configured default model."
                 )
             ),
             "reasoning_effort": _string(
@@ -1589,7 +1590,7 @@ def _conversation_managed_worker_projection(value: Mapping[str, Any]) -> dict[st
     result: dict[str, Any] = {
         "name": sanitize_operator_text(value.get("operator_label")) or "",
         "runner": runner,
-        "model": sanitize_operator_text(value.get("effective_model")) or "",
+        "model": model_identifier(value.get("effective_model")) or "",
         "reasoning_effort": sanitize_operator_text(value.get("effective_reasoning_effort")) or "",
         "state": state,
     }
@@ -3835,10 +3836,6 @@ class MCPServer:
             except ControlPlaneError as error:
                 reason_code = str((error.details or {}).get("reason_code") or "")
                 invalid_messages = {
-                    "worker_model_not_allowed": (
-                        "new Worker model is unavailable for the selected runner; "
-                        "omit model to use the configured default"
-                    ),
                     "worker_reasoning_effort_not_allowed": (
                         "new Worker reasoning effort is unavailable for the selected runner"
                     ),
@@ -4314,6 +4311,7 @@ def _attached_cao_conversation(value: Mapping[str, Any]) -> AttachedCAOConversat
     attachment_id = value.get("id")
     native_thread_id = value.get("native_thread_id")
     project_digest = value.get("project_digest")
+    project_identity_digest = value.get("project_identity_digest", project_digest)
     context_bearer = value.get("context_token")
     generation = value.get("generation")
     connection_id = value.get("connection_id")
@@ -4326,6 +4324,8 @@ def _attached_cao_conversation(value: Mapping[str, Any]) -> AttachedCAOConversat
         or not native_thread_id
         or not isinstance(project_digest, str)
         or len(project_digest) != 64
+        or not isinstance(project_identity_digest, str)
+        or len(project_identity_digest) != 64
         or not isinstance(context_bearer, str)
         or not context_bearer.startswith("cao.csc_")
         or (
@@ -4364,6 +4364,7 @@ def _attached_cao_conversation(value: Mapping[str, Any]) -> AttachedCAOConversat
         connection_id=connection_id,
         connection_generation=connection_generation,
         peer_binding_digest=peer_binding_digest,
+        project_identity_digest=project_identity_digest,
     )
 
 
@@ -4424,7 +4425,7 @@ async def _attach_cao_conversation_over_http(
     attached = _attached_cao_conversation(value)
     if (
         attached.native_thread_id != context.native_thread_id
-        or attached.project_digest != context.project_digest
+        or (attached.project_identity_digest or attached.project_digest) != context.project_digest
     ):
         raise ValidationError("CAO conversation attachment identity mismatch")
     return attached
@@ -4785,7 +4786,7 @@ def _validate_attached_start_request(
         )
     if (
         context.native_thread_id != attachment.native_thread_id
-        or context.project_digest != attachment.project_digest
+        or context.project_digest != (attachment.project_identity_digest or attachment.project_digest)
     ):
         return _pending_bridge_error(
             request.get("id"),
@@ -5491,7 +5492,8 @@ async def serve_stdio_proxy(
                                                         prior_attachment.native_thread_id
                                                     ),
                                                     project_digest=(
-                                                        prior_attachment.project_digest
+                                                        prior_attachment.project_identity_digest
+                                                        or prior_attachment.project_digest
                                                     ),
                                                 ),
                                                 request=request,

@@ -1696,7 +1696,7 @@ class ControlPlane:
             JOIN cao_session_attachments AS candidate_attachment
               ON candidate_attachment.id = ?
              AND candidate_attachment.principal_id = source_attachment.principal_id
-             AND candidate_attachment.project_digest = source_attachment.project_digest
+             AND candidate_attachment.project_scope_digest = source_attachment.project_scope_digest
              AND candidate_attachment.state = 'active'
             WHERE source_work.id = ?
             """,
@@ -1863,14 +1863,13 @@ class ControlPlane:
         model: str | None,
         reasoning_effort: ManagedWorkerReasoningEffort | None,
     ) -> tuple[ManagedWorkerProfile, str, ManagedWorkerReasoningEffort]:
-        """Resolve optional public launch fields to one server-owned profile."""
+        """Choose runner policy; the provider owns explicit model selection."""
 
         adapter = "codex-app-server" if runner == "codex" else "claude"
         profiles = [
             profile
             for profile in self.settings.managed_worker_profiles
             if profile.adapter == adapter
-            and (model is None or model in profile.models)
             and (reasoning_effort is None or reasoning_effort in profile.reasoning_efforts)
         ]
         preferred = [profile for profile in profiles if profile.profile_id == runner]
@@ -1884,7 +1883,7 @@ class ControlPlane:
                 reason_code="worker_launch_profile_not_allowed",
                 runner=runner,
             )
-        resolved_model = model or profile.models[0]
+        resolved_model = model if model is not None else profile.default_model
         resolved_effort = cast(
             ManagedWorkerReasoningEffort,
             reasoning_effort
@@ -2049,8 +2048,6 @@ class ControlPlane:
         profile = self.settings.managed_worker_profile(request.worker_profile_id)
         if profile is None or profile.adapter != request.adapter:
             raise ValidationError("managed Worker profile does not permit this adapter")
-        if request.model not in profile.models:
-            raise ValidationError("managed Worker profile does not permit this model")
         if request.reasoning_effort not in profile.reasoning_efforts:
             raise ValidationError("managed Worker profile does not permit this reasoning effort")
 
@@ -2299,7 +2296,7 @@ class ControlPlane:
         now = utc_now()
         current_attachment = connection.execute(
             """
-            SELECT attachment.id, attachment.principal_id, attachment.project_digest,
+            SELECT attachment.id, attachment.principal_id, attachment.project_digest, attachment.project_scope_digest,
                    attachment.generation, attachment.state
             FROM cao_session_attachments AS attachment
             WHERE attachment.id = ? AND attachment.principal_id = ?
@@ -2311,7 +2308,7 @@ class ControlPlane:
             return None
         source_attachment = connection.execute(
             """
-            SELECT attachment.id, attachment.principal_id, attachment.project_digest,
+            SELECT attachment.id, attachment.principal_id, attachment.project_digest, attachment.project_scope_digest,
                    attachment.runtime_session_id,
                    attachment.generation, attachment.state, attachment.updated_at,
                    runtime.state AS runtime_state,
@@ -2327,7 +2324,7 @@ class ControlPlane:
             source_attachment is None
             or str(source_attachment["id"]) == attachment_id
             or str(source_attachment["principal_id"]) != str(actor["id"])
-            or str(source_attachment["project_digest"]) != str(current_attachment["project_digest"])
+            or str(source_attachment["project_scope_digest"]) != str(current_attachment["project_scope_digest"])
             or str(source_attachment["state"]) not in {"failed", "revoked", "stale"}
             or str(source_attachment["runtime_state"])
             not in {
@@ -2700,7 +2697,7 @@ class ControlPlane:
             return None
         current_attachment = connection.execute(
             """
-            SELECT attachment.id, attachment.principal_id, attachment.project_digest,
+            SELECT attachment.id, attachment.principal_id, attachment.project_digest, attachment.project_scope_digest,
                    attachment.generation, attachment.state
             FROM cao_session_attachments AS attachment
             WHERE attachment.id = ? AND attachment.principal_id = ?
@@ -2710,7 +2707,7 @@ class ControlPlane:
         ).fetchone()
         source_attachment = connection.execute(
             """
-            SELECT attachment.id, attachment.principal_id, attachment.project_digest,
+            SELECT attachment.id, attachment.principal_id, attachment.project_digest, attachment.project_scope_digest,
                    attachment.runtime_session_id, attachment.generation,
                    attachment.state, attachment.updated_at,
                    runtime.state AS runtime_state,
@@ -2726,7 +2723,7 @@ class ControlPlane:
             current_attachment is None
             or source_attachment is None
             or str(source_attachment["principal_id"]) != str(actor["id"])
-            or str(source_attachment["project_digest"]) != str(current_attachment["project_digest"])
+            or str(source_attachment["project_scope_digest"]) != str(current_attachment["project_scope_digest"])
         ):
             return None
 
@@ -3338,7 +3335,7 @@ class ControlPlane:
             JOIN cao_session_attachments AS supervisor_attachment
               ON supervisor_attachment.id = ?
              AND supervisor_attachment.principal_id = attachment.principal_id
-             AND supervisor_attachment.project_digest = attachment.project_digest
+             AND supervisor_attachment.project_scope_digest = attachment.project_scope_digest
             WHERE thread.id = ? AND thread.generation = ?
               AND thread.state = 'active' AND spec.state = 'enabled'
               AND spec.principal_id = ?
@@ -3712,10 +3709,10 @@ class ControlPlane:
                 JOIN cao_session_attachments AS source_attachment
                   ON source_attachment.id = spec.attachment_id
                 WHERE source_attachment.principal_id = ?
-                  AND source_attachment.project_digest = ?
+                  AND source_attachment.project_scope_digest = (SELECT project_scope_digest FROM cao_session_attachments WHERE id = ?)
                 ORDER BY spec.created_at DESC, spec.id DESC
                 """,
-                (actor["id"], str(actor.get("_cao_project_digest") or "")),
+                (actor["id"], attachment_id),
             ).fetchall()
             return [self._managed_worker_spec_view_tx(connection, row) for row in rows]
 
@@ -3802,11 +3799,11 @@ class ControlPlane:
               ON current_attachment.id = ?
              AND current_attachment.principal_id = ?
              AND current_attachment.generation = ?
-             AND current_attachment.project_digest = source_attachment.project_digest
+             AND current_attachment.project_scope_digest = source_attachment.project_scope_digest
              AND current_attachment.state = 'active'
             WHERE thread.id = ?
               AND source_attachment.principal_id = ?
-              AND source_attachment.project_digest = ?
+              AND source_attachment.project_scope_digest = (SELECT project_scope_digest FROM cao_session_attachments WHERE id = ?)
             """,
             (
                 attachment_id,
@@ -3814,7 +3811,7 @@ class ControlPlane:
                 attachment_generation,
                 worker_thread_id,
                 actor["id"],
-                str(actor.get("_cao_project_digest") or ""),
+                attachment_id,
             ),
         ).fetchone()
         if row is None:
@@ -4740,6 +4737,7 @@ class ControlPlane:
                    source_attachment.generation AS source_attachment_generation,
                    source_attachment.native_thread_id AS source_native_thread_id,
                    source_attachment.project_digest AS source_project_digest,
+                   source_attachment.project_scope_digest AS source_project_scope,
                    worker_runtime.state AS worker_runtime_state,
                    enrollment.state AS enrollment_state
             FROM managed_worker_threads AS thread
@@ -4759,7 +4757,7 @@ class ControlPlane:
               ON current_attachment.id = ?
              AND current_attachment.principal_id = ?
              AND current_attachment.generation = ?
-             AND current_attachment.project_digest = source_attachment.project_digest
+             AND current_attachment.project_scope_digest = source_attachment.project_scope_digest
             WHERE thread.id = ?
               AND source_attachment.principal_id = ?
             """,
@@ -4886,7 +4884,8 @@ class ControlPlane:
                    work_attachment.principal_id AS work_attachment_principal_id,
                    work_attachment.generation AS work_attachment_generation,
                    work_attachment.native_thread_id AS work_native_thread_id,
-                   work_attachment.project_digest AS work_project_digest
+                   work_attachment.project_digest AS work_project_digest,
+                   work_attachment.project_scope_digest AS work_project_scope
             FROM work_items AS work
             LEFT JOIN goal_revisions AS goal
               ON goal.work_item_id = work.id AND goal.version = work.goal_version
@@ -4914,7 +4913,7 @@ class ControlPlane:
         if any(
             str(work["supervisor_id"] or "") != str(actor["id"])
             or str(work["work_attachment_principal_id"] or "") != str(actor["id"])
-            or str(work["work_project_digest"] or "") != str(row["source_project_digest"])
+            or str(work["work_project_scope"] or "") != str(row["source_project_scope"])
             for work in unsettled_work
         ):
             blocked("shared_worker_binding")
@@ -5787,7 +5786,7 @@ class ControlPlane:
             JOIN cao_session_attachments AS candidate_attachment
               ON candidate_attachment.id = ?
              AND candidate_attachment.principal_id = source_attachment.principal_id
-             AND candidate_attachment.project_digest = source_attachment.project_digest
+             AND candidate_attachment.project_scope_digest = source_attachment.project_scope_digest
              AND candidate_attachment.state = 'active'
              AND candidate_attachment.lease_expires_at > ?
             JOIN principals AS candidate_supervisor
@@ -6319,7 +6318,7 @@ class ControlPlane:
             JOIN cao_session_attachments AS candidate_attachment
               ON candidate_attachment.id = ?
              AND candidate_attachment.principal_id = source_attachment.principal_id
-             AND candidate_attachment.project_digest = source_attachment.project_digest
+             AND candidate_attachment.project_scope_digest = source_attachment.project_scope_digest
              AND candidate_attachment.state = 'active'
              AND candidate_attachment.lease_expires_at > ?
             JOIN runtime_sessions AS candidate_runtime
@@ -6893,7 +6892,7 @@ class ControlPlane:
             JOIN cao_session_attachments AS supervisor_attachment
               ON supervisor_attachment.id = work.supervisor_attachment_id
              AND supervisor_attachment.principal_id = work.supervisor_id
-             AND supervisor_attachment.project_digest = probe_attachment.project_digest
+             AND supervisor_attachment.project_scope_digest = probe_attachment.project_scope_digest
             JOIN managed_worker_specs AS source_spec
               ON source_spec.runtime_session_id = ?
               OR EXISTS (
@@ -6993,7 +6992,7 @@ class ControlPlane:
               AND probe_spec.provider_scope_digest = ?
               AND supervisor_attachment.state = 'active'
               AND supervisor_attachment.lease_expires_at > ?
-              AND probe_attachment.project_digest = source_attachment.project_digest
+              AND probe_attachment.project_scope_digest = source_attachment.project_scope_digest
               AND source_spec.catalog_target_id <> ''
               AND source_spec.principal_id = source_attempt.worker_id
               AND source_attempt.work_item_id = source_work.id
@@ -7396,7 +7395,7 @@ class ControlPlane:
                 JOIN cao_session_attachments AS supervisor_attachment
                   ON supervisor_attachment.id = work.supervisor_attachment_id
                  AND supervisor_attachment.principal_id = attachment.principal_id
-                 AND supervisor_attachment.project_digest = attachment.project_digest
+                 AND supervisor_attachment.project_scope_digest = attachment.project_scope_digest
                  AND supervisor_attachment.principal_id = work.supervisor_id
                 JOIN events AS boundary_event
                   ON boundary_event.event_type = 'boundary.recorded'
@@ -7590,6 +7589,57 @@ class ControlPlane:
             {"generation": generation, "connection_id": connection_id},
         )
         return {"context_token": credential, "context_credential_id": credential_id}
+
+    def legacy_project_observation(self, native_thread_id: str) -> dict[str, Any] | None:
+        """Read a bounded migration target; this is not attachment authority."""
+        row = self.db.fetchone(
+            "SELECT a.id, a.principal_id, a.native_thread_id, a.project_digest, a.generation "
+            "FROM cao_session_attachments a JOIN principals p ON p.id = a.principal_id "
+            "WHERE p.name = 'cao' AND p.role = 'cao' AND p.enabled = 1 "
+            "AND a.native_thread_id = ? AND a.project_identity_version = 1 "
+            "ORDER BY a.created_at DESC, a.id DESC LIMIT 1",
+            (native_thread_id,),
+        )
+        return dict(row) if row is not None else None
+
+    def bind_verified_project_identity(
+        self, observation: Mapping[str, Any], project_identity: str
+    ) -> None:
+        """Migrate scope after the owner edge verifies Codex's persisted cwd.
+
+        Native thread/read supplies the proof, never a caller's claimed old
+        device number. Original digests remain sealed into existing packets.
+        """
+        if not _is_sha256_digest(project_identity):
+            raise ValidationError("persistent project identity is invalid")
+        with self.db.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM cao_session_attachments WHERE id = ? AND principal_id = ? "
+                "AND native_thread_id = ? AND project_digest = ? AND generation = ?",
+                tuple(observation[key] for key in (
+                    "id", "principal_id", "native_thread_id", "project_digest", "generation"
+                )),
+            ).fetchone()
+            if row is None:
+                raise ConflictError("project identity migration observation is stale")
+            if int(row["project_identity_version"]) == 2:
+                if str(row["project_scope_digest"]) != project_identity:
+                    raise ConflictError("persistent project identity conflicts")
+                return
+            # A native thread may have moved since the legacy digest was
+            # recorded. Its proof can bind only this exact attachment, never
+            # rewrite every other conversation sharing the historical digest.
+            connection.execute(
+                "UPDATE cao_session_attachments SET project_scope_digest = ?, "
+                "project_identity_version = 2 WHERE id = ? AND principal_id = ? "
+                "AND generation = ? AND project_identity_version = 1",
+                (project_identity, row["id"], row["principal_id"], row["generation"]),
+            )
+            self._event(
+                connection, "cao.project_identity_migrated", "cao_session_attachment",
+                str(row["id"]), str(row["principal_id"]),
+                {"identity_version": 2, "proof": "provider-thread-workspace"},
+            )
 
     def issue_owner_local_attachment_bootstrap(
         self,
@@ -8665,7 +8715,7 @@ class ControlPlane:
             if existing is not None:
                 if (
                     str(existing["native_thread_id"]) != request.native_thread_id
-                    or str(existing["project_digest"]) != request.project_digest
+                    or str(existing["project_scope_digest"]) != request.project_digest
                     or str(existing["adapter"]) != "codex-app-server"
                 ):
                     raise ConflictError(
@@ -8841,6 +8891,13 @@ class ControlPlane:
                     },
                 )
 
+            if existing is None:
+                connection.execute(
+                    "UPDATE cao_session_attachments SET project_identity_version = 2, "
+                    "project_scope_digest = ? WHERE id = ?",
+                    (request.project_digest, attachment_id),
+                )
+
             connection.execute(
                 "UPDATE cao_attachment_bootstrap_credentials "
                 "SET state = 'revoked', revoked_at = ?, updated_at = ? WHERE id = ?",
@@ -8949,6 +9006,7 @@ class ControlPlane:
             ).fetchone()
             assert attachment_row is not None and runtime_row is not None
             result = dict(attachment_row)
+            result["project_identity_digest"] = result["project_scope_digest"]
             runtime_value = dict(runtime_row)
             runtime_value["metadata"] = _load(runtime_value.pop("metadata_json"), {})
             result["runtime"] = runtime_value
@@ -16138,7 +16196,7 @@ class ControlPlane:
             JOIN cao_session_attachments AS supervisor_attachment
               ON supervisor_attachment.id = ?
              AND supervisor_attachment.principal_id = source_attachment.principal_id
-             AND supervisor_attachment.project_digest = source_attachment.project_digest
+             AND supervisor_attachment.project_scope_digest = source_attachment.project_scope_digest
             WHERE epoch.runtime_session_id = ? AND spec.principal_id = ?
             """,
             (work["supervisor_attachment_id"], successor["runtime_session_id"], target_worker),
@@ -22859,7 +22917,7 @@ class ControlPlane:
             JOIN cao_session_attachments AS supervisor_attachment
               ON supervisor_attachment.id = ?
              AND supervisor_attachment.principal_id = source_attachment.principal_id
-             AND supervisor_attachment.project_digest = source_attachment.project_digest
+             AND supervisor_attachment.project_scope_digest = source_attachment.project_scope_digest
             WHERE spec.runtime_session_id = ?
               AND spec.enrollment_id = epoch.enrollment_id
               AND epoch.runtime_session_id = spec.runtime_session_id
@@ -25456,9 +25514,9 @@ class ControlPlane:
                    attachment.generation AS current_generation,
                    attachment.state AS attachment_state,
                    attachment.principal_id AS attachment_principal_id,
-                   attachment.project_digest AS attachment_project_digest,
+                   attachment.project_scope_digest AS attachment_project_digest,
                    supervisor_attachment.principal_id AS supervisor_principal_id,
-                   supervisor_attachment.project_digest AS supervisor_project_digest,
+                   supervisor_attachment.project_scope_digest AS supervisor_project_digest,
                    runtime.principal_id AS runtime_principal_id,
                    enrollment.id AS runtime_enrollment_id,
                    enrollment.principal_id AS enrollment_principal_id,

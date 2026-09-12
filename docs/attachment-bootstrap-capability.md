@@ -53,6 +53,50 @@ to its current conversation contract before admitting the connection. A
 generic local tool that does not implement and present that configured bridge
 contract cannot attach merely by reaching the socket.
 
+## Project identity across host restarts
+
+Persistent identity and a live filesystem race fence are separate contracts.
+The bridge derives the project from the canonical directory, persistent volume
+UUID on macOS, inode and available birth/generation marker. On macOS the kernel's
+descriptor path normalizes case and aliases. A mount's `st_dev` is never part
+of this durable identity: reboot or remount may renumber it. Device/inode pairs
+still prove that path resolution and an open descriptor refer to the same object
+during one operation. A different volume, renamed directory or replacement
+object does not inherit the registered identity. The portable fallback binds
+canonical location, inode and available generation; filesystems without persistent
+volume/generation support retain a same-location object-reuse limitation.
+
+Schema 45 preserves each attachment's original `project_digest` in every sealed
+Goal, Task, evidence and memory record. `project_scope_digest` separately binds
+current project membership. Existing version-1 registrations migrate only after
+the owner edge reads the exact native conversation using the supported Codex
+`thread/read` operation and derives its persisted workspace's current identity.
+The requested project must match that observation before bootstrap issuance.
+The migration transaction checks the observed attachment, principal, native
+thread, original digest and generation, binds only that exact attachment once,
+and records a path-free event. A moved native thread cannot migrate other
+conversations that shared its historical digest. Concurrent equal proofs are idempotent; conflicting
+proofs are rejected. It neither replays Work nor resets the attachment lifecycle.
+An unavailable historical native thread remains unmigrated and cannot block
+other conversations. Startup attempts independent legacy attachments in the background;
+an affected conversation's own attachment verifies its migration synchronously.
+
+Project-local Worker list, instruction and lifecycle authority, recovery,
+projection validation and explicitly project-shared memory compare the persistent
+scope. Packet validation and conversation-private memory continue to use the
+original exact attachment and sealed digest. A new conversation in the same
+project can therefore use its existing Workers after migration without granting
+access to another project's Work or private memory.
+
+The owner-private Directory registry uses the same persistent directory identity
+for new Worker references. An integrity-verified legacy entry keeps its original
+opaque reference: canonical location, inode and the saved object-generation
+marker must still match before its persistent identity is added atomically.
+Across a changed device number, a legacy entry without a real birth/generation
+marker fails closed. The registry retains old mount numbers only as migration
+evidence; launch still checks the live descriptor immediately before use. No
+workspace marker, registry deletion, new Worker or database reset is required.
+
 ## Replaceable connections and bounded failure
 
 Each admitted bridge creates or renews only its own replaceable connection

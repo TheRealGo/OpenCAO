@@ -66,18 +66,17 @@ cao_attachment_bootstrap_credential_ttl_seconds = 86400
 # Historical unbound rows remain audit evidence and are never routed.
 require_cao_attachment_for_work = true
 
-# This is the complete server-owned managed Worker profile catalog. A custom
-# catalog replaces the built-in defaults; every model and effort remains an
-# explicit allow-list entry. Profiles never carry commands, paths, tokens, or
-# other launch metadata.
+# Runner policy and defaults for omitted launch options. Explicit model IDs
+# and aliases are passed unchanged to the provider; no model registration is
+# required here. Profiles never carry commands, paths, tokens, or credentials.
 [runtime.managed_worker_profiles.codex]
 adapter = "codex-app-server"
-models = ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5", "gpt-5.1", "gpt-5.2"]
+default_model = "gpt-5.6-terra"
 reasoning_efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
 
 [runtime.managed_worker_profiles.claude]
 adapter = "claude"
-models = ["opus", "fable", "sonnet", "claude-fable-5"]
+default_model = "opus"
 reasoning_efforts = ["low", "medium", "high", "xhigh", "max"]
 
 [retention]

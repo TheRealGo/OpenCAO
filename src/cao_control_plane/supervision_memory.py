@@ -373,7 +373,7 @@ def _scope_tx(connection: sqlite3.Connection, actor: Mapping[str, Any]) -> tuple
 def _visible_rows_tx(
     connection: sqlite3.Connection, actor: Mapping[str, Any], *, active_only: bool
 ) -> list[sqlite3.Row]:
-    principal, attachment, project = _scope_tx(connection, actor)
+    principal, attachment, _project = _scope_tx(connection, actor)
     # Deliberately do not SELECT value: even candidate retrieval cannot use it
     # as an index, relevance feature, or accidental search result.
     return list(
@@ -381,11 +381,13 @@ def _visible_rows_tx(
             "SELECT m.*, r.primary_abstraction, r.value_digest, r.source_work_item_id, r.created_attachment_id "
             "FROM supervision_memories m JOIN supervision_memory_revisions r "
             "ON r.memory_id=m.id AND r.revision=m.current_revision "
-            "WHERE m.owner_principal_id=? AND m.project_digest=? "
+            "JOIN cao_session_attachments origin ON origin.id=m.origin_attachment_id "
+            "JOIN cao_session_attachments current ON current.id=? "
+            "WHERE m.owner_principal_id=? AND origin.project_scope_digest=current.project_scope_digest "
             "AND (m.scope='project' OR m.origin_attachment_id=?) "
             + ("AND m.lifecycle_state='active' " if active_only else "")
             + "ORDER BY m.created_at,m.id",
-            (principal, project, attachment),
+            (attachment, principal, attachment),
         )
     )
 

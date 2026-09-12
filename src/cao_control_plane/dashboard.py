@@ -24,6 +24,7 @@ from .projection import (
     project_work_items_from_connection,
     sanitize_operator_text,
 )
+from .provider_models import model_identifier
 from .service import ControlPlane
 
 DASHBOARD_FORMAT = "cao-dashboard-read-model/v1"
@@ -85,7 +86,6 @@ _RUNNER_CONNECTION_STATES = frozenset(
         "unavailable",
     }
 )
-_MODEL_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPERATOR_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -1126,7 +1126,7 @@ def _enum(value: object, allowed: frozenset[str]) -> str | None:
 def _model_label(value: object) -> str | None:
     """Accept only the bounded canonical model label, never arbitrary text."""
 
-    return value if isinstance(value, str) and _MODEL_LABEL.fullmatch(value) else None
+    return model_identifier(value)
 
 
 def _timestamp(value: object) -> str | None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -25,7 +26,12 @@ from .a2a import (
     A2AProtocolError,
     A2AServer,
 )
-from .attachment_issuer import AttachmentCapabilityIssuer, AttachmentPeerIdentityProvider
+from .attachment_issuer import (
+    AttachmentCapabilityIssuer,
+    AttachmentCatalogRefreshRequired,
+    AttachmentIssuerError,
+    AttachmentPeerIdentityProvider,
+)
 from .config import Settings
 from .dashboard import DashboardCursor, DashboardReadModel, DashboardResyncRequired
 from .dashboard_history import HISTORY_REFERENCE
@@ -70,7 +76,7 @@ from .models import (
 )
 from .projection import build_projection
 from .release_identity import current_release_identity
-from .runtime import Dispatcher
+from .runtime import Dispatcher, read_cao_project_identity
 from .security import (
     origin_allowed,
     redact_control_plane_secrets,
@@ -336,10 +342,47 @@ def create_app(
     mcp = MCPServer(service)
     a2a = A2AServer(service)
     dispatcher = Dispatcher(service, resolved)
+
+    async def prepare_project(thread_id: str, digest: str, catalog: str, abi: int) -> None:
+        from .connection_contract import CAO_CONVERSATION_PROXY_ABI_VERSION
+
+        if catalog != release_identity.mcp_catalog_digest or abi != CAO_CONVERSATION_PROXY_ABI_VERSION:
+            raise AttachmentCatalogRefreshRequired("attachment proxy contract is stale")
+        observation = service.legacy_project_observation(thread_id)
+        if observation is None:
+            return
+        try:
+            verified = await read_cao_project_identity(resolved, thread_id)
+            if verified != digest:
+                raise AttachmentIssuerError("attachment project identity conflicts")
+            service.bind_verified_project_identity(observation, verified)
+        except Exception as error:
+            raise AttachmentIssuerError("attachment project identity is unavailable") from error
+
+    async def migrate_legacy_projects() -> None:
+        # Each legacy attachment needs its own native workspace proof. Failure
+        # for an unavailable historical thread cannot block unrelated control;
+        # its own next attachment still requires synchronous verified migration.
+        rows = database.fetchall(
+            "SELECT native_thread_id FROM cao_session_attachments "
+            "WHERE project_identity_version = 1 ORDER BY (state='active') DESC, "
+            "updated_at DESC, id DESC"
+        )
+        for row in rows:
+            observation = service.legacy_project_observation(str(row["native_thread_id"]))
+            if observation is None:
+                continue
+            try:
+                identity = await read_cao_project_identity(resolved, str(row["native_thread_id"]))
+                service.bind_verified_project_identity(observation, identity)
+            except Exception:
+                continue
+
     attachment_issuer = AttachmentCapabilityIssuer(
         resolved.state_dir,
         service.issue_owner_local_attachment_bootstrap,
         peer_identity_provider=attachment_peer_identity_provider,
+        prepare_project=prepare_project,
     )
     dashboard_read_model = DashboardReadModel(service)
 
@@ -348,9 +391,12 @@ def create_app(
         del app
         await attachment_issuer.start()
         await dispatcher.start()
+        project_migration = asyncio.create_task(migrate_legacy_projects())
         try:
             yield
         finally:
+            project_migration.cancel()
+            await asyncio.gather(project_migration, return_exceptions=True)
             await dispatcher.stop()
             await attachment_issuer.close()
 

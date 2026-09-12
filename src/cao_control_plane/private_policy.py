@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .canonical import canonical_json_bytes as _canonical_json_bytes
+from .directory_identity import canonical_directory_path, directory_identity
+from .directory_identity import object_generation as _stat_object_generation
 
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
 _RUNNERS = frozenset({"claude", "codex"})
@@ -177,12 +179,27 @@ class OwnerPrivatePolicyEdge:
         if _stat_identity(current) != _stat_identity(info):
             raise PrivatePolicyError("owner_private_policy_workspace_unavailable")
         object_generation = _stat_object_generation(info)
+        persistent_identity = self._persistent_identity(authorized)
         if _stat_object_generation(current) != object_generation:
             raise PrivatePolicyError("owner_private_policy_workspace_unavailable")
 
         with self._locked_workspace_registry():
             registry = self._read_or_create_workspace_registry_locked()
             key = self._workspace_registry_key(registry)
+            workspaces = registry["workspaces"]
+            assert isinstance(workspaces, dict)
+            for existing_ref, existing_entry in workspaces.items():
+                if (existing_entry.get("runner") != runner
+                    or existing_entry.get("inode") != int(info.st_ino)
+                    or existing_entry.get("persistent_identity", persistent_identity) != persistent_identity):
+                    continue
+                try:
+                    resolved = self._resolve_registered_workspace_entry(existing_entry)
+                except PrivatePolicyError:
+                    continue
+                if self._persistent_identity(resolved) == persistent_identity:
+                    self._upgrade_workspace_identity_locked(registry, existing_ref, existing_entry)
+                    return str(existing_ref)
             workspace_ref = self._registered_workspace_ref(
                 key,
                 runner=runner,
@@ -190,6 +207,7 @@ class OwnerPrivatePolicyEdge:
                 inode=int(info.st_ino),
                 path=os.fspath(authorized),
                 object_generation=object_generation,
+                persistent_identity=persistent_identity,
             )
             entry_without_seal: dict[str, object] = {
                 "path": os.fspath(authorized),
@@ -197,6 +215,7 @@ class OwnerPrivatePolicyEdge:
                 "inode": int(info.st_ino),
                 "object_generation": object_generation,
                 "runner": runner,
+                "persistent_identity": persistent_identity,
             }
             entry = {
                 **entry_without_seal,
@@ -566,7 +585,7 @@ class OwnerPrivatePolicyEdge:
 
     def _workspace_identity(self, snapshot: _PolicySnapshot, workspace: Path) -> tuple[str, Path]:
         try:
-            candidate = Path(os.path.abspath(os.fspath(workspace))).resolve(strict=True)
+            candidate = canonical_directory_path(Path(os.path.abspath(os.fspath(workspace))))
             info = candidate.stat()
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise PrivatePolicyError("owner_private_policy_workspace_unavailable") from error
@@ -604,7 +623,7 @@ class OwnerPrivatePolicyEdge:
                 raise ValueError
             raw = Path(os.path.abspath(os.fspath(supplied)))
             raw_info = raw.lstat()
-            canonical = raw.resolve(strict=True)
+            canonical = canonical_directory_path(raw)
             canonical_info = canonical.lstat()
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise PrivatePolicyError(
@@ -654,19 +673,50 @@ class OwnerPrivatePolicyEdge:
             or stat.S_ISLNK(info.st_mode)
             or not stat.S_ISDIR(canonical_info.st_mode)
             or _stat_identity(info) != _stat_identity(canonical_info)
-            or int(canonical_info.st_dev) != device
             or int(canonical_info.st_ino) != inode
             or _stat_object_generation(canonical_info) != object_generation
         ):
             raise PrivatePolicyError("owner_private_policy_workspace_unavailable")
+        persistent = entry.get("persistent_identity")
+        if persistent is not None:
+            if self._persistent_identity(canonical) != persistent:
+                raise PrivatePolicyError("owner_private_policy_workspace_unavailable")
+        elif int(canonical_info.st_dev) != device and object_generation == "stable-generation-unavailable":
+            # Old registries lack volume UUIDs. Across a boot, migration needs
+            # the unchanged canonical path, inode and a real birth/generation.
+            raise PrivatePolicyError("owner_private_policy_workspace_unavailable")
         return canonical
+
+    @staticmethod
+    def _persistent_identity(path: Path) -> str:
+        try:
+            return directory_identity(path)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise PrivatePolicyError("owner_private_policy_workspace_unavailable") from error
+
+    def _upgrade_workspace_identity_locked(
+        self, registry: dict[str, Any], workspace_ref: str, entry: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        if "persistent_identity" in entry:
+            return entry
+        path = self._resolve_registered_workspace_entry(entry)
+        upgraded = dict(entry)
+        upgraded["persistent_identity"] = self._persistent_identity(path)
+        payload = {key: value for key, value in upgraded.items() if key != "seal"}
+        upgraded["seal"] = self._workspace_registry_seal(
+            self._workspace_registry_key(registry), workspace_ref, payload
+        )
+        registry["workspaces"][workspace_ref] = upgraded
+        registry["revision"] += 1
+        self._write_workspace_registry_locked(registry)
+        return upgraded
 
     @staticmethod
     def _workspace_entry_matches_stat(
         entry: Mapping[str, object], info: os.stat_result
     ) -> bool:
         return (
-            entry.get("device") == int(info.st_dev)
+            (entry.get("persistent_identity") is not None or entry.get("device") == int(info.st_dev))
             and entry.get("inode") == int(info.st_ino)
             and entry.get("object_generation") == _stat_object_generation(info)
             and stat.S_ISDIR(info.st_mode)
@@ -769,7 +819,13 @@ class OwnerPrivatePolicyEdge:
             workspaces = registry["workspaces"]
             assert isinstance(workspaces, dict)
             entry = workspaces.get(workspace_ref)
-            return dict(entry) if isinstance(entry, Mapping) else None
+            if not isinstance(entry, Mapping):
+                return None
+            # A removed Directory does not make registry membership invalid.
+            # Its resolution still fails; unrelated records remain usable.
+            with suppress(PrivatePolicyError):
+                entry = self._upgrade_workspace_identity_locked(registry, workspace_ref, entry)
+            return dict(entry)
 
     def _read_workspace_registry_locked(self) -> dict[str, Any]:
         if self._workspace_registry_file is None:
@@ -864,7 +920,7 @@ class OwnerPrivatePolicyEdge:
             if (
                 not self.is_registered_workspace_ref(workspace_ref)
                 or not isinstance(raw_entry, dict)
-                or set(raw_entry) != _WORKSPACE_REGISTRY_ENTRY_FIELDS
+                or set(raw_entry) not in (_WORKSPACE_REGISTRY_ENTRY_FIELDS, _WORKSPACE_REGISTRY_ENTRY_FIELDS | {"persistent_identity"})
             ):
                 raise PrivatePolicyError(
                     "owner_private_policy_workspace_unavailable"
@@ -895,6 +951,12 @@ class OwnerPrivatePolicyEdge:
                 raise PrivatePolicyError(
                     "owner_private_policy_workspace_unavailable"
                 )
+            persistent_identity = raw_entry.get("persistent_identity")
+            if persistent_identity is not None and (
+                not isinstance(persistent_identity, str)
+                or re.fullmatch(r"[0-9a-f]{64}", persistent_identity) is None
+            ):
+                raise PrivatePolicyError("owner_private_policy_workspace_unavailable")
             expected_ref = self._registered_workspace_ref(
                 key,
                 runner=runner,
@@ -913,10 +975,16 @@ class OwnerPrivatePolicyEdge:
                     "runner",
                 )
             }
+            if persistent_identity is not None:
+                entry_without_seal["persistent_identity"] = persistent_identity
+            stable_ref = self._registered_workspace_ref(
+                key, runner=runner, device=device, inode=inode, path=path,
+                object_generation=object_generation, persistent_identity=persistent_identity,
+            )
             expected_seal = self._workspace_registry_seal(
                 key, workspace_ref, entry_without_seal
             )
-            if workspace_ref != expected_ref or not hmac.compare_digest(
+            if workspace_ref not in {expected_ref, stable_ref} or not hmac.compare_digest(
                 seal, expected_seal
             ):
                 raise PrivatePolicyError(
@@ -949,6 +1017,7 @@ class OwnerPrivatePolicyEdge:
         inode: int,
         path: str,
         object_generation: str,
+        persistent_identity: str | None = None,
     ) -> str:
         # The canonical path is part of the opaque proof so filesystem inode
         # reuse can never silently redirect an older Worker to an unrelated
@@ -957,6 +1026,8 @@ class OwnerPrivatePolicyEdge:
             f"workspace-ref-v1\0{runner}\0{device}\0{inode}\0"
             f"{object_generation}\0{path}"
         ).encode()
+        if persistent_identity is not None:
+            proof = f"workspace-ref-v2\0{runner}\0{object_generation}\0{persistent_identity}".encode()
         return "cao-dynamic-" + hmac.new(key, proof, hashlib.sha256).hexdigest()
 
     @staticmethod
@@ -1141,27 +1212,6 @@ def _stat_identity(info: os.stat_result) -> tuple[int, int, int]:
     return (int(info.st_dev), int(info.st_ino), stat.S_IFMT(info.st_mode))
 
 
-def _stat_object_generation(info: os.stat_result) -> str:
-    """Return the strongest portable object-generation marker available."""
-
-    birthtime = getattr(info, "st_birthtime", None)
-    if isinstance(birthtime, (int, float)) and not isinstance(birthtime, bool):
-        return f"birthtime:{float(birthtime).hex()}"
-    generation = getattr(info, "st_gen", None)
-    if (
-        isinstance(generation, int)
-        and not isinstance(generation, bool)
-        and generation > 0
-    ):
-        return f"stat-generation:{generation}"
-    # Directory ctime is deliberately not used: creating a normal project
-    # file changes it on Linux and would strand every subsequent runtime. On a
-    # filesystem without birthtime or a generation counter, path+device+inode
-    # remain the portable fail-closed identity and inode reuse is a documented
-    # residual risk rather than a guaranteed lifecycle outage.
-    return "stable-generation-unavailable"
-
-
 def _valid_object_generation(value: str) -> bool:
     if value.startswith("birthtime:"):
         try:
@@ -1180,15 +1230,16 @@ def _workspace_identity_digest(
     workspace: Path,
     info: os.stat_result,
 ) -> str:
+    try:
+        identity = directory_identity(workspace, expected=info)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise PrivatePolicyError("owner_private_policy_workspace_unavailable") from error
     return _hmac_id(
         snapshot.evidence_key,
         "\0".join(
             (
                 "workspace-v2",
-                str(int(info.st_dev)),
-                str(int(info.st_ino)),
-                _stat_object_generation(info),
-                os.fspath(workspace),
+                identity,
             )
         ),
     )

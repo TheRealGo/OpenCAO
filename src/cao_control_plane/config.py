@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from .provider_models import model_identifier
+
 
 def _bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -29,16 +31,15 @@ _ADAPTER_REASONING_EFFORTS: dict[str, frozenset[str]] = {
     "claude": frozenset({"low", "medium", "high", "xhigh", "max"}),
 }
 _MANAGED_WORKER_PROFILE_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_MANAGED_WORKER_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 @dataclass(frozen=True, slots=True)
 class ManagedWorkerProfile:
-    """One server-owned, immutable managed Worker launch profile."""
+    """Runner policy and an omitted-value default, not a provider model catalog."""
 
     profile_id: str
     adapter: ManagedWorkerAdapter
-    models: tuple[str, ...]
+    default_model: str
     reasoning_efforts: tuple[str, ...]
 
     def __post_init__(self) -> None:
@@ -46,12 +47,8 @@ class ManagedWorkerProfile:
             raise ValueError("managed_worker_profiles contains an invalid profile id")
         if self.adapter not in _MANAGED_WORKER_ADAPTERS:
             raise ValueError("managed_worker_profiles contains an unsupported adapter")
-        _validate_profile_values(
-            self.models,
-            field_name="models",
-            allowed=None,
-            matcher=_MANAGED_WORKER_MODEL,
-        )
+        if model_identifier(self.default_model) is None:
+            raise ValueError("managed_worker_profiles contains an invalid default model")
         _validate_profile_values(
             self.reasoning_efforts,
             field_name="reasoning_efforts",
@@ -95,7 +92,7 @@ def _profile_values(value: object, *, field_name: str) -> tuple[str, ...]:
 
 
 def _parse_managed_worker_profiles(value: object) -> tuple[ManagedWorkerProfile, ...]:
-    """Parse the complete catalog; a configured catalog replaces the defaults."""
+    """Parse runner defaults, including the first entry of legacy model arrays."""
 
     if not isinstance(value, Mapping) or not value:
         raise ValueError("managed_worker_profiles must be a non-empty table or object")
@@ -103,19 +100,28 @@ def _parse_managed_worker_profiles(value: object) -> tuple[ManagedWorkerProfile,
     for profile_id, raw_profile in value.items():
         if not isinstance(profile_id, str) or not isinstance(raw_profile, Mapping):
             raise ValueError("managed_worker_profiles contains an invalid profile")
-        expected = {"adapter", "models", "reasoning_efforts"}
-        if set(raw_profile) != expected:
+        common = {"adapter", "reasoning_efforts"}
+        if set(raw_profile) not in (common | {"default_model"}, common | {"models"}):
             raise ValueError(
-                "managed_worker_profiles profiles require adapter, models, and reasoning_efforts"
+                "managed_worker_profiles require adapter, default_model, and reasoning_efforts"
             )
         adapter = raw_profile["adapter"]
         if not isinstance(adapter, str):
             raise ValueError("managed_worker_profiles contains an unsupported adapter")
+        if "models" in raw_profile:
+            legacy_models = _profile_values(raw_profile["models"], field_name="models")
+            if not legacy_models:
+                raise ValueError("managed_worker_profiles models must not be empty")
+            default_model = legacy_models[0]
+        else:
+            default_model = raw_profile["default_model"]
+        if not isinstance(default_model, str):
+            raise ValueError("managed_worker_profiles default_model must be a string")
         profiles.append(
             ManagedWorkerProfile(
                 profile_id=profile_id,
                 adapter=adapter,  # type: ignore[arg-type]
-                models=_profile_values(raw_profile["models"], field_name="models"),
+                default_model=default_model,
                 reasoning_efforts=_profile_values(
                     raw_profile["reasoning_efforts"], field_name="reasoning_efforts"
                 ),
@@ -137,13 +143,13 @@ DEFAULT_MANAGED_WORKER_PROFILES: tuple[ManagedWorkerProfile, ...] = (
     ManagedWorkerProfile(
         profile_id="codex",
         adapter="codex-app-server",
-        models=("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5", "gpt-5.1", "gpt-5.2"),
+        default_model="gpt-5.6-terra",
         reasoning_efforts=("low", "medium", "high", "xhigh", "max", "ultra"),
     ),
     ManagedWorkerProfile(
         profile_id="claude",
         adapter="claude",
-        models=("opus", "fable", "sonnet", "claude-fable-5"),
+        default_model="opus",
         reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
     ),
 )
@@ -256,9 +262,8 @@ class Settings:
     # dispatch to an arbitrary CAO session. Canonical deployments keep this
     # true to reject new unbound Work at delegation time.
     require_cao_attachment_for_work: bool = True
-    # This complete catalog is server-owned launch policy.  A TOML or
-    # environment catalog replaces these defaults atomically; callers can
-    # select only one configured profile/model/effort combination.
+    # A TOML or environment override replaces these runner defaults and effort
+    # policies. Explicit provider model selectors never require registration.
     managed_worker_profiles: tuple[ManagedWorkerProfile, ...] = DEFAULT_MANAGED_WORKER_PROFILES
     event_retention_days: int = 30
     message_retention_days: int = 90

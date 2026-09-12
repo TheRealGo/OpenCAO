@@ -39,7 +39,7 @@ from .goal_packets import (
 from .security import canonical_json as security_canonical_json
 from .security import contains_control_plane_secret
 
-SCHEMA_VERSION = 44
+SCHEMA_VERSION = 45
 APPLICATION_ID = 0x43414F32  # "CAO2"
 
 
@@ -551,6 +551,8 @@ CREATE TABLE IF NOT EXISTS cao_session_attachments (
         REFERENCES runtime_sessions(id) ON DELETE CASCADE,
     native_thread_id TEXT NOT NULL,
     project_digest TEXT NOT NULL,
+    project_scope_digest TEXT NOT NULL DEFAULT '',
+    project_identity_version INTEGER NOT NULL DEFAULT 1 CHECK(project_identity_version IN (1, 2)),
     model TEXT NOT NULL,
     sandbox TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('active', 'stale', 'revoked', 'failed')),
@@ -3660,7 +3662,7 @@ def _work_thread_binding_candidates_sql() -> str:
             JOIN cao_session_attachments AS supervisor_attachment
               ON supervisor_attachment.id = work.supervisor_attachment_id
              AND supervisor_attachment.principal_id = source_attachment.principal_id
-             AND supervisor_attachment.project_digest = source_attachment.project_digest
+             AND supervisor_attachment.project_scope_digest = source_attachment.project_scope_digest
         ),
         exact_bindings AS (
             SELECT work_item_id,
@@ -3795,7 +3797,7 @@ def _install_work_thread_binding_triggers(connection: sqlite3.Connection) -> Non
             JOIN cao_session_attachments AS supervisor_attachment
               ON supervisor_attachment.id = NEW.supervisor_attachment_id
              AND supervisor_attachment.principal_id = source_attachment.principal_id
-             AND supervisor_attachment.project_digest = source_attachment.project_digest
+             AND supervisor_attachment.project_scope_digest = source_attachment.project_scope_digest
             JOIN managed_worker_thread_epochs AS epoch
               ON epoch.thread_id = thread.id
              AND epoch.generation = thread.generation
@@ -3894,8 +3896,8 @@ def _install_work_thread_binding_triggers(connection: sqlite3.Connection) -> Non
                             ON supervisor_attachment.id = work.supervisor_attachment_id
                            AND supervisor_attachment.principal_id =
                                source_attachment.principal_id
-                           AND supervisor_attachment.project_digest =
-                               source_attachment.project_digest
+                           AND supervisor_attachment.project_scope_digest =
+                               source_attachment.project_scope_digest
                           WHERE epoch.runtime_session_id = NEW.runtime_session_id
                             AND epoch.thread_id = work.managed_worker_thread_id
                             AND epoch.generation =
@@ -7834,6 +7836,25 @@ class Database:
                             "PRAGMA table_info(cao_session_attachments)"
                         )
                     }
+                    for column_name, definition in (
+                        ("project_scope_digest", "TEXT NOT NULL DEFAULT ''"),
+                        ("project_identity_version", "INTEGER NOT NULL DEFAULT 1 CHECK(project_identity_version IN (1, 2))"),
+                    ):
+                        if column_name not in attachment_columns:
+                            connection.execute(
+                                "ALTER TABLE cao_session_attachments "
+                                f"ADD COLUMN {column_name} {definition}"
+                            )
+                    connection.execute(
+                        "UPDATE cao_session_attachments SET project_scope_digest = project_digest "
+                        "WHERE project_scope_digest = ''"
+                    )
+                    connection.execute(
+                        "CREATE TRIGGER IF NOT EXISTS cao_attachment_project_scope_default "
+                        "AFTER INSERT ON cao_session_attachments WHEN NEW.project_scope_digest = '' "
+                        "BEGIN UPDATE cao_session_attachments SET project_scope_digest = NEW.project_digest "
+                        "WHERE id = NEW.id; END"
+                    )
                     legacy_attachment_process_columns = {
                         "host_root_pid",
                         "host_root_start_signature",
@@ -8785,6 +8806,7 @@ class Database:
                         ),
                         43: "provider-owned Worker output receipts and attachment notification lanes",
                         44: "typed supervision pauses, explicit resumption, and scoped durable memory",
+                        45: "persistent directory identity and sealed project scope migration",
                     }
                     if existing < 31:
                         _backfill_managed_worker_threads(connection)

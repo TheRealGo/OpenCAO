@@ -6,4 +6,4 @@ from __future__ import annotations
 # tool catalog digest cannot represent. A long-lived Python bridge retains this
 # value in memory, so reading newer package files cannot impersonate a current
 # connection contract.
-CAO_CONVERSATION_PROXY_ABI_VERSION = 1
+CAO_CONVERSATION_PROXY_ABI_VERSION = 2

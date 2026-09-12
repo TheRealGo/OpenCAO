@@ -36,6 +36,7 @@ from .cloudflare_access import CloudflareAccessJWTValidator, CloudflareAccessSet
 from .dashboard_history import HISTORY_KINDS, HISTORY_REFERENCE, full_operator_text
 from .dashboard_presentation import local_timestamp_display
 from .projection import sanitize_operator_text
+from .provider_models import model_identifier
 
 _API_PREFIX = "/api/v1/dashboard/v1"
 _DASHBOARD_FORMAT = "cao-dashboard-read-model/v1"
@@ -83,7 +84,6 @@ _RUNNER_CONNECTION_STATES = frozenset(
         "unavailable",
     }
 )
-_MODEL_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OPERATOR_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -1071,7 +1071,7 @@ def _safe_status(value: object, allowed: frozenset[str]) -> str | None:
 def _model_label(value: object) -> str | None:
     """Retain only a canonical, bounded model identifier from the DTO."""
 
-    return value if isinstance(value, str) and _MODEL_LABEL.fullmatch(value) else None
+    return model_identifier(value)
 
 
 def _safe_timestamp(value: object) -> str | None:

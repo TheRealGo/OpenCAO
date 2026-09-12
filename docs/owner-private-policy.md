@@ -61,25 +61,39 @@ embedding a private location in tracked code.
 `cao_new_worker_thread` supplies one absolute existing Directory and the
 selected `codex` or `claude` runner to this local edge. The edge resolves the
 concrete directory identity, applies the same runner allow/deny rules, and
-stores the raw path, device/inode identity, the strongest stable filesystem
-object-generation marker available, runner, and integrity seal only in a
-separate owner-only `0600` registry. It returns a deterministic opaque
-workspace reference for the Directory/runner pair. That opaque reference is
-the only value admitted to Control Plane state.
+stores the raw path, inode, strongest available object-generation marker,
+persistent directory identity, runner, and integrity seal only in a separate
+owner-only `0600` registry. The observed mount device number is retained as
+local migration evidence. The edge returns a deterministic opaque workspace
+reference for the Directory/runner pair. That opaque reference is the only
+value admitted to Control Plane state.
 
 Existing static workspace mappings retain precedence over the dynamic
 namespace, including a historical static identifier that happens to match the
 new opaque-reference syntax. Registry updates are size-bounded and atomic; a
 rejected append leaves every previously registered Directory resolvable.
-When a Directory is renamed, a fresh authorized registration receives a new
-opaque reference and Worker. The old reference remains bound to the old
-canonical path and fails closed. On filesystems exposing stable birth or
-generation metadata, that marker also prevents delete/recreate inode reuse
-from silently redirecting an older Worker. Where the OS/filesystem exposes no
-stable generation marker, the edge deliberately falls back to canonical
-path, device, and inode: ordinary project writes remain usable, while exact
-delete/recreate inode reuse remains a documented residual risk. No private
-registry surgery is required.
+
+Persistent directory identity binds the canonical location, inode and
+available birth/generation marker, plus the persistent volume UUID on macOS.
+A mount's `st_dev` is excluded because reboot or remount may renumber it.
+Device/inode pairs still verify that path resolution and the open launch
+descriptor refer to the same object during an operation. When a Directory is
+renamed, a fresh authorized registration receives a new opaque reference and
+Worker; the old reference remains bound to the old canonical path and fails
+closed. Available birth/generation metadata also prevents delete/recreate
+inode reuse from silently redirecting an older Worker. The portable fallback
+binds canonical location, inode and available generation; where persistent
+volume or generation information is unavailable, same-location object reuse
+remains a residual risk.
+
+An integrity-verified legacy registry entry keeps its original opaque
+reference when its canonical location, inode and saved generation marker
+still match. If the device number changed and no birth/generation marker is
+available, migration fails closed. The persistent identity is added under
+the registry lock with an updated integrity seal and an atomic write. See
+[Project identity across host restarts](attachment-bootstrap-capability.md#project-identity-across-host-restarts)
+for the shared identity and migration contract. No private registry surgery
+is required.
 
 A default local installation needs no separate policy setup before using this
 tool. If `owner_private_policy_file` is unset, CAO atomically creates a

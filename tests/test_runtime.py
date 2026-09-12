@@ -1313,9 +1313,17 @@ def test_dispatch_result_persistence_allowlists_diagnostics_and_discards_convers
             assert row["count"] == 0, (table, column, sentinel)
 
 
-def test_dispatch_failure_persists_only_a_fixed_mcp_startup_code(system):
+def test_dispatch_failure_persists_only_a_fixed_mcp_startup_code(system, monkeypatch):
     service = system["service"]
     runtime = system["runtime"]
+    # Second-resolution timestamps can tie across the dispatch and its CAO wake.
+    import cao_control_plane.runtime as runtime_module
+    import cao_control_plane.service as service_module
+
+    fixed_now = service_module.utc_now()
+    monkeypatch.setattr(service_module, "utc_now", lambda: fixed_now)
+    monkeypatch.setattr(runtime_module, "utc_now", lambda: fixed_now)
+    dispatched_messages = []
     raw_failure = (
         "managed Codex MCP server readiness timed out: cao_control_plane; "
         "last status: runtime-raw-mcp-startup-payload-sentinel"
@@ -1333,6 +1341,7 @@ def test_dispatch_failure_persists_only_a_fixed_mcp_startup_code(system):
 
     class FailedAdapter:
         async def dispatch(self, _runtime, _message):
+            dispatched_messages.append(_message["id"])
             return RuntimeDispatchResult(
                 success=False,
                 state="failed",
@@ -1350,8 +1359,11 @@ def test_dispatch_failure_persists_only_a_fixed_mcp_startup_code(system):
             return FailedAdapter()
 
     assert asyncio.run(Dispatcher(service, system["settings"], registry=Registry()).run_once()) == 1
+    assert len(dispatched_messages) == 1
     delivery = service.db.fetchone(
-        "SELECT message_id, last_error FROM message_deliveries ORDER BY updated_at DESC LIMIT 1"
+        "SELECT message_id, last_error FROM message_deliveries "
+        "WHERE message_id = ? AND recipient_id = ?",
+        (dispatched_messages[0], system["worker"]["id"]),
     )
     assert delivery is not None
     assert delivery["last_error"] == "runtime_dispatch_pre_submit_failed"

@@ -6,6 +6,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
+from .provider_models import ProviderModel
+
 
 class PrincipalRole(StrEnum):
     CAO = "cao"
@@ -305,7 +307,7 @@ class ProvisionManagedWorkerInput(APIModel):
     workspace_ref: str = Field(
         min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
     )
-    model: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    model: ProviderModel
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"]
     operator_scope: Literal["production", "acceptance-test"]
     operator_label: str = Field(min_length=1, max_length=128)
@@ -498,12 +500,7 @@ class NewWorkerThreadInput(APIModel):
 
     working_directory: str = Field(min_length=1, max_length=4096)
     runner: Literal["codex", "claude"] = "codex"
-    model: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
-    )
+    model: ProviderModel | None = None
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] | None = None
     name: str | None = Field(default=None, max_length=128)
     idempotency_key: str = Field(min_length=1, max_length=256)
