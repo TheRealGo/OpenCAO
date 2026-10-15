@@ -148,6 +148,7 @@ def test_project_migration_preserves_work_packets_and_shares_only_project_scope(
     assert [m["memory_id"] for m in found] == [memory["memory_id"]]
     assert private["memory_id"] not in {m["memory_id"] for m in found}
     instruction = service.instruct_worker_thread(current, InstructWorkerThreadInput(
+            expected_purpose_version=1,
         worker_thread_id=ids["thread_id"], objective="Continue on the exact retained Worker.",
         idempotency_key="after-reboot-instruction",
     ))

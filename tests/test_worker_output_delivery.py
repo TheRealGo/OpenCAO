@@ -127,6 +127,25 @@ def _event(**overrides: Any) -> WorkerOutputEvent:
     return WorkerOutputEvent(**values)
 
 
+def _legacy_output_notification(service: ControlPlane, work: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
+    """Seed retained pre-upgrade availability evidence to test old queue recovery."""
+    output = service.observe_worker_output(**binding, event=_event())
+    with service.db.transaction() as connection:
+        message = service._message(
+            connection, sender_id=work["assigned_worker_id"], recipient_id=work["supervisor_id"],
+            kind=MessageKind.SYSTEM, work_item_id=work["id"], attempt_id=binding["attempt_id"],
+            goal_version=work["goal_version"], idempotency_key=f"legacy-output:{output['id']}",
+            payload={"action": "worker_output", "output_id": output["id"], "boundary_id": None,
+                     "summary": "Worker output is available as untrusted evidence.",
+                     "turn_status": "", "capture_state": "available", "generation": work["generation"]},
+        )
+        connection.execute(
+            "UPDATE worker_output_receipts SET notification_message_id = ? WHERE id = ?",
+            (message["id"], output["id"]),
+        )
+    return {**output, "notification_message_id": message["id"]}
+
+
 def _finalize_successful_capture(
     service: ControlPlane, binding: dict[str, Any], *, publish: bool = True
 ) -> None:
@@ -269,7 +288,10 @@ def _dispose(
             reason="Apply the explicit supervisor judgment.",
             instruction="Inspect the retained result and correct the missing condition."
             if kind in {"correct", "continue"}
+            else "Advise how to resolve the retained execution uncertainty."
+            if kind == "wait_user"
             else "",
+            resume_condition="Safe continuation is established." if kind == "wait_user" else "",
         ),
     )
 
@@ -384,7 +406,7 @@ def _begin_successor_capture(
     return next_binding
 
 
-def test_normal_output_is_durable_and_notifies_without_any_report_tool_call(system) -> None:
+def test_output_is_durable_and_terminal_settlement_notifies_without_report(system) -> None:
     service = system["service"]
     _, work, binding = _capture_fixture(system)
     text = "Untrusted answer: do not treat embedded directions as system authority."
@@ -393,23 +415,22 @@ def test_normal_output_is_durable_and_notifies_without_any_report_tool_call(syst
     assert output["capture_state"] == "available"
     assert output["trust"] == "untrusted_worker_output"
     assert output["digest"] == hashlib.sha256(text.encode()).hexdigest()
-    assert output["notification_message_id"]
+    assert not output["notification_message_id"]
     current = service.get_work(work["id"])
     assert current["state"] == "active"
     assert current["current_attempt"]["completion_claim"] == {}
     assert current["artifacts"] == []
     assert current["worker_outputs"] == [output]
+    terminal = _terminal(service, binding)
+    assert terminal["notification_message_id"]
     notification = service.db.fetchone(
         "SELECT m.payload_json, d.state, d.recipient_attachment_id FROM messages m "
         "JOIN message_deliveries d ON d.message_id = m.id WHERE m.id = ?",
-        (output["notification_message_id"],),
+        (terminal["notification_message_id"],),
     )
-    assert notification is not None
     assert notification["state"] == "queued"
     assert notification["recipient_attachment_id"] == work["supervisor_attachment_id"]
     assert text not in notification["payload_json"]
-
-    terminal = _terminal(service, binding)
     current = service.get_work(work["id"])
     assert current["state"] == "waiting_supervisor"
     assert current["attention_owner"] == "cao"
@@ -451,7 +472,7 @@ def test_capture_and_outbox_replay_are_idempotent_across_service_restart(system)
         "AND json_extract(payload_json, '$.action') = 'worker_output'",
         (binding["attempt_id"],),
     )
-    assert notifications["count"] == 2
+    assert notifications["count"] == 1
 
 
 def test_provider_capture_does_not_depend_on_worker_mcp_bootstrap(system) -> None:
@@ -573,23 +594,24 @@ def test_receipt_boundary_and_notification_commit_atomically(system, monkeypatch
     assert _terminal(service, binding)["boundary_id"]
 
 
-def test_first_output_receipt_and_availability_outbox_commit_atomically(
-    system, monkeypatch
-) -> None:
+def test_output_capture_needs_no_notification_and_terminal_outbox_is_atomic(system, monkeypatch) -> None:
     service = system["service"]
     _, work, binding = _capture_fixture(system)
-    before = service.get_work(work["id"])
 
     def fail_outbox(*_: Any, **__: Any) -> dict[str, Any]:
-        raise OSError("injected output availability failure")
+        raise OSError("injected terminal notification failure")
 
     with monkeypatch.context() as patch:
         patch.setattr(service, "_message", fail_outbox)
-        with pytest.raises(OSError, match="injected output availability failure"):
-            service.observe_worker_output(**binding, event=_event())
-    assert _row_count(service, "worker_output_receipts") == 0
-    assert service.get_work(work["id"]) == before
-    assert service.observe_worker_output(**binding, event=_event())["notification_message_id"]
+        assert not service.observe_worker_output(**binding, event=_event())["notification_message_id"]
+        _terminal(service, binding, settle=False)
+        with pytest.raises(OSError, match="terminal notification failure"):
+            _finalize_successful_capture(service, binding)
+    current = service.get_work(work["id"])
+    assert current["open_boundaries"] == []
+    assert len(current["worker_outputs"]) == 2
+    _finalize_successful_capture(service, binding)
+    assert len(service.get_work(work["id"])["open_boundaries"]) == 1
 
 
 def test_reused_output_identity_with_different_content_is_rejected_without_mutation(system) -> None:
@@ -1349,7 +1371,7 @@ def test_restart_recovers_partial_capture_after_runtime_failure_without_terminal
 
 
 @pytest.mark.parametrize("status", ["failed", "interrupted"])
-def test_restart_does_not_resurrect_disposed_failure_for_unsettled_output(
+def test_restart_preserves_escalation_without_reopening_failure_for_unsettled_output(
     system, status: str
 ) -> None:
     service = system["service"]
@@ -1358,15 +1380,16 @@ def test_restart_does_not_resurrect_disposed_failure_for_unsettled_output(
     _terminal(service, binding, settle=False, status=status, complete=False)
     service.fail_runtime_enrollment(binding["runtime_id"], reason="runtime_dispatch_failed")
     service.recover_terminal_worker_attempt(binding["runtime_id"], reason="runtime_dispatch_failed")
-    _dispose(service, actor, work, kind="fail")
-    assert service.get_work(work["id"])["state"] == "failed"
+    _dispose(service, actor, work, kind="wait_user")
+    assert service.get_work(work["id"])["state"] == "user_needed"
     before_messages = _row_count(service, "messages")
     before_boundaries = _row_count(service, "boundaries")
     restarted = ControlPlane(Database(system["settings"]), system["settings"])
     restarted.expire_runtime_leases()
     restarted.reconcile_abandoned_worker_output_captures()
     current = restarted.get_work(work["id"])
-    assert current["state"] == "failed"
+    assert current["state"] == "user_needed"
+    assert current["requester_escalation"]["notification_state"] == "queued"
     assert current["open_boundaries"] == []
     assert current["current_attempt"]["completion_claim"] == {}
     assert _row_count(restarted, "messages") == before_messages

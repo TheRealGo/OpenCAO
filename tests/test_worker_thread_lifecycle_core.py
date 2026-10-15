@@ -8,7 +8,11 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-from conftest import attach_cao_session_with_peer, current_cao_session_attachment
+from conftest import (
+    attach_cao_session_with_peer,
+    business_purpose_contract,
+    current_cao_session_attachment,
+)
 from pydantic import ValidationError as PydanticValidationError
 
 import cao_control_plane.database as database_module
@@ -34,6 +38,7 @@ from cao_control_plane.models import (
     ResumeWorkerThreadInput,
     RuntimeDispatchResult,
     RuntimeHeartbeat,
+    SetWorkerPurposeInput,
     StatusRequestInput,
     WorkAssignment,
     WorkerThreadLifecycleInput,
@@ -166,6 +171,7 @@ def _seed_managed_thread(
     *,
     ordinal: int,
     with_thread: bool = True,
+    with_purpose: bool = True,
     spec_state: str = "enabled",
     runtime_state: str = "starting",
     enrollment_state: str = "awaiting_handshake",
@@ -314,12 +320,24 @@ def _seed_managed_thread(
                     now,
                 ),
             )
+    if with_thread and with_purpose:
+        system["service"].set_worker_purpose(
+            actor,
+            SetWorkerPurposeInput(
+                contract=business_purpose_contract(),
+                worker_thread_id=ids["thread_id"],
+                purpose="Sustain reliable service operation as requirements evolve.",
+                reason="The requester assigned this continuing business responsibility.",
+                idempotency_key=f"fixture-purpose-{ordinal}",
+            ),
+        )
     return ids
 
 
 def _seeded_managed_work_assignment(ids: dict[str, str], **fields: Any) -> WorkAssignment:
     """Build an assignment for the exact generation-1 thread seeded above."""
 
+    fields.setdefault("expected_purpose_version", 1)
     return WorkAssignment(
         worker_id=ids["principal_id"],
         runtime_session_id=ids["runtime_id"],
@@ -450,6 +468,7 @@ def _prepare_runtime_recovery(
     instructed = service.instruct_worker_thread(
         actor,
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=1,
             title=f"Managed runtime recovery {ordinal}",
@@ -520,6 +539,7 @@ def _prepare_runtime_recovery(
             idempotency_key=f"turn-runtime-recovery-{ordinal}",
         )
         request = BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=failed["generation"],
@@ -685,6 +705,7 @@ def test_pre_submit_failure_is_recoverable_after_mcp_bootstrap(system) -> None:
         actor,
         boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=waiting["generation"],
@@ -881,6 +902,7 @@ def test_pre_submit_failure_is_recoverable_after_mcp_bootstrap(system) -> None:
         actor,
         second_boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=second_turn["id"],
             lease_token=second_turn["lease_token"],
             expected_generation=waiting_again["generation"],
@@ -988,7 +1010,10 @@ def test_get_work_exposes_crossed_mcp_boundary_as_unsafe_to_redeliver(system) ->
     assert projected["current_attempt"]["assignment_delivery"] == evidence
 
 
-def test_post_mcp_unknown_delivery_reconciles_on_same_work_and_native_thread(system) -> None:
+@pytest.mark.parametrize("consult_requester", [False, True])
+def test_post_mcp_unknown_delivery_reconciles_on_same_work_and_native_thread(
+    system, consult_requester: bool,
+) -> None:
     actor = _attached(system, suffix="c")
     native_thread_id = "native-post-mcp-reconciliation"
     ids = _seed_managed_thread(
@@ -1145,10 +1170,12 @@ def test_post_mcp_unknown_delivery_reconciles_on_same_work_and_native_thread(sys
         actor,
         boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=waiting["generation"],
-            kind=BoundaryDispositionKind.CONTINUE,
+            kind=BoundaryDispositionKind.WAIT_USER if consult_requester else BoundaryDispositionKind.CONTINUE,
+            resume_condition="The requester supplied guidance for safe reconciliation." if consult_requester else "",
             reason="Reconcile the exact unknown Assignment on its original logical thread.",
             instruction=(
                 "Inspect the current task and workspace state first. Report completion if it "
@@ -1157,6 +1184,12 @@ def test_post_mcp_unknown_delivery_reconciles_on_same_work_and_native_thread(sys
         ),
     )
 
+    if consult_requester:
+        service = ControlPlane(Database(system["settings"]), system["settings"])
+        service.reply(
+            actor, work["id"], "Inspect the current state and continue only unmet conditions.",
+            expected_purpose_version=1, idempotency_key="post-mcp-consultation-answer",
+        )
     recovered = service.get_work(work["id"])
     successor = recovered["current_attempt"]
     assert recovered["id"] == work["id"]
@@ -1818,6 +1851,7 @@ def test_terminal_transport_does_not_replace_logical_worker_thread(
     instructed = service.instruct_worker_thread(
         actor,
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=1,
             objective="Advance only the failed transport and keep this Worker.",
@@ -2103,6 +2137,7 @@ def test_attached_mcp_runs_complete_worker_thread_lifecycle(system) -> None:
             "worker_thread_id": ids["thread_id"],
             "expected_generation": 3,
             "idempotency_key": "mcp-instruct-resumed-thread",
+            "expected_purpose_version": 1,
             "title": "MCP resumed Work",
             "objective": "Prove a later instruction uses the resumed Worker.",
             "maturity": "defined",
@@ -2538,6 +2573,7 @@ def test_legacy_terminal_stale_watchdog_repair_is_idempotent_and_continues(
             actor,
             repaired["id"],
             BoundaryDispositionInput(
+                expected_purpose_version=1,
                 turn_id=turn["id"],
                 lease_token=turn["lease_token"],
                 expected_generation=waiting["generation"],
@@ -2670,6 +2706,7 @@ def test_v30_dead_watchdog_startup_repairs_terminal_epoch_and_continues(
         actor,
         boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=repaired["generation"],
@@ -2814,6 +2851,7 @@ def test_overdue_assignment_after_prior_handshake_preserves_native_thread(
         actor,
         boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=waiting["generation"],
@@ -3070,6 +3108,7 @@ def test_dispatcher_mcp_startup_timeout_advances_one_fresh_thread_epoch(system) 
         actor,
         boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=failed["generation"],
@@ -3707,7 +3746,7 @@ def test_non_pre_mcp_runtime_boundaries_cannot_requeue_failed_runtime(system, re
     )
 
 
-def test_system_reconciliation_requires_terminal_disposition_before_handling(
+def test_system_reconciliation_requires_escalation_before_handling(
     system,
 ) -> None:
     actor = _attached(system, suffix="c")
@@ -3772,18 +3811,23 @@ def test_system_reconciliation_requires_terminal_disposition_before_handling(
         actor,
         boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=failed["generation"],
-            kind=BoundaryDispositionKind.FAIL,
+            kind=BoundaryDispositionKind.WAIT_USER,
             reason="No authoritative recovery path exists for this system failure",
+            instruction="Advise how to complete the unmet objective with this execution blocked.",
+            resume_condition="The requester supplies guidance and the safe continuation is verified.",
         ),
     )
-    assert disposition["kind"] == "fail"
+    assert disposition["kind"] == "wait_user"
     after = service.get_work(failed["id"])
-    assert after["generation"] == before["generation"] + 1
-    assert after["state"] == "failed"
-    assert after["current_attempt"]["state"] == "failed"
+    assert after["generation"] == before["generation"]
+    assert after["state"] == "user_needed"
+    assert after["attention_owner"] == "user"
+    assert after["current_attempt"]["state"] == "input_required"
+    assert after["user_needed"]["boundary_id"] == boundary["id"]
     assert after["open_boundaries"] == []
     assert (
         service.db.fetchone(
@@ -3807,7 +3851,7 @@ def test_system_reconciliation_requires_terminal_disposition_before_handling(
         "boundary_id": boundary["id"],
         "disposition_id": disposition["id"],
         "generation": failed["generation"],
-        "kind": "fail",
+        "kind": "wait_user",
     }
     assert recovery_message["id"] not in {item["id"] for item in service.get_inbox(actor)["items"]}
     handled_history = {
@@ -3819,6 +3863,77 @@ def test_system_reconciliation_requires_terminal_disposition_before_handling(
         item["id"] for item in server.call_tool(actor, "cao_get_inbox", {})["items"]
     }
 
+
+
+def test_unfinished_failure_escalates_once_and_survives_notification_handling(system) -> None:
+    service = system["service"]
+    actor = _attached(system, suffix="escalation")
+    _ids, work, boundary, _request = _prepare_runtime_recovery(
+        system, actor, ordinal=9728, reason="worker_inactive_timeout", acquire_turn=False
+    )
+    turn = service.acquire_reasoner_turn(
+        actor, work["id"], boundary_id=boundary["id"],
+        expected_generation=work["generation"], idempotency_key="escalation-decision",
+    )
+    failure = BoundaryDispositionInput(
+        expected_purpose_version=1, turn_id=turn["id"], lease_token=turn["lease_token"],
+        expected_generation=work["generation"], kind="fail",
+        reason="The execution cannot safely continue.",
+    )
+    with pytest.raises(ConflictError) as rejected:
+        service.dispose_boundary(actor, boundary["id"], failure)
+    assert rejected.value.details["reason_code"] == "unfinished_work_requires_escalation"
+    assert service.get_work(work["id"])["state"] == "waiting_supervisor"
+    request = BoundaryDispositionInput(
+        expected_purpose_version=1, turn_id=turn["id"], lease_token=turn["lease_token"],
+        expected_generation=work["generation"], kind="wait_user",
+        reason="The supervisor cannot determine a safe solution to the execution fault.",
+        instruction="Advise which remaining approach can achieve the original objective.",
+        resume_condition="Requester guidance is incorporated and safe execution is verified.",
+    )
+    disposition = service.dispose_boundary(actor, boundary["id"], request)
+    assert service.dispose_boundary(actor, boundary["id"], request) == disposition
+    current = service.get_work(work["id"])
+    escalation = current["requester_escalation"]
+    assert escalation["decision"] == request.instruction
+    assert escalation["notification_state"] == "queued"
+    assert current["objective"] == work["objective"]
+    assert current["state"] == "user_needed"
+    assert current["current_attempt"]["assignment_delivery"]["safe_to_redeliver"] is False
+    notices = [
+        item for item in service.get_inbox(actor)["items"]
+        if item["payload"].get("action") == "requester_escalation"
+    ]
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice["id"] == escalation["message_id"]
+    delivery = service.db.fetchone(
+        "SELECT recipient_attachment_id FROM message_deliveries WHERE message_id = ?",
+        (notice["id"],),
+    )
+    assert delivery["recipient_attachment_id"] == actor["_cao_attachment_id"]
+    service.acknowledge(actor, AckInput(message_ids=[notice["id"]]))
+    service.mark_message_handled(
+        actor, notice["id"], evidence="The blocker and advice request were presented.",
+        expected_purpose_version=1,
+    )
+    reopened = ControlPlane(Database(system["settings"]), system["settings"])
+    restored = reopened.get_work(work["id"])
+    assert restored["requester_escalation"]["notification_state"] == "handled"
+    assert restored["state"] == "user_needed"
+    assert restored["user_needed"]["decision"] == request.instruction
+    assert restored["worker_purpose"] == current["worker_purpose"]
+    assert not build_projection(reopened.db).violations
+    public = MCPServer(reopened).call_tool(actor, "cao_get_work", {"work_item_id": work["id"]})
+    assert public["requester_escalation"]["decision"] == request.instruction
+    assert public["requester_escalation"]["notification_state"] == "handled"
+    # Advice is not proof that the unknown execution can be replayed.
+    with pytest.raises(ConflictError):
+        reopened.reply(
+            actor, work["id"], "Continue the original assignment.",
+            expected_purpose_version=1, idempotency_key="unsafe-escalation-reply",
+        )
+    assert reopened.get_work(work["id"])["state"] == "user_needed"
 
 def test_unresolved_cao_boundary_with_legacy_handled_wake_is_rearmed_once(system) -> None:
     actor = _attached(system, suffix="d")
@@ -4356,6 +4471,7 @@ def test_dynamic_worker_rate_limit_with_exact_pre_mcp_proof_rotates_same_thread(
         actor,
         boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=failed["generation"],
@@ -4551,6 +4667,7 @@ def test_v30_dynamic_rate_limit_backfill_uses_exact_delivery_proof_without_circu
         actor,
         str(recovered["id"]),
         BoundaryDispositionInput(
+            expected_purpose_version=1,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=int(current["generation"]),

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import attach_cao_session_with_peer
+from conftest import attach_cao_session_with_peer, business_purpose_contract
 
 import cao_control_plane.database as database_module
 from cao_control_plane.connection_contract import CAO_CONVERSATION_PROXY_ABI_VERSION
@@ -21,6 +21,7 @@ from cao_control_plane.models import (
     EffectGrantInput,
     InstructWorkerThreadInput,
     NewWorkerThreadInput,
+    SetWorkerPurposeInput,
     WorkAssignment,
 )
 from cao_control_plane.projection import verify_projection
@@ -585,12 +586,23 @@ def test_schema35_backfills_historical_goal_runtime_from_sealed_pre_close_epoch(
     service = system["service"]
     attachment, actor = _attach_current(service, "schema35-goal-runtime-reopen")
     managed = _new_worker(service, actor, tmp_path, "schema35-goal-runtime-reopen")
+    service.set_worker_purpose(
+        actor,
+        SetWorkerPurposeInput(
+            contract=business_purpose_contract(),
+            worker_thread_id=managed["worker_thread_id"],
+            purpose="Maintain reliable historical records across system upgrades.",
+            reason="The requester entrusted this responsibility to the Worker.",
+            idempotency_key="schema35-worker-purpose",
+        ),
+    )
     work = service.instruct_worker_thread(
         actor,
         InstructWorkerThreadInput(
             worker_thread_id=managed["worker_thread_id"],
             expected_generation=managed["thread_generation"],
             objective="Keep historical Goal and Task packets valid after attachment reopen.",
+            expected_purpose_version=1,
             acceptance=["The pre-close supervisor runtime remains immutable."],
             idempotency_key="schema35-goal-runtime-reopen-work",
         ),

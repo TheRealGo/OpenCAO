@@ -51,6 +51,7 @@ dev = [
 [project.scripts]
 cao-a2a = "cao_control_plane.cli:main"
 cao-dashboard = "cao_control_plane.dashboard_cli:main"
+cao-adaptation = "cao_control_plane.adaptation:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

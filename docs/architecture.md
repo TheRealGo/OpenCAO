@@ -7,7 +7,8 @@ layer; this document describes the underlying durable architecture.
 ## One durable supervisor kernel
 
 The daemon is the sole durable state, resume, and dispatch authority. It owns
-CAO-authored Tasks and Directives, immutable goals, Worker attempts,
+Worker business purposes, CAO-authored Tasks and Directives, immutable task
+contracts, Worker attempts,
 Worker-reported boundaries, exact-Boundary-bound and generation-fenced CAO
 reasoning turns, messages, per-recipient delivery, evidence review, exact
 conversation-scoped requester decisions, and effect authority. A CAO model
@@ -22,6 +23,10 @@ Principal
   ├── RuntimeSession(s)
   └── scoped bearer token
 
+ManagedWorkerThread
+  ├── immutable business-purpose revisions
+  └── WorkItem(s), each with its sealed purpose reference
+
 WorkItem
   ├── CAO-authored Task and Directive relations (independent/augment/interrupt/replace/cancel)
   ├── requester reference, supervising CAO, and immutable CAO session attachment
@@ -35,7 +40,13 @@ WorkItem
   └── conversation-scoped RequesterDecision 0..n
 ```
 
-A WorkItem is the stable user-facing objective. An Attempt is one execution by one Worker. Creating a retry never rewrites prior evidence.
+CAO is the Chief Agent Officer supervising multiple Workers. Each Worker has
+an enduring business purpose; CAO reads it before every instruction or judgment.
+A WorkItem is one assigned task toward that purpose, often a checkpoint. An
+Attempt is one execution of that task by one Worker. Task completion is not
+purpose achievement. Creating a retry never rewrites prior evidence. The
+[purpose contract](managed-worker-thread-lifecycle.md#business-purpose-and-cao-judgment)
+defines persistence, current-purpose confirmation and legacy compatibility.
 
 State is deliberately multi-dimensional:
 

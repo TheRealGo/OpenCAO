@@ -9,7 +9,11 @@ from threading import Barrier, Event
 from typing import Any
 
 import pytest
-from conftest import attach_cao_session_with_peer, current_cao_session_attachment
+from conftest import (
+    attach_cao_session_with_peer,
+    business_purpose_contract,
+    current_cao_session_attachment,
+)
 
 from cao_control_plane.errors import (
     AuthorizationError,
@@ -36,6 +40,7 @@ from cao_control_plane.models import (
     ReviewVerdict,
     RuntimeHeartbeat,
     RuntimeState,
+    SetWorkerPurposeInput,
     StatusRequestInput,
     WorkAssignment,
     WorkerThreadLifecycleInput,
@@ -95,6 +100,16 @@ def _new_thread(
             idempotency_key=f"new-{suffix}",
         ),
     )
+    service.set_worker_purpose(
+        actor,
+        SetWorkerPurposeInput(
+            contract=business_purpose_contract(),
+            worker_thread_id=str(created["worker_thread_id"]),
+            purpose="Sustain reliable service operation as requirements evolve.",
+            reason="The requester assigned this continuing business responsibility.",
+            idempotency_key=f"purpose-{suffix}",
+        ),
+    )
     return str(created["worker_thread_id"])
 
 
@@ -118,9 +133,9 @@ def _thread_route(service: ControlPlane, thread_id: str) -> dict[str, Any]:
     return dict(row)
 
 
-def _enroll_current_runtime(service: ControlPlane, thread_id: str) -> tuple[dict[str, Any], str]:
+def _enroll_current_runtime(service: ControlPlane, thread_id: str, *, attempt_id: str | None = None) -> tuple[dict[str, Any], str]:
     route = _thread_route(service, thread_id)
-    launch = service.issue_runtime_launch_ticket(str(route["runtime_session_id"]))
+    launch = service.issue_runtime_launch_ticket(str(route["runtime_session_id"]), attempt_id=attempt_id)
     exchange = service.exchange_runtime_launch_ticket(str(launch["ticket"]))
     worker = service.authenticate(str(exchange["token"]))
     service.record_mcp_tool_discovery(
@@ -157,6 +172,7 @@ def _instruct(
             expected_generation=1,
             objective="Produce the exact durable result.",
             idempotency_key=f"instruct-{suffix}",
+            expected_purpose_version=1,
         ),
     )
 
@@ -224,6 +240,7 @@ def _wait_user(
             reason="The requester owns this exact choice.",
             instruction="Choose option A or option B.",
             resume_condition="The requester supplies one exact option.",
+            expected_purpose_version=1,
         ),
     )
     return service.get_work(str(waiting["id"]))
@@ -288,13 +305,19 @@ def _offline_revised_work(
         and item["payload"].get("boundary_id") == boundary["id"]
     )
     service.acknowledge(actor, AckInput(message_ids=[notification["id"]]))
-    _wait_user(service, actor, waiting, suffix=suffix)
+    consultation = _wait_user(service, actor, waiting, suffix=suffix)["requester_escalation"]
+    service.acknowledge(actor, AckInput(message_ids=[consultation["message_id"]]))
+    service.mark_message_handled(
+        actor, consultation["message_id"], expected_purpose_version=1,
+        evidence="The requester was asked the exact choice before supplying a revision.",
+    )
     native_session_id = f"native-session-{suffix}"
     _disconnect_with_native(service, runtime_id, native_session_id=native_session_id)
     MCPServer(service).call_tool(
         actor,
         "cao_revise_goal",
         {
+            "expected_purpose_version": 1,
             "work_item_id": work_id,
             "expected_version": 1,
             "objective": "Produce the revised exact durable result.",
@@ -553,6 +576,7 @@ def test_disconnected_disposition_uses_one_replacement_assignment(
             kind=kind,
             reason="The exact next action is now decided.",
             instruction=(instruction if kind != BoundaryDispositionKind.RETRY else ""),
+            expected_purpose_version=1,
         ),
     )
     current = service.get_work(str(waiting["id"]))["current_attempt"]
@@ -621,6 +645,7 @@ def test_disconnected_user_needed_reply_uses_one_replacement_assignment(
         actor,
         "cao_reply",
         {
+            "expected_purpose_version": 1,
             "work_item_id": str(user_needed["id"]),
             "message": "Use option B exactly.",
             "idempotency_key": "reply-user-needed-offline",
@@ -699,6 +724,7 @@ def test_disconnected_wait_user_reply_rolls_back_continuation_and_epoch_on_final
             work_id,
             "Persist this requester decision atomically.",
             idempotency_key="reply-wait-final-receipt-rollback",
+            expected_purpose_version=1,
         )
 
     assert _ledger_snapshot(service, snapshot_tables) == before
@@ -708,6 +734,7 @@ def test_disconnected_wait_user_reply_rolls_back_continuation_and_epoch_on_final
         work_id,
         "Persist this requester decision atomically.",
         idempotency_key="reply-wait-final-receipt-rollback",
+        expected_purpose_version=1,
     )
 
     assert resumed["state"] == "active"
@@ -746,6 +773,7 @@ def test_disconnected_open_boundary_reply_uses_one_replacement_assignment(
         work_id,
         "Use the exact supervisor correction.",
         idempotency_key="open-boundary-offline-reply",
+        expected_purpose_version=1,
     )
 
     current = resumed["current_attempt"]
@@ -782,6 +810,7 @@ def test_disposed_boundary_replay_reauthorizes_the_exact_conversation_before_ret
         kind=BoundaryDispositionKind.CORRECT,
         reason="Apply the exact owning-conversation correction.",
         instruction="Continue only on the owning conversation lane.",
+        expected_purpose_version=1,
     )
     disposed = service.dispose_boundary(owner, boundary_id, request)
     assert disposed["boundary_id"] == boundary_id
@@ -854,6 +883,7 @@ def test_foreign_attachment_cannot_replay_cached_work_authority(
             acceptance=["Only the owning conversation receives this revision bundle."],
             reason="Exercise cached replay authorization.",
             idempotency_key="foreign-cache-revise-goal",
+            expected_purpose_version=1,
         )
 
         def invoke(actor: dict[str, Any]) -> dict[str, Any]:
@@ -919,6 +949,7 @@ def test_foreign_attachment_cannot_replay_cached_assignment_result(
         maturity=GoalMaturity.DEFINED,
         acceptance=["The assigned Work remains bound to its owning conversation."],
         idempotency_key="foreign-cache-assign-work",
+        expected_purpose_version=1,
     )
     assigned = service.assign_work(owner, request)
     work_id = str(assigned["id"])
@@ -967,6 +998,7 @@ def test_foreign_attachment_cannot_replay_cached_work_mutator_result(
                 work_id,
                 "Use the exact owner-scoped requester decision.",
                 idempotency_key="foreign-cache-reply",
+                expected_purpose_version=1,
             )
 
     elif ingress == "create_attempt":
@@ -981,6 +1013,7 @@ def test_foreign_attachment_cannot_replay_cached_work_mutator_result(
                 idempotency_key="foreign-cache-create-attempt",
                 managed_worker_thread_id=thread_id,
                 managed_worker_thread_generation=1,
+                expected_purpose_version=1,
             )
 
     else:
@@ -1059,6 +1092,7 @@ def test_new_runtime_credential_cannot_replay_cached_report_from_prior_attempt_r
         work_id,
         "Resume on a fresh exact runtime route.",
         idempotency_key="cache-report-route-resume",
+        expected_purpose_version=1,
     )
     assert int(resumed["current_attempt"]["attempt_number"]) == 2
     second_worker, second_runtime_id = _enroll_current_runtime(service, thread_id)
@@ -1115,7 +1149,13 @@ def test_foreign_attachment_cannot_replay_cached_review_bundle(
         attempt_id=str(attempt["id"]),
         verdict=ReviewVerdict.NEEDS_WORK,
         summary="The owning conversation requests one exact correction.",
+        criterion_assessments=[
+            {"criterion_id": item["id"], "verdict": "unmet",
+             "evidence": "The owner-scoped fixture result needs the specified correction."}
+            for item in work["review_criteria"]
+        ],
         idempotency_key="foreign-cache-review",
+        expected_purpose_version=1,
     )
     owner_result = service.review(owner, request)
     assert owner_result["id"] == work_id
@@ -1161,6 +1201,7 @@ def test_disconnected_open_boundary_reply_different_key_loser_is_atomic(
                 work_id,
                 f"Use exact option {ordinal}.",
                 idempotency_key=f"offline-reply-race-{ordinal}",
+                expected_purpose_version=1,
             )
         except ControlPlaneError as error:
             return error
@@ -1234,6 +1275,7 @@ def test_atomic_open_boundary_reply_rolls_back_every_row_on_late_admission_block
             work_id,
             "Apply the exact atomic correction.",
             idempotency_key="reply-atomic-rollback",
+            expected_purpose_version=1,
         )
 
     assert caught.value.details == {
@@ -1265,7 +1307,9 @@ def test_exact_legacy_leased_reply_turn_resumes_through_shared_disposition_core(
         key=key,
     )
 
-    result = service.reply(actor, work_id, message_text, idempotency_key=key)
+    result = service.reply(
+        actor, work_id, message_text, idempotency_key=key, expected_purpose_version=1
+    )
 
     assert result["id"] == work_id
     turns = service.db.fetchall(
@@ -1332,7 +1376,7 @@ def test_exact_expired_legacy_reply_turn_is_replaced_atomically(
             ),
         )
 
-    service.reply(actor, work_id, message_text, idempotency_key=key)
+    service.reply(actor, work_id, message_text, idempotency_key=key, expected_purpose_version=1)
 
     turns = service.db.fetchall(
         "SELECT id, state FROM reasoner_turns WHERE boundary_id = ? ORDER BY created_at, id",
@@ -1410,7 +1454,7 @@ def test_corrupt_legacy_reply_turn_receipt_fails_closed_without_mutation(
     before = _ledger_snapshot(service, snapshot_tables)
 
     with pytest.raises(ConflictError) as caught:
-        service.reply(actor, work_id, message_text, idempotency_key=key)
+        service.reply(actor, work_id, message_text, idempotency_key=key, expected_purpose_version=1)
 
     assert caught.value.details == {
         "reason_code": "reply_turn_provenance_conflict",
@@ -1450,6 +1494,7 @@ def test_exact_legacy_disposed_reply_residue_replays_without_redisposition(
             kind=BoundaryDispositionKind.CORRECT,
             reason="Supervisor response to a recorded boundary",
             instruction=message_text,
+            expected_purpose_version=1,
         ),
         expected_work_item_id=work_id,
     )
@@ -1471,7 +1516,9 @@ def test_exact_legacy_disposed_reply_residue_replays_without_redisposition(
     )
     before = _ledger_snapshot(service, domain_tables)
 
-    replay = service.reply(actor, work_id, message_text, idempotency_key=key)
+    replay = service.reply(
+        actor, work_id, message_text, idempotency_key=key, expected_purpose_version=1
+    )
 
     assert replay["id"] == work_id
     assert _ledger_snapshot(service, domain_tables) == before
@@ -1510,6 +1557,7 @@ def test_explicit_reply_to_disposed_wait_user_boundary_uses_requester_continuati
         "Use the exact requester-selected option.",
         in_reply_to=str(question_message["id"]),
         idempotency_key="reply-wait-user-explicit",
+        expected_purpose_version=1,
     )
 
     assert resumed["state"] == "active"
@@ -1541,6 +1589,7 @@ def test_same_attempt_can_ask_wait_and_consume_two_exact_requester_decisions(
         work_id,
         "Use requester option A for the first decision.",
         idempotency_key="two-waits-first-reply",
+        expected_purpose_version=1,
     )
 
     first_instruction = service.db.fetchone(
@@ -1568,6 +1617,7 @@ def test_same_attempt_can_ask_wait_and_consume_two_exact_requester_decisions(
         work_id,
         "Use requester option B for the second decision.",
         idempotency_key="two-waits-second-reply",
+        expected_purpose_version=1,
     )
 
     assert first_reply["current_attempt"]["id"] == second_reply["current_attempt"]["id"]
@@ -1667,6 +1717,7 @@ def test_concurrent_wait_user_replies_consume_one_exact_boundary(
                     if same_key
                     else f"concurrent-wait-user-different-{ordinal}"
                 ),
+                expected_purpose_version=1,
             )
         except ControlPlaneError as error:
             return error
@@ -1824,6 +1875,7 @@ def test_wait_user_reply_rechecks_no_new_unresolved_boundary_after_selection(
             work_id,
             "Do not cross the newly unresolved boundary.",
             idempotency_key="reply-wait-user-race",
+            expected_purpose_version=1,
         )
 
     assert caught.value.details == {
@@ -1868,6 +1920,7 @@ def test_resume_then_instruction_reuses_the_fresh_pending_epoch(
             maturity=GoalMaturity.DEFINED,
             acceptance=["The resumed result is reviewable."],
             idempotency_key="instruction-after-resume-one-epoch",
+            expected_purpose_version=1,
         ),
     )
     current_epochs = service.db.fetchall(
@@ -1919,6 +1972,7 @@ def test_generic_managed_assignment_cannot_guess_the_only_thread(
                 objective="Do not guess a logical Worker thread.",
                 acceptance=["No logical Worker authority is guessed."],
                 idempotency_key="ambiguous-generic-managed-assignment",
+                expected_purpose_version=1,
             ),
         )
 
@@ -1946,6 +2000,7 @@ def test_full_assignment_model_requires_and_persists_the_exact_thread_pair(
             objective="Persist the exact logical Worker authority.",
             acceptance=["The Work pair is exact before its Attempt is inserted."],
             idempotency_key="explicit-managed-assignment",
+            expected_purpose_version=1,
         ),
     )
 
@@ -1997,6 +2052,7 @@ def test_managed_assignment_rejects_a_noncanonical_runtime_without_mutation(
                 objective="Use only the route selected by exact logical authority.",
                 acceptance=["No request provenance seals a different runtime."],
                 idempotency_key="managed-assignment-runtime-mismatch",
+                expected_purpose_version=1,
             ),
         )
 
@@ -2113,7 +2169,9 @@ def test_unsettled_execution_blockers_leave_every_command_row_unchanged(
     worker, _runtime_id = _enroll_current_runtime(service, thread_id)
     instructed = _instruct(service, actor, thread_id, suffix=f"blocker-{blocker}")
     work_id = str(instructed["task"]["work_item_id"])
-    if blocker != "active_attempt":
+    if blocker == "active_attempt":
+        service.db.execute("UPDATE attempts SET state='working' WHERE work_item_id=?", (work_id,))
+    else:
         _question(service, worker, work_id, suffix=f"blocker-{blocker}")
         assignment = service.db.fetchone(
             "SELECT message.id FROM messages AS message "
@@ -2175,6 +2233,7 @@ def test_unsettled_execution_blockers_leave_every_command_row_unchanged(
                 acceptance=["The prior outcome is settled first."],
                 reason="Exercise the command admission blocker.",
                 idempotency_key=f"blocked-revision-{blocker}",
+                expected_purpose_version=1,
             ),
         )
 
@@ -2211,6 +2270,7 @@ def test_concurrent_offline_revisions_advance_once_and_stale_loser_writes_nothin
                     acceptance=["Only one revision advances the logical Work."],
                     reason="Exercise different-key revision serialization.",
                     idempotency_key=f"offline-revise-race-{ordinal}",
+                    expected_purpose_version=1,
                 ),
             )
         except StaleGoalError as error:
@@ -2286,6 +2346,7 @@ def test_two_authentic_connections_replay_same_offline_revision_once(
         acceptance=["Both authentic connections observe the same durable result."],
         reason="Exercise same-key connection linearization.",
         idempotency_key="offline-revise-two-connections",
+        expected_purpose_version=1,
     )
     ready = Barrier(2)
 
@@ -2375,6 +2436,7 @@ def test_retry_cannot_stage_a_boundary_to_erase_a_working_attempt_blocker(
             work_id,
             reason="Do not retry an execution-owned Attempt.",
             idempotency_key="retry-working-blocked",
+            expected_purpose_version=1,
         )
 
     assert caught.value.details is not None
@@ -2438,6 +2500,7 @@ def test_claimed_delivery_blocks_reply_and_retry_before_facade_mutation(
                 work_id,
                 "Do not cross the active delivery claim.",
                 idempotency_key="blocked-reply-delivery",
+                expected_purpose_version=1,
             )
         else:
             service.create_attempt(
@@ -2445,6 +2508,7 @@ def test_claimed_delivery_blocks_reply_and_retry_before_facade_mutation(
                 work_id,
                 reason="Do not retry across a dispatched Delivery.",
                 idempotency_key="blocked-retry-delivery",
+                expected_purpose_version=1,
             )
 
     assert caught.value.details is not None
@@ -2474,6 +2538,7 @@ def test_atomic_retry_same_key_converges_on_one_attempt_and_one_connection(
             work_id,
             reason="Retry this exact safe Attempt once.",
             idempotency_key="atomic-retry-same-key",
+            expected_purpose_version=1,
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -2496,6 +2561,7 @@ def test_atomic_retry_same_key_converges_on_one_attempt_and_one_connection(
             work_id,
             reason="A different request cannot reuse the same key.",
             idempotency_key="atomic-retry-same-key",
+            expected_purpose_version=1,
         )
 
 
@@ -2543,6 +2609,7 @@ def test_atomic_retry_rolls_back_boundary_epoch_attempt_and_delivery_on_injected
             work_id,
             reason="This atomic retry is deliberately interrupted.",
             idempotency_key="atomic-retry-rollback",
+            expected_purpose_version=1,
         )
 
     assert _ledger_snapshot(service, snapshot_tables) == before
@@ -2574,6 +2641,7 @@ def test_matching_legacy_retry_boundary_residue_resumes_atomically(
         work_id,
         reason=reason,
         idempotency_key="matching-retry-residue",
+        expected_purpose_version=1,
     )
 
     assert int(result["current_attempt"]["attempt_number"]) == 2
@@ -2603,10 +2671,7 @@ def test_successful_disposed_retry_without_receipt_replays_proven_successor_once
     reason = "Replay only the proven successful retry transition."
     key = "disposed-retry-success-replay"
     first = service.create_attempt(
-        actor,
-        work_id,
-        reason=reason,
-        idempotency_key=key,
+        actor, work_id, reason=reason, idempotency_key=key, expected_purpose_version=1
     )
     service.db.execute(
         "DELETE FROM idempotency_results WHERE actor_id = ? "
@@ -2632,10 +2697,7 @@ def test_successful_disposed_retry_without_receipt_replays_proven_successor_once
     before = _ledger_snapshot(service, domain_tables)
 
     replay = service.create_attempt(
-        actor,
-        work_id,
-        reason=reason,
-        idempotency_key=key,
+        actor, work_id, reason=reason, idempotency_key=key, expected_purpose_version=1
     )
 
     assert replay == first
@@ -2664,10 +2726,7 @@ def test_disposed_retry_replay_survives_later_legitimate_work_evolution(
     reason = "Preserve the immutable retry even after later Work evolution."
     key = "disposed-retry-evolved"
     retried = service.create_attempt(
-        actor,
-        work_id,
-        reason=reason,
-        idempotency_key=key,
+        actor, work_id, reason=reason, idempotency_key=key, expected_purpose_version=1
     )
     waiting_again = _question(service, worker, work_id, suffix="disposed-retry-evolved-second")
     _wait_user(service, actor, waiting_again, suffix="disposed-retry-evolved-second")
@@ -2681,6 +2740,7 @@ def test_disposed_retry_replay_survives_later_legitimate_work_evolution(
             acceptance=["The retry replay returns this current canonical Work."],
             reason="Legitimately evolve Work after the historical retry.",
             idempotency_key="evolve-after-retry",
+            expected_purpose_version=1,
         ),
     )
     assert evolved["current_attempt"]["id"] != retried["current_attempt"]["id"]
@@ -2709,10 +2769,7 @@ def test_disposed_retry_replay_survives_later_legitimate_work_evolution(
     before = _ledger_snapshot(service, domain_tables)
 
     replay = service.create_attempt(
-        actor,
-        work_id,
-        reason=reason,
-        idempotency_key=key,
+        actor, work_id, reason=reason, idempotency_key=key, expected_purpose_version=1
     )
 
     assert replay["current_attempt"]["id"] == evolved["current_attempt"]["id"]
@@ -2743,6 +2800,8 @@ def test_legacy_disposed_retry_to_different_managed_worker_replays_exact_runtime
         idempotency_key=key,
         managed_worker_thread_id=target_thread_id,
         managed_worker_thread_generation=int(target_route["thread_generation"]),
+        expected_purpose_version=1,
+        expected_successor_purpose_version=1,
     )
     successor = retried["current_attempt"]
     successor_runtime = str(successor["runtime_session_id"])
@@ -2857,6 +2916,8 @@ def test_legacy_disposed_retry_to_different_managed_worker_replays_exact_runtime
         runtime_session_id=successor_runtime,
         reason=reason,
         idempotency_key=key,
+        expected_purpose_version=1,
+        expected_successor_purpose_version=1,
     )
 
     assert replay["id"] == retried["id"]
@@ -2985,10 +3046,7 @@ def test_disposed_retry_without_a_successor_is_bounded_and_zero_mutation(
 
     with pytest.raises(ConflictError) as caught:
         service.create_attempt(
-            actor,
-            work_id,
-            reason=reason,
-            idempotency_key=key,
+            actor, work_id, reason=reason, idempotency_key=key, expected_purpose_version=1
         )
 
     assert caught.value.details == {
@@ -3012,10 +3070,7 @@ def test_disposed_retry_successor_assignment_is_immutable_and_zero_mutation(
     reason = "Reject a retry whose successor provenance was altered."
     key = "disposed-retry-tampered"
     retried = service.create_attempt(
-        actor,
-        work_id,
-        reason=reason,
-        idempotency_key=key,
+        actor, work_id, reason=reason, idempotency_key=key, expected_purpose_version=1
     )
     latest = retried["current_attempt"]
     assignment = service.db.fetchone(
@@ -3089,10 +3144,7 @@ def test_cross_work_retry_boundary_residue_is_bounded_and_zero_mutation(
         )
     else:
         service.create_attempt(
-            actor,
-            source_work_id,
-            reason=reason,
-            idempotency_key=key,
+            actor, source_work_id, reason=reason, idempotency_key=key, expected_purpose_version=1
         )
         service.db.execute(
             "DELETE FROM idempotency_results WHERE actor_id = ? "
@@ -3120,10 +3172,7 @@ def test_cross_work_retry_boundary_residue_is_bounded_and_zero_mutation(
 
     with pytest.raises(ConflictError) as caught:
         service.create_attempt(
-            actor,
-            target_work_id,
-            reason=reason,
-            idempotency_key=key,
+            actor, target_work_id, reason=reason, idempotency_key=key, expected_purpose_version=1
         )
 
     assert caught.value.details == {
@@ -3203,6 +3252,7 @@ def test_retry_successor_rejects_nonexact_managed_pair_without_any_mutation(
             idempotency_key=f"invalid-successor-{invalid_binding}",
             managed_worker_thread_id=thread_id,
             managed_worker_thread_generation=generation,  # type: ignore[arg-type]
+            expected_purpose_version=1,
         )
 
     assert _ledger_snapshot(service, snapshot_tables) == before
@@ -3232,6 +3282,8 @@ def test_full_mcp_retry_rebinds_to_exact_managed_successor_atomically(
             "managed_worker_thread_generation": 1,
             "reason": "Move the exact Work to its explicit managed successor.",
             "idempotency_key": "exact-managed-successor",
+            "expected_purpose_version": 1,
+            "expected_successor_purpose_version": 1,
         },
     )
 
@@ -3299,6 +3351,7 @@ def test_managed_retry_rejects_even_a_current_runtime_override_without_mutation(
             runtime_session_id=runtime_id,
             reason="A managed retry cannot select its execution route.",
             idempotency_key="managed-retry-runtime-selector",
+            expected_purpose_version=1,
         )
 
     assert caught.value.details == {"reason_code": "managed_runtime_selection_forbidden"}
@@ -3356,6 +3409,7 @@ def test_legacy_null_work_binding_never_guesses_its_unique_managed_thread(
                     acceptance=["The unresolved binding remains unchanged."],
                     reason="Exercise legacy binding admission.",
                     idempotency_key="legacy-null-revise",
+                    expected_purpose_version=None,
                 ),
             )
         elif command == "reply":
@@ -3364,6 +3418,7 @@ def test_legacy_null_work_binding_never_guesses_its_unique_managed_thread(
                 work_id,
                 "Use option A.",
                 idempotency_key="legacy-null-reply",
+                expected_purpose_version=None,
             )
         else:
             service.create_attempt(
@@ -3371,6 +3426,7 @@ def test_legacy_null_work_binding_never_guesses_its_unique_managed_thread(
                 work_id,
                 reason="Do not infer a retry lane.",
                 idempotency_key="legacy-null-retry",
+                expected_purpose_version=None,
             )
 
     assert caught.value.details is not None
@@ -3402,6 +3458,7 @@ def test_connected_commands_do_not_rotate_the_execution_connection(
                     acceptance=["The live connection generation remains one."],
                     reason="Exercise connected revision admission.",
                     idempotency_key="connected-revise",
+                    expected_purpose_version=1,
                 ),
             )
         else:
@@ -3410,6 +3467,7 @@ def test_connected_commands_do_not_rotate_the_execution_connection(
                 work_id,
                 "Use option A on the current connection.",
                 idempotency_key="connected-reply",
+                expected_purpose_version=1,
             )
     else:
         boundary = waiting["open_boundaries"][-1]
@@ -3430,6 +3488,7 @@ def test_connected_commands_do_not_rotate_the_execution_connection(
                 kind=BoundaryDispositionKind.CONTINUE,
                 reason="Continue on the exact connected Attempt.",
                 instruction="Continue with option A.",
+                expected_purpose_version=1,
             ),
         )
     route = _thread_route(service, thread_id)
@@ -3485,6 +3544,7 @@ def test_legacy_assignment_idempotency_digest_without_new_pair_fields_replays(
         objective="Replay the pre-thread-binding request digest.",
         acceptance=["No second Work or Attempt is created."],
         idempotency_key="legacy-assignment-pair-digest",
+        expected_purpose_version=None,
     )
     first = service.assign_work(system["cao"], request)
     legacy_fields = request.model_dump(mode="json")

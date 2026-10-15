@@ -27,8 +27,8 @@ generation, and bounded display/launch-profile labels. Runtime, enrollment,
 provider-session, and workspace identities remain private.
 
 `cao_instruct_worker_thread` is the separate task operation for one exact
-active thread. It requires only the thread, bounded objective, and idempotency
-key. Title is optional and maturity defaults
+active thread. It requires the thread, bounded `instruction`, current
+`expected_purpose_version`, and idempotency key. Title is optional and maturity defaults
 to the explicitly stored `unset`; `defined` alone requires an acceptance
 condition. The instruction is durably queued even when its Worker connection
 is unavailable or the Worker already has unsettled Work. Every call creates an
@@ -45,6 +45,127 @@ in the requester-facing four-operation lifecycle maps to the existing Finish
 operation and its resumable archive. A stale generation cannot mutate a newer
 lifecycle. A foreign or unknown identifier is reported as the same scoped
 not-found condition.
+
+## Business purpose and CAO judgment
+
+CAO is the Chief Agent Officer: one CAO supervises multiple Workers and knows
+why each Worker's business responsibility exists. Each logical Worker retains
+its own business purpose independently of individual Work instructions. CAO
+uses that purpose to define outcomes and evaluate submitted evidence against
+task background and acceptance. The Worker owns ordinary method choices,
+diagnosis, implementation and experiments within its sealed task. CAO returns
+missing evidence or unmet outcomes without taking over execution or imposing
+approval on each choice; scope, authority, resource and unresolved blocker
+boundaries still require supervision. A task is often a checkpoint toward the
+purpose. Accepting a satisfied task does not complete or revise the purpose;
+delegate the next outcome without moving the current acceptance conditions.
+
+### Fixed purpose contract and task review
+
+New purpose definitions and revisions require a structured `contract` alongside
+business direction. CAO defines these fields from the requester direction before
+delegation; incomplete or whitespace-only fields and duplicate criterion IDs
+cannot commit a purpose revision.
+
+| Field | Required meaning |
+| --- | --- |
+| `outcome` | The observable state the responsibility should achieve |
+| `scope` | The subjects and boundaries to which the judgment applies |
+| `criteria` | Stable IDs, fixed pass conditions, and the evidence for each condition |
+| `completion` | The finite completion boundary, or the explicit checkpoint and continuation rule for ongoing work |
+| `authority` | Permitted operations, exclusions, resource and cost boundaries |
+| `unmet_action` | How to continue unmet outcomes and escalate a concrete unresolved blocker |
+
+The contract is sealed as `cao-worker-purpose/v2` in the existing immutable
+purpose packet. Existing v1 purpose and task packets retain their exact contents
+and digests; the system never invents historical criteria. Existing task recovery
+and terminal lifecycle authority remain available. New managed assignments first
+require a defined contract. Dashboard purpose text includes the complete contract.
+Structural validation cannot establish that prose is sufficiently precise: CAO
+must choose observable evidence, a fixed reference and a decision boundary, rather
+than repeat an adjective or an unbounded future guarantee.
+
+`cao_get_work.review_criteria` lists IDs and conditions from that task's verified
+immutable Goal packet. Explicit acceptance conditions become `task_1`, `task_2`,
+and so on; an unset/exploring task is judged against its bounded `task_instruction`.
+A Review of a structured assignment supplies `criterion_assessments` for every
+listed ID, each with `met`, `unmet`, or `unverified` and supporting evidence.
+Unknown/duplicate/missing IDs and a contradictory overall verdict cannot commit.
+These assessments remain bound to the original task packet and assignment purpose
+version in the Review evidence. Satisfying a checkpoint does not require every
+outstanding business-purpose outcome to be met.
+
+After a purpose revision, read `purpose_alignment` on each affected task. Its
+current and assignment versions distinguish a saved purpose from a revised task.
+A Review after a purpose change explicitly confirms
+`expected_assignment_purpose_version`; it still judges the frozen task conditions.
+If the task must change, use `cao_revise_task` at its admitted safe boundary.
+A never-claimed queued Assignment may be replaced on its current exact connection
+even while another Work is executing. That transaction retires only proven
+unclaimed terminal inputs; it does not rotate the executing connection or replay
+its Delivery. A claimed/dispatched Assignment, launch authority, captured output,
+artifact or unresolved effect cannot use this queue-only route.
+
+Before each instruction or business judgment, CAO reads the current
+`worker_purpose` from `cao_list_managed_workers`, `cao_get_work`, or
+`cao_acquire_reasoner_turn`. This context includes the complete purpose text,
+version and digest, and instructions to reason from it. CAO confirms the read
+version with `expected_purpose_version` on instruction, task revision, reply,
+review, handling a report without a Boundary, Boundary disposition, task
+resumption, retry and requester-decision
+commands. The same transaction checks that the version is still current;
+stale or omitted confirmation cannot commit a new decision. Confirmed business
+judgments are recorded in the existing event ledger. A matching idempotent
+replay returns the already committed result after authenticating the caller;
+it does not make another judgment. A reasoner-lease replay refreshes current
+purpose context without changing the lease identity.
+
+`cao_set_worker_purpose` defines or explicitly revises business direction for
+one exact same-project `worker_thread_id`. Supply `purpose`, the reason for the
+business-direction decision, an idempotency key and `expected_purpose_version`
+(`0` for an unset purpose). Revisions are immutable and independently numbered;
+`expected_generation` remains an optional Worker lifecycle guard. A changed
+local instruction, format constraint or method is never grounds to replace
+business purpose. Define or revise it from the requester's business direction.
+
+New managed assignments require a defined purpose. New Work seals that purpose
+snapshot into its existing contract; `assignment_purpose` stays frozen while
+`worker_purpose` shows the current business direction. If they differ,
+`purpose_changed_since_assignment` is true so CAO can judge what the changed
+purpose means for that task. The public `instruction` field and
+`cao_revise_task` name describe the task contract. `objective` and
+`cao_revise_goal` remain compatible names for that same task data; they do not
+control Worker business purpose. No additional task/execution hierarchy,
+purpose scheduler or automatic purpose-completion state is introduced.
+
+Recording later Work while the first Assignment starts preserves the current
+connection and enrollment; it never retires an in-flight bootstrap. Worker
+context resolves the current consumed launch-ticket Attempt. An older unscoped
+launch uses the exact credential runtime and Assignment sequence, never the
+latest updated Work or a queued later task.
+
+Each new Assignment message also seals the selected Worker's current purpose,
+including after a correction or retry. An explicitly authorized administrative
+handoff checks both the source purpose and the exact successor's
+`expected_successor_purpose_version` before committing. The original Work
+purpose remains historical context; neither Work transfer nor replay changes
+either Worker's business responsibility.
+
+Schema 47 stores purpose revisions and exact Work-revision references.
+Purpose identity uses the shared immutable-packet canonical JSON encoder for
+both writing and verification, including non-ASCII purpose and revision text.
+Previously sealed Work retains its original packets and digests without an
+inferred purpose. Historical task supervision and recovery remain available
+when purpose is unset; a new managed assignment first requires CAO to define
+the known business purpose. An unknown purpose stays visibly unset, never
+copied from the latest task, label, constraint or Directory.
+
+Reconnect, task completion and archive/resume preserve purpose. Delete retains
+its revision history alongside Work evidence. Explicit Finish/Delete and
+conversation cancellation are terminal authority, independent of business
+purpose confirmation. Corrupt purpose metadata is reported as invalid on the
+Worker list and cannot authorize a new instruction; it does not hide unrelated
+Workers or block exact terminal lifecycle control.
 
 ## Archive meaning
 

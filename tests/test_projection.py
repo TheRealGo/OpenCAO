@@ -96,7 +96,7 @@ def test_pristine_received_intent_is_visible_pending_not_integrity_drift(system)
     assert projection.snapshot["pending_intents"] == 1
 
 
-def test_worker_progress_wakes_supervisor_but_artifact_only_does_not(system):
+def test_worker_informational_reports_are_durable_without_supervisor_wake(system):
     work = _assign(system)
     attempt = work["current_attempt"]
     common = {
@@ -134,7 +134,7 @@ def test_worker_progress_wakes_supervisor_but_artifact_only_does_not(system):
 
     assert {row["kind"]: row["count"] for row in report_deliveries} == {
         "artifact": 0,
-        "progress": 1,
+        "progress": 0,
     }
     assert projection.healthy is True
     assert all(
@@ -199,3 +199,32 @@ def test_projection_rejects_goal_packet_with_different_semantic_columns(system):
     assert projection.healthy is False
     assert "goal.packet_invalid" in codes
     assert "work.current_goal_semantics_mismatch" in codes
+
+
+def test_report_receipt_membership_is_not_a_correlated_table_scan(system):
+    """Receipt volume must not multiply the cost of every Work report lookup."""
+    from cao_control_plane.projection import build_projection_from_connection
+
+    _assign(system)
+    statements = []
+    with system["service"].db.connection_scope() as connection:
+        connection.set_trace_callback(statements.append)
+        build_projection_from_connection(connection, as_of=AS_OF)
+        connection.set_trace_callback(None)
+        report_query = next(
+            sql for sql in statements
+            if sql.lstrip().startswith("WITH valid_requester_decisions")
+        )
+        plan = connection.execute("EXPLAIN QUERY PLAN " + report_query).fetchall()
+    nodes = {row[0]: (row[1], row[3]) for row in plan}
+    receipt_reads = [row for row in plan if "worker_output_receipts" in row[3]]
+    assert receipt_reads
+    for row in receipt_reads:
+        parent = row[1]
+        while parent in nodes:
+            parent, detail = nodes[parent]
+            assert "CORRELATED" not in detail
+            if "LIST SUBQUERY" in detail:
+                break
+        else:
+            raise AssertionError("receipt lookup lacks an independent set")

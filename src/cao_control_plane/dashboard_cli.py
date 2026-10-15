@@ -329,7 +329,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = upgrade_dashboard_lifecycle(
                     upgrade_plan,
                     runner,
-                    probe=HttpxDashboardUpgradeProbe(HttpxProbe()),
+                    # Full database/projection checks can exceed the short
+                    # status budget on a healthy installation with history.
+                    probe=HttpxDashboardUpgradeProbe(HttpxProbe(timeout_seconds=30.0)),
                     receipt=receipt,
                     execute=args.execute,
                     owner_confirmed=args.owner_confirm,

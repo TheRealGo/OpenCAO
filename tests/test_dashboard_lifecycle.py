@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 
+import httpx
 import pytest
 
 from cao_control_plane.canonical import canonical_sha256
@@ -35,8 +36,10 @@ from cao_control_plane.dashboard_lifecycle import (
     ExactDashboardUpgradeProcessController,
     HttpResult,
     HttpxDashboardUpgradeProbe,
+    HttpxProbe,
     LifecycleUnknownOutcome,
     UpgradeLaunchAgentBinding,
+    _checked_codex_socket,
     _lifecycle_process_argv,
     _previous_canonical_launchagent_plist,
     apply_dashboard_lifecycle,
@@ -346,6 +349,73 @@ def _owner_unix_socket():
             server.close()
 
 
+@pytest.mark.parametrize(
+    "unsafe",
+    ["noncanonical", "relative", "chained", "target_permissions", "target_parent", "alias_parent"],
+)
+def test_codex_socket_alias_rejects_untrusted_routes(
+    unsafe: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alias_parent = tmp_path.resolve() / "control"
+    alias_parent.mkdir(mode=0o700)
+    alias = alias_parent / "control.sock"
+    monkeypatch.setattr(
+        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_socket",
+        lambda: alias if unsafe != "noncanonical" else alias_parent / "different.sock",
+    )
+    with _owner_unix_socket() as endpoint:
+        destination = endpoint
+        if unsafe == "relative":
+            destination = Path(os.path.relpath(endpoint, alias.parent))
+        elif unsafe == "chained":
+            destination = alias_parent / "intermediate"
+            destination.symlink_to(endpoint)
+        elif unsafe == "target_permissions":
+            endpoint.chmod(0o666)
+        elif unsafe == "target_parent":
+            endpoint.parent.chmod(0o755)
+        elif unsafe == "alias_parent":
+            alias_parent.chmod(0o755)
+        alias.symlink_to(destination)
+        with pytest.raises(ValueError, match="Codex app-server socket"):
+            _checked_codex_socket(alias)
+
+
+def test_codex_reload_rejects_alias_redirection_before_sending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cao_control_plane.runtime import _JsonRpcDesktopSocket
+
+    parent = tmp_path.resolve() / "control"
+    parent.mkdir(mode=0o700)
+    alias = parent / "control.sock"
+    monkeypatch.setattr(
+        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_socket", lambda: alias,
+    )
+    closed = []
+
+    class UnusedRPC:
+        async def close(self):
+            closed.append(True)
+
+        async def send(self, payload):
+            pytest.fail("must reject changed endpoint before any RPC")
+
+    with _owner_unix_socket() as first, _owner_unix_socket() as second:
+        alias.symlink_to(first)
+
+        async def connect(path, *, timeout):
+            alias.unlink()
+            alias.symlink_to(second)
+            return UnusedRPC()
+
+        monkeypatch.setattr(_JsonRpcDesktopSocket, "connect", staticmethod(connect))
+        with pytest.raises(RuntimeError, match="reload preflight failed") as caught:
+            reload_codex_mcp_server(alias, "a" * 64)
+        assert "changed identity while connecting" in str(caught.value.__cause__)
+    assert closed == [True]
+
+
 def _test_codex_app_server_executable(
     root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -359,6 +429,29 @@ def _test_codex_app_server_executable(
         lambda: executable,
     )
     return executable
+
+
+def test_canonical_codex_executable_supports_packaged_desktop_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy = tmp_path / "ChatGPT.app" / "Contents" / "Resources" / "codex"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"signed-codex-test-double")
+    legacy.chmod(0o755)
+    packaged = legacy.parent / "codex-cli" / "CodexCLI.app" / "Contents" / "MacOS" / "codex"
+    packaged.parent.mkdir(parents=True)
+    packaged.write_bytes(b"signed-codex-test-double")
+    packaged.chmod(0o755)
+    monkeypatch.setattr(
+        "cao_control_plane.runtime._BUNDLED_CODEX_EXECUTABLES", (legacy, packaged)
+    )
+    assert canonical_codex_app_server_executable() == legacy
+    legacy.unlink()
+    assert canonical_codex_app_server_executable() == packaged
+    packaged.unlink()
+    assert canonical_codex_app_server_executable() == Path(
+        "/Applications/Codex.app/Contents/Resources/codex"
+    )
 
 
 def _codex_desktop_binding(
@@ -2141,6 +2234,29 @@ def test_control_plane_readiness_failure_never_bootstraps_edge_or_reloads_codex(
     assert edge_bootstrap not in runner.calls
 
 
+@pytest.mark.parametrize("response_seconds", [9.5, 31.0])
+def test_upgrade_probe_admits_slow_healthy_readiness_but_keeps_a_deadline(
+    response_seconds: float, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _settings_value, _lifecycle, plan = _upgrade_plan(tmp_path)
+
+    def get(url, *, headers, timeout, follow_redirects):
+        assert follow_redirects is False
+        if url.endswith("/ready") and response_seconds > timeout:
+            raise httpx.ReadTimeout("readiness deadline")
+        if url.endswith("/dashboard/"):
+            return httpx.Response(200, text="<!doctype html>", headers={"content-type": "text/html"})
+        return httpx.Response(200, json={"ready": True, "status": "ok"})
+
+    monkeypatch.setattr("cao_control_plane.dashboard_lifecycle.httpx.get", get)
+    probe = HttpxDashboardUpgradeProbe(HttpxProbe(timeout_seconds=30.0))
+    if response_seconds > 30.0:
+        with pytest.raises(RuntimeError, match="upgrade preflight requires"):
+            probe.require_preflight_ready(plan, target_projection_verified=True)
+    else:
+        probe.require_preflight_ready(plan, target_projection_verified=True)
+
+
 def test_upgrade_probe_requires_exact_release_schema_catalog_and_edge_html(tmp_path: Path) -> None:
     _settings_value, _lifecycle, plan = _upgrade_plan(tmp_path)
     identity = plan.target_identity.to_dict()
@@ -2332,7 +2448,11 @@ def test_codex_reload_uses_existing_bounded_websocket_client_and_exact_envelopes
     ]
 
 
+@pytest.mark.parametrize("socket_alias", [False, True])
+@pytest.mark.parametrize("managed_layout", ["standalone/current/codex", "app-server-daemon/current/bin/codex"])
 def test_codex_host_refresh_accepts_desktop_daemon_without_managed_install_and_reloads_once(
+    socket_alias: bool,
+    managed_layout: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2344,9 +2464,12 @@ def test_codex_host_refresh_accepts_desktop_daemon_without_managed_install_and_r
     control.chmod(0o700)
     socket_path = control / "app-server-control.sock"
     old_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    old_listener.bind(os.fspath(socket_path))
+    endpoint = control / "daemon.sock" if socket_alias else socket_path
+    old_listener.bind(os.fspath(endpoint))
     old_listener.listen(1)
-    socket_path.chmod(0o600)
+    endpoint.chmod(0o600)
+    if socket_alias:
+        socket_path.symlink_to(endpoint)
     old_identity = socket_path.stat()
     executable = tmp_path / "ChatGPT.app" / "Contents" / "Resources" / "codex"
     executable.parent.mkdir(parents=True)
@@ -2398,7 +2521,7 @@ def test_codex_host_refresh_accepts_desktop_daemon_without_managed_install_and_r
                 {
                     "status": "running",
                     "managedCodexPath": os.fspath(
-                        socket_path.parent.parent / "packages" / "standalone" / "current" / "codex"
+                        socket_path.parent.parent / "packages" / managed_layout
                     ),
                     "managedCodexVersion": None,
                     "socketPath": os.fspath(socket_path),

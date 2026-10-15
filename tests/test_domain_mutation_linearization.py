@@ -832,6 +832,7 @@ def test_finish_one_public_call_archives_working_thread_and_preserves_unknown_ev
     instructed = service.instruct_worker_thread(
         actor_two,
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=3,
             objective="Create a distinct Work without retrying retained evidence.",
@@ -1169,6 +1170,7 @@ def test_instruct_accepts_distinct_work_after_completed_waiting_user_history(
     instructed = service.instruct_worker_thread(
         actor,
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=1,
             title="Distinct follow-up",
@@ -1284,6 +1286,7 @@ def test_instruct_accepts_distinct_work_after_coordination_owned_attempt(
     instructed = service.instruct_worker_thread(
         actor,
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=1,
             objective=f"Create a distinct instruction after {attempt_state} history.",
@@ -1350,6 +1353,7 @@ def test_instruct_accepts_distinct_work_during_execution_owned_attempt(
         actor,
         "cao_instruct_worker_thread",
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=1,
             objective="Create one distinct Work while execution continues.",
@@ -1464,6 +1468,7 @@ def test_instruct_preserves_unknown_evidence_while_accepting_distinct_work(
         actor,
         "cao_instruct_worker_thread",
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=1,
             objective="Create distinct Work while preserving unresolved evidence.",
@@ -1567,6 +1572,7 @@ def test_finish_is_the_only_public_close_step_for_active_and_waiting_user_worker
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=reported["generation"],
+            expected_purpose_version=1,
             kind=BoundaryDispositionKind.ACCEPT,
             reason="The result is ready for exact CAO review.",
         ),
@@ -1576,7 +1582,13 @@ def test_finish_is_the_only_public_close_step_for_active_and_waiting_user_worker
         ReviewInput(
             attempt_id=waiting_attempt["id"],
             verdict=ReviewVerdict.OK,
+            expected_purpose_version=1,
             summary="The result is verified and awaiting the requester.",
+            criterion_assessments=[
+                {"criterion_id": item["id"], "verdict": "met",
+                 "evidence": "The submitted result satisfies the fixed fixture conditions."}
+                for item in reported["review_criteria"]
+            ],
             idempotency_key="finish-many-waiting-review",
         ),
     )

@@ -22,7 +22,9 @@ supervisory state or transition it outside this contract.
 - Preserve every CAO-authored Task and Directive as a durable, attributable
   decision after CAO has interpreted the requester conversation, including
   accumulated work alongside already-open work.
-- Represent the current objective as an immutable revision history with an
+- Keep each Worker business purpose independent of its immediate instructions,
+  and require CAO to read and confirm it before each business decision.
+- Represent each task contract as an immutable revision history with an
   explicit current pointer; never overwrite prior objective, acceptance, or
   non-goal text.
 - Serialize supervisory reasoning so that one generation of a reasoner turn is
@@ -125,7 +127,10 @@ requester principal, or alternate requester UI contract.
 
 ### WorkItem and immutable GoalRevision
 
-`WorkItem` is the stable, user-visible unit of requested outcome. It owns the
+`WorkItem` is one assigned task, often a checkpoint toward a Worker business
+purpose. `GoalRevision` is the retained technical name for its task contract,
+not the enduring business purpose. The independent [Worker purpose contract](managed-worker-thread-lifecycle.md#business-purpose-and-cao-judgment)
+requires CAO to check current purpose on each instruction and judgment. Work owns the
 requester, supervising principal, current lifecycle state, current goal
 revision pointer, current attention owner, and sequence counters. It does not
 store mutable goal prose as its authoritative objective.
@@ -138,7 +143,9 @@ store mutable goal prose as its authoritative objective.
 - revision reason and revision class;
 - author, source intent or directive, correlation, and timestamp; and
 - the prior revision identifier; and
-- canonical packet JSON plus its cryptographic digest.
+- canonical packet JSON plus its cryptographic digest; and
+- the exact immutable Worker business-purpose snapshot for new managed tasks.
+  Legacy packets omit this field and retain their original digests.
 
 `WorkItem.current_goal_revision_id` MUST reference one of its own revisions.
 Creating a WorkItem atomically creates revision 1. Updating the current
@@ -198,7 +205,7 @@ An Attempt can make a completion claim, but a claim is only declared evidence.
 It cannot complete its WorkItem. A terminal Attempt does not imply a terminal
 WorkItem; the work may require review, a requester decision recorded from the
 existing CAO conversation, a correction,
-another attempt, or an explicit cancellation/failure disposition.
+another attempt, explicit cancellation, or a requester escalation.
 
 ### ReasonerTurn and exclusive generation-bound lease
 
@@ -236,7 +243,7 @@ input snapshot, and opening event.
 Every normally closed Boundary MUST have exactly one immutable `Disposition`. A
 Disposition names the decision class, actor, evidence, and resulting domain
 references. Examples are `route`, `delegate`, `resume`, `wait_user`,
-`needs_work`, `accept`, `reject`, `cancel`, `fail`, `suspend`, and
+`needs_work`, `accept`, `reject`, `cancel`, `suspend`, and
 `effect_authorize`. A partial unique constraint on `Disposition.boundary_id`,
 plus a closed-boundary constraint, enforces one disposition. An actionable open
 Boundary has neither a Disposition nor a supersession; a normally closed
@@ -352,7 +359,17 @@ any exceptional follow-up.
 | `waiting_user` | `completed` | CAO records an exact accepted RequesterDecision and completes the explicit close path. |
 | `waiting_user` | `active` | CAO records a rejected RequesterDecision and a CAO disposition resumes or replans. |
 | nonterminal | `cancelled` | An authorized cancellation disposition. |
-| nonterminal | `failed` | An explicit terminal failure disposition with evidence. |
+| `waiting_supervisor` | `user_needed` | CAO cannot proceed and records the blocker, concrete advice needed, and resume condition with a durable requester notification. |
+
+Unfinished Work cannot receive a new `fail` disposition. Historical failed
+records remain readable without reactivating their business tasks. Execution
+failure is evidence for continuation or escalation, not purpose completion.
+`wait_user` and safe `pause` commit their requester notification atomically.
+A handled notification does not resolve the consultation or complete Work.
+Schema 48 admits an escalation Boundary sourced by the exact assigned Worker
+or owning CAO. The current Work, Attempt, generation, packet and reasoner-turn
+bindings remain mandatory. Requester guidance consumes that exact consultation;
+runtime continuation rechecks its original execution proofs before proceeding.
 
 `idle` is not a WorkItem state and is not a steady-state supervision signal.
 The control plane never derives a Boundary from a runtime, screen, process, or
@@ -369,7 +386,7 @@ completion Boundary.
 | `submitted` | `completed` | CAO Review records `ok` with evidence. |
 | `submitted` | `working` | Supervisor Review requires more work. |
 | active attempt state | `cancelled` | Authorized cancellation or replacement boundary. |
-| active attempt state | `failed` | Explicit failure disposition. |
+| active attempt state | `failed` | Recorded execution failure; unfinished Work still requires CAO continuation or escalation. |
 
 ### Delivery lifecycle
 
@@ -427,9 +444,14 @@ It commits none of them if any invariant fails.
    turn ID, owner token, and WorkItem generation. A Delivery mutation requires
    its owner token and delivery generation. Expired or stale leases cannot write.
 8. **Boundary closure.** An actionable Boundary has neither a Disposition nor
-   a supersession. It closes with exactly one Disposition, or an explicit Work
-   cancellation terminally supersedes it with the exact later cancellation
-   event. No Boundary may have both, and no unrelated history can supersede it.
+   a supersession. It closes with exactly one Disposition, or existing terminal
+   Work authority supersedes its actionability. A Work cancellation uses its
+   exact later cancellation event. A committed Fail/Cancel disposition uses
+   its exact Boundary, reasoner turn, generation and later disposition event
+   to supersede earlier unresolved Boundaries of that same Work. Writers and
+   migrations use the same proof; ambiguous or missing authority stays visible.
+   Captured evidence and prior decisions remain unchanged. No Boundary may
+   have both a disposition and a supersession.
 9. **Message immutability.** Message payload and routing metadata never change.
    Each recipient has one Delivery record and acknowledgement belongs to that
    recipient only.

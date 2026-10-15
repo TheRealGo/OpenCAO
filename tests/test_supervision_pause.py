@@ -124,8 +124,7 @@ def _observe(
     read = service.read_worker_output(case["actor"], _read_request(work, output))
     assert read["content"] == text and read["complete"] is True
     if acknowledge:
-        for message_id in (output["notification_message_id"], terminal["notification_message_id"]):
-            service.acknowledge(case["actor"], AckInput(message_ids=[message_id]))
+        service.acknowledge(case["actor"], AckInput(message_ids=[terminal["notification_message_id"]]))
     if review:
         service.review(
             case["actor"],
@@ -187,7 +186,7 @@ def _decide(case: dict[str, Any], observed: dict[str, Any], **values: Any) -> di
     if observed["acknowledged"]:
         case["service"].mark_message_handled(
             case["actor"],
-            observed["output"]["notification_message_id"],
+            observed["terminal"]["notification_message_id"],
             evidence="The exact output was read and its supervision decision recorded.",
         )
     return result
@@ -426,6 +425,9 @@ def test_manual_pause_preserves_needs_work_review_and_exact_resume_condition(sce
     assert decision["kind"] == "pause"
     assert decision["reason"] == REASON
     assert decision["resume_condition"] == RESUME_CONDITION
+    assert work["requester_escalation"]["reason"] == REASON
+    assert work["requester_escalation"]["resume_condition"] == RESUME_CONDITION
+    assert work["requester_escalation"]["notification_state"] == "queued"
     assert len(work["reviews"]) == 1 and work["reviews"][0]["verdict"] == "needs_work"
     assert _worker_instructions(scenario) == []
     assert (
@@ -475,6 +477,19 @@ def test_history_and_recall_references_do_not_fabricate_audited_content_reads(sc
     )
 
 
+def _present_pause_notice(scenario) -> None:
+    service = scenario["service"]
+    notice = service.get_work(scenario["work_id"])["requester_escalation"]
+    delivery = Dispatcher(service, scenario["settings"])._claim_delivery()
+    assert delivery is not None and delivery["message_id"] == notice["message_id"]
+    assert delivery["recipient_id"] == scenario["actor"]["id"]
+    service.acknowledge(scenario["actor"], AckInput(message_ids=[notice["message_id"]]))
+    service.mark_message_handled(
+        scenario["actor"], notice["message_id"],
+        evidence="The requester was told the pause reason and condition for continuation.",
+    )
+
+
 def test_cao_actor_can_read_prior_attempts_and_explicitly_choose_pause(scenario) -> None:
     """Script the supervisor's decision; do not claim to test model reasoning."""
     service = scenario["service"]
@@ -508,6 +523,7 @@ def test_cao_actor_can_read_prior_attempts_and_explicitly_choose_pause(scenario)
     _assert_paused(scenario, observed)
     assert decision["kind"] == "pause"
     assert len(_worker_instructions(scenario)) == 3
+    _present_pause_notice(scenario)
     quiet = _snapshot(scenario)
     for _ in range(3):
         service.reconcile_cao_supervision_obligations()
@@ -1136,6 +1152,7 @@ def test_paused_worker_inputs_cannot_dispatch_after_restart_or_heartbeat(scenari
         ),
     )
     dispatcher = Dispatcher(service, scenario["settings"])
+    _present_pause_notice(scenario)
     for _ in range(3):
         service.expire_runtime_leases()
         service.reconcile_abandoned_worker_output_captures()

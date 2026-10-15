@@ -4,7 +4,7 @@ import asyncio
 from typing import Any
 
 import pytest
-from test_worker_output_delivery import _capture_fixture, _event
+from test_worker_output_delivery import _capture_fixture, _legacy_output_notification
 
 from cao_control_plane.errors import ValidationError
 from cao_control_plane.models import MessageKind, ReportInput
@@ -48,12 +48,12 @@ def _notification(system: dict[str, Any], actor: dict[str, Any], work: dict[str,
 @pytest.mark.parametrize("kind", ["first_output", "progress"])
 @pytest.mark.parametrize("delivery_state", ["delivered", "acknowledged"])
 def test_every_accepted_informational_notification_can_activate_without_a_boundary(
-    system, kind: str, delivery_state: str
+    system, kind: str, delivery_state: str, legacy_progress_wakes
 ) -> None:
     service = system["service"]
     actor, work, binding = _capture_fixture(system)
     if kind == "first_output":
-        output = service.observe_worker_output(**binding, event=_event())
+        output = _legacy_output_notification(service, work, binding)
         message_id = output["notification_message_id"]
     else:
         attempt = work["current_attempt"]

@@ -104,9 +104,20 @@ def test_task_packets_preserve_outcome_and_actor_responsibility() -> None:
     assert "requested outcome distinct from the proposed method" in agent_text
     assert "inventory, audit, or plan is not completion" in agent_text
     assert "Preserve role boundaries" in agent_text
-    assert "Separate **outcome** from **method** before sealing" in runbook_text
-    assert "acceptance condition directly observes the requested outcome" in runbook_text
+    assert "Keep a task's outcome distinct from its method and constraints" in runbook_text
+    assert "bounded instruction and observable task acceptance" in runbook_text
     assert "CAO owns delegation, evidence review, requester-facing synthesis" in runbook_text
+
+
+def test_unmet_purpose_requires_continuation_or_visible_escalation() -> None:
+    agent_text = _normalized_text(AGENT_MAP)
+    runbook_text = _normalized_text(RUNBOOK)
+    assert "continue or escalate: Worker to CAO, CAO to requester" in agent_text
+    assert "Missing knowledge, an unknown solution, and system failure" in runbook_text
+    assert "ACK or handled records communication, never resolution" in runbook_text
+    assert "Missing system recovery is not user-needed" not in runbook_text
+    tools = {tool["name"]: tool for tool in conversation_server_tools()}
+    assert "fail" not in tools["cao_dispose_boundary"]["inputSchema"]["properties"]["kind"]["enum"]
 
 
 def test_operations_contract_distinguishes_readiness_and_diagnostic_severity() -> None:
@@ -202,7 +213,7 @@ def test_runbook_requires_worker_assignment_preflight_before_rerouting() -> None
     assert "Runtime connection is Delivery state, not command-admission authority" in text
     assert "whether `assignment_readiness` is `ready` or `not_connected`" in text
     assert "`assignment_readiness=not_connected`" in text
-    assert "Use `cao_revise_goal` for that Work" in text
+    assert "Use `cao_revise_task` for that Work" in text
     assert "Use `cao_reply`, or acquire the exact reasoner turn" in text
     assert "typed current `WAIT_USER` pointer" in text
     assert "never chooses from event JSON or historical ordering" in text
@@ -339,3 +350,18 @@ def test_public_tool_descriptions_match_the_lifecycle_router() -> None:
         CONVERSATION_DELETE_WORKER_THREAD_TOOL["description"]
     )
     assert CONVERSATION_DELETE_WORKER_THREAD_TOOL["annotations"]["destructiveHint"] is True
+
+
+def test_cao_judges_each_instruction_and_report_against_durable_worker_purpose() -> None:
+    agent = _normalized_text(AGENT_MAP)
+    purpose = _normalized_text(MANAGED_WORKER_LIFECYCLE)
+    assert "Chief Agent Officer supervising multiple Workers" in agent
+    assert "Before every instruction or judgment" in agent
+    assert "task completion never completes or replaces purpose" in agent
+    assert "A task is often a checkpoint toward the purpose" in purpose
+    assert "stale or omitted confirmation cannot commit a new decision" in purpose
+    tools = {tool["name"]: tool for tool in conversation_server_tools()}
+    for name in ("cao_instruct_worker_thread", "cao_revise_task", "cao_reply", "cao_review",
+                 "cao_dispose_boundary", "cao_resume_work", "cao_mark_handled", "cao_record_requester_decision"):
+        assert "purpose" in tools[name]["description"]
+        assert "expected_purpose_version" in tools[name]["inputSchema"]["properties"]

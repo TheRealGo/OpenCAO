@@ -343,7 +343,7 @@ def lexical_score(query: str, text: str) -> float:
     """Legacy-compatible lexical ranking; callers never pass a memory value."""
 
     query_norm, text_norm = _normalize(query), _normalize(text)
-    query_tokens, text_tokens = set(_tokens(query_norm)), set(_tokens(text_norm))
+    query_tokens, text_tokens = _search_tokens(query_norm), _search_tokens(text_norm)
     if not query_tokens or not text_tokens:
         return 0.0
     return (
@@ -351,6 +351,23 @@ def lexical_score(query: str, text: str) -> float:
         + float(query_norm in text_norm)
         + sum(0.1 for token in query_tokens if token in text_norm)
     )
+
+
+def _search_tokens(text: str) -> set[str]:
+    """Retain words and index overlapping CJK spans without requiring spaces.
+
+    Only search features expand. Persisted cue anchors keep their original
+    wording, and rich values remain outside retrieval.
+    """
+    tokens = set(_tokens(text))
+    for span in re.findall(r"[\u3040-\u30ff\u3400-\u9fff]+", text):
+        for size in (2, 3):
+            tokens.update(
+                piece
+                for index in range(len(span) - size + 1)
+                if re.search(r"[\u30a0-\u30ff\u3400-\u9fff]", piece := span[index : index + size])
+            )
+    return tokens
 
 
 def _scope_tx(connection: sqlite3.Connection, actor: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -442,11 +459,14 @@ def _metadata_tx(
 
 
 def search_memories_tx(
-    connection: sqlite3.Connection, actor: Mapping[str, Any], request: MemorySearchInput
+    connection: sqlite3.Connection, actor: Mapping[str, Any], request: MemorySearchInput,
+    *, source_work_item_id: str | None = None,
 ) -> dict[str, Any]:
     """Pure scoped search inside the caller's already-authenticated transaction."""
 
     rows = _visible_rows_tx(connection, actor, active_only=True)
+    if source_work_item_id is not None:
+        rows = [row for row in rows if row["source_work_item_id"] == source_work_item_id]
     require_memory_safe_payload(request.query)
     cues = {str(row["id"]): _cues_tx(connection, str(row["id"])) for row in rows}
     related_cues: set[str] = set()
@@ -513,7 +533,7 @@ def read_memory(
         if entry is None:
             raise NotFoundError("supervision memory", request.memory_id)
         revision = connection.execute(
-            "SELECT value,value_digest FROM supervision_memory_revisions WHERE memory_id=? AND revision=?",
+            "SELECT value,value_digest,source_work_item_id FROM supervision_memory_revisions WHERE memory_id=? AND revision=?",
             (request.memory_id, request.expected_revision),
         ).fetchone()
         if revision is None:
@@ -550,6 +570,15 @@ def read_memory(
             "complete": next_offset == len(value),
             "untrusted": True,
             "scope": str(entry["scope"]),
+            "kind": str(entry["kind"]),
+            "guidance": "Historical evidence only; current purpose, roles and permissions prevail.",
+            **({"source_work_item_id": str(revision["source_work_item_id"])} if (
+                revision["source_work_item_id"] is not None
+                and connection.execute(
+                    "SELECT 1 FROM work_items WHERE id=? AND supervisor_id=? AND supervisor_attachment_id=?",
+                    (revision["source_work_item_id"], actor["id"], actor["_cao_attachment_id"]),
+                ).fetchone() is not None
+            ) else {}),
             "lifecycle_state": str(entry["lifecycle_state"]),
         }
 

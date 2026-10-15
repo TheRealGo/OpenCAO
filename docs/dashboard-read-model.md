@@ -9,7 +9,7 @@ The Control Plane exposes a single, versioned, read-only operator contract:
 
 ## Reading and information hierarchy
 
-The Dashboard answers three everyday questions: what is the objective, what
+The Dashboard answers three everyday questions: what business purpose the Worker serves, what
 did the Worker report, and who needs to act next. It uses the existing
 server-owned Worker categories and completion criteria. Presentation does not
 change the status-request clock, recovery capabilities, delivery authority,
@@ -17,10 +17,11 @@ Worker lifecycle or close contract.
 
 | Information | Presentation and meaning |
 | --- | --- |
-| Objective and latest report | `objective_text` and `latest_report_text` preserve the complete redacted text and paragraph breaks. Short content is immediately visible; long content uses native, keyboard-operable disclosure. The 280-character summary fields remain compatibility previews, never the source of the expanded body. |
+| Business purpose, instruction and latest report | Worker `purpose_text` persists without active Work. Work `purpose_text` is the frozen assignment purpose; `instruction_text` and `latest_report_text` preserve the complete redacted text and paragraph breaks. Short content is immediately visible; long content uses native, keyboard-operable disclosure. The 280-character summary fields remain compatibility previews, never the source of the expanded body. |
 | Current progress and next step | Show available Worker-declared values and one current action label. Never repeat protocol state, trajectory and attention owner as equivalent user-facing status rows. |
 | Verified completion | Lead with CAO review completion and its timestamp. Later requester acceptance or close bookkeeping is diagnostic history, not an active request for input. A completion claim remains distinct from review. |
-| Recovery and automatic supervision | Show an exceptional notice only for an actually present, allowlisted recovery capability. Details contain the matching notification evidence; recovery is never a menu of suggested lifecycle operations. |
+| Recovery and automatic supervision | Show an exceptional notice only for an actually present, allowlisted recovery capability. A supervisor whose connection needs updating displays `CAOの接続更新待ち`, rather than active reasoning or a requester decision. Details contain the matching notification evidence; recovery is never a menu of suggested lifecycle operations. |
+| Requester consultation | Current `requester_escalation` exposes the blocker, advice or decision needed, resume condition, request time, and notification status. Internal Boundary and message IDs are removed. Handling its notification never means the purpose was achieved. |
 | Status requests and runtime clocks | Diagnostic detail only, when applicable to current Work. A status response deadline is a system-owned stall detection threshold, not a promise that an LLM measures elapsed time. Heartbeats, task activity and status responses remain different facts. |
 | Connection and models | Collapsed details with effective model/effort once. Show requested values only when different. |
 | Missing, zero and obsolete fields | Do not fill the main view with unavailable rows, zero unresolved counts, completed Work's old status requests, or recovery fields without a current recovery action. |
@@ -34,7 +35,7 @@ bounded JSON responses up to 16 MiB so ordinary long reports do not hit the
 former preview-sized response ceiling.
 
 The work-history reader is one bounded, scrollable panel with a compact work
-index and a selected work's objective, latest report and chronological
+index and a selected work's instruction, assignment purpose, latest report and chronological
 exchanges. It loads 20 work records and 30 exchanges at a time in the browser;
 explicit older-page controls expose all retained pages. The index filter is
 clearly scoped to loaded records. Selection, disclosures, focus and scroll
@@ -83,6 +84,12 @@ Automatically captured output contributes only its typed report notification
 with a matching capture receipt, never the underlying provider transcript.
 The edge independently re-applies the allowlist and redaction. No command,
 artifact read, filesystem locator, private note store or mutation is added.
+The producer and Web/text edge share the public supervisor-state and attention-
+reason vocabulary in `dashboard_status.py`. The edge preserves supported states
+such as `connection_required` and `cao-connection-required`, including the return
+to scheduled supervision after an admitted reconnect; unknown values remain
+unavailable. Validate these transitions through the authenticated public edge,
+not only the producer DTO or a standalone browser fixture.
 
 Every dashboard surface, including Web, text, and native Codex clients,
 consumes this exact JSON representation. Native Codex obtains the same DTO
@@ -158,7 +165,8 @@ text.
 Each nested Work record and each `operator.work_items[]` compatibility record
 contains only these allowlisted keys:
 `display_label`, `history_reference`, `worker_label`, `work_title`,
-`objective_summary`, `objective_text`, `latest_report_text`, `state`,
+`purpose_text`, `instruction_summary`, `instruction_text`, the compatible
+`objective_summary` and `objective_text`, `latest_report_text`, `state`,
 `attempt_state`, `progress_stage`, `trajectory`, `attention_owner`,
 `next_boundary_summary`, `pending_supervisor_boundary`, `recovery_action`,
 `recovery_waiting_since`, `recovery_notification_state`,
@@ -319,7 +327,7 @@ scoped-runtime records. The `completed` → `awaiting-explicit-close` fallback
 applies only when a legacy row has no closure field; it never infers a receipt.
 
 The canonical projection supplies bounded, deterministic, redacted title and
-objective text from the current CAO-authored Goal and the kind, timestamp,
+business purpose and instruction text from the current CAO-authored task contract and the kind, timestamp,
 summary, stage, and next boundary of the latest current-Attempt Worker MCP
 report. Runner details are supplied only by
 one matching `managed_worker_specs` row: its Worker principal and runtime must
@@ -360,6 +368,21 @@ SSE stream using `Last-Event-ID`.  Each emitted `dashboard-update` carries the
 next cursor.  Reconnecting with that cursor replays only later durable events,
 without duplicates.
 
+Event replay reads the authority generation, retained sequence bounds and a
+bounded page of production event envelopes in one fresh SQLite transaction.
+It never reconstructs Work, runs projection integrity audits or loads event
+payloads. An index on immutable event scope and sequence lets replay skip
+hidden history directly; when no visible events remain, the replay barrier
+advances to that transaction's last durable sequence. Concurrent commits are
+observed by the next read, including authority-generation resynchronization.
+
+Snapshot and readiness retain the complete canonical projection and integrity
+checks. Indexed Attempt activity, artifact and causation lookups avoid scanning
+all message history separately for each Work. These indexes are installed for
+both new databases and upgrades without changing retained evidence or the
+operator DTO. Regression checks bound SQLite execution work independently of
+machine timing and prove that replay cannot read private event columns.
+
 ## Resynchronization
 
 If an authority generation changes, a cursor is older than retained history,
@@ -381,3 +404,9 @@ This bounded recovery scan is intentionally retained for another process that
 commits to the same SQLite database: process-local notifications do not make a
 cross-process delivery guarantee. No worker runtime, terminal, or screen is
 inspected by this mechanism.
+
+Report visibility verifies captured-output receipt membership using an independent
+set lookup. Receipt-table reads must not become correlated full scans per Work:
+that multiplies snapshot cost with retained output history. The query-plan
+regression in `test_projection.py` preserves this bound without weakening the
+receipt requirement or changing the latest-report ordering.

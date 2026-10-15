@@ -146,3 +146,33 @@ ordinary operations remain usable. It never substitutes for a successful fresh c
 401, explicit catalog-stale evidence, or a digest mismatch clears that
 eligibility and follows the typed refresh/reattach path; an unverified initial
 attachment is never promoted to ready.
+
+## Automatic supervision requires a usable conversation catalog
+
+The durable attachment grants supervision authority; its admitted connection
+contract separately determines whether an automatic wake can be consumed. After
+a catalog or proxy ABI change, automatic notification dispatch, cold-thread
+activation, incomplete-provider-turn recovery, expired reasoner recovery and
+Boundary rearming all use the same persisted capability check. They wait until
+an authentic connection presents the current catalog and ABI for that exact
+attachment generation. A host reload ACK, another conversation's connection,
+or an unchanged completed provider turn cannot release this wait.
+
+The pending Work, Boundary and Delivery remain intact. Repeated recovery scans
+and Control Plane restarts create no successor notification while that capability
+is unavailable. An unsubmitted lease caught by a concurrent catalog change is
+returned to the queue under its existing Message identity and a fresh Delivery
+generation. A provider-accepted or unknown handoff is never reset or replayed.
+The Dashboard displays `connection_required` as a system connection wait; it is
+neither active CAO reasoning nor a request for a business decision from the user.
+
+A fresh current-catalog connection on the same durable attachment releases the
+pending queue and recovery eligibility. It does not transfer Work to a different
+conversation or prove that another process's embedded MCP bridge was refreshed.
+Existing terminal-turn corroboration, generation fences, Review and disposition
+requirements still apply. Credential lease expiry alone does not erase an
+admitted catalog: a cold conversation may reacquire credentials when awakened.
+Explicit revocation, connection failure or catalog invalidation provides no such
+continuity evidence. Ordinary authenticated inbox reads, list, New, instruction
+and Worker lifecycle controls do not use this automatic-wake gate. Other
+attachments retain their independent capability and recovery lanes.

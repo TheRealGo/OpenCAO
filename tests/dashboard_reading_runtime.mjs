@@ -49,7 +49,7 @@ const source = fs.readFileSync(process.argv[2], "utf8");
 const sandbox = { document, fetch, AbortController, URLSearchParams, Intl,
   window: clock, testAPI: null };
 vm.runInNewContext(source.slice(0, source.lastIndexOf("  (async () => {")) +
-  "globalThis.testAPI = { state, appendWork, renderSnapshot, selectHistoryWork, loadWorkIndex, renderWorkIndex, fetchWithDeadline }; })();", sandbox);
+  "globalThis.testAPI = { state, appendWork, workerCard, renderSnapshot, selectHistoryWork, loadWorkIndex, renderWorkIndex, fetchWithDeadline }; })();", sandbox);
 const api = sandbox.testAPI;
 const text = (node, visible = false) => node.hidden && visible ? "" : [node.textContent,
   ...(visible && node.tagName === "details" && !node.open ? node.children.slice(0, 1) : node.children)
@@ -58,6 +58,8 @@ const find = (node, test) => test(node) ? node : node.children.map((child) => fi
 const full = "Readable paragraph.\n".repeat(80) + "THE FINAL SENTENCE";
 const work = {
   history_reference: "a".repeat(64), work_title: "A work", objective_text: full,
+  purpose_text: "Keep the service reliable as requirements evolve.",
+  instruction_text: full,
   latest_report_text: full, latest_report_summary: "truncated…", latest_report_kind: "progress",
   attention_owner: "worker", status_request_state: "responded", closure_summary: {},
   completed_at: "2026-09-01T00:00:00Z", state: "waiting_user", attempt_state: "completed",
@@ -66,6 +68,20 @@ const work = {
 const container = new Element();
 api.appendWork(container, work, { completed: true });
 assert.match(text(container), /THE FINAL SENTENCE/);
+assert.match(text(container), /指示時の業務目的/);
+assert.match(text(container), /今回の指示/);
+assert.match(text(container), /Keep the service reliable/);
+const idleWorker = api.workerCard({ worker_label: "Reliability Worker", purpose_text: work.purpose_text,
+  purpose_status: "defined", current_work_items: [] });
+assert.match(text(idleWorker), /業務の目的/);
+assert.match(text(idleWorker), /Keep the service reliable/);
+const unsetWorker = api.workerCard({ worker_label: "Unassigned Worker", current_work_items: [work] });
+assert.match(text(unsetWorker), /業務の目的は未登録です/);
+const connectionWait = api.workerCard({ worker_label: "Waiting Supervisor",
+  attention_reason: "cao-connection-required", current_work_items: [{ ...work,
+    state: "waiting_supervisor", attention_owner: "cao", cao_supervision_state: "connection_required" }] });
+assert.match(text(connectionWait, true), /CAOの接続更新待ち/);
+assert.doesNotMatch(text(connectionWait, true), /CAOが確認・判断中|CAOが自動処理中|あなたの回答・判断が必要/);
 assert.doesNotMatch(text(container, true), /停滞検出|Runtime生存信号|依頼者の受理記録|復旧待ち開始/);
 assert.match(text(container, true), /CAOレビュー済み/);
 assert.doesNotMatch(text(container, true), /あなたの回答・判断が必要/);

@@ -346,6 +346,7 @@ def test_delete_active_work_preserves_claimed_delivery_and_unknown_effects(
     instructed = service.instruct_worker_thread(
         actor,
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=1,
             title="Active Work deleted by explicit requester authority",
@@ -838,6 +839,7 @@ def test_delete_resumed_thread_accepts_historical_attachment_generations(
     instructed = service.instruct_worker_thread(
         actor,
         InstructWorkerThreadInput(
+            expected_purpose_version=1,
             worker_thread_id=ids["thread_id"],
             expected_generation=3,
             idempotency_key="instruction-before-rotated-delete",

@@ -1438,10 +1438,17 @@ class DashboardLifecycleStatus:
 
 
 class HttpxProbe:
-    """Short, redirect-free loopback probe used by the explicit status command."""
+    """Bounded, redirect-free loopback probe for status and lifecycle checks."""
+
+    def __init__(self, *, timeout_seconds: float = 5.0) -> None:
+        if not 0 < timeout_seconds <= 30.0:
+            raise ValueError("loopback probe timeout must be positive and at most 30 seconds")
+        self.timeout_seconds = timeout_seconds
 
     def get(self, url: str, headers: Mapping[str, str]) -> HttpResult:
-        response = httpx.get(url, headers=dict(headers), timeout=5.0, follow_redirects=False)
+        response = httpx.get(
+            url, headers=dict(headers), timeout=self.timeout_seconds, follow_redirects=False,
+        )
         try:
             value = response.json()
         except ValueError:
@@ -2093,8 +2100,7 @@ def _configured_control_plane_database(
     return (state_dir / "control-plane.sqlite3").resolve(strict=False)
 
 
-def _checked_codex_socket(path: Path) -> os.stat_result:
-    parent = path.parent
+def _checked_codex_socket_parent(parent: Path) -> os.stat_result:
     try:
         parent_info = parent.lstat()
         resolved_parent = parent.resolve(strict=True)
@@ -2108,10 +2114,35 @@ def _checked_codex_socket(path: Path) -> os.stat_result:
         or stat.S_IMODE(parent_info.st_mode) != 0o700
     ):
         raise ValueError("Codex app-server socket parent must be a real owner-only 0700 directory")
+    return parent_info
+
+
+def _checked_codex_socket(path: Path) -> os.stat_result:
+    parent_info = _checked_codex_socket_parent(path.parent)
     try:
         info = path.lstat()
     except FileNotFoundError as error:
         raise ValueError("Codex app-server socket does not exist") from error
+    alias_info = None
+    target = path
+    target_parent_info = parent_info
+    if stat.S_ISLNK(info.st_mode):
+        # Current Desktop daemons keep the canonical endpoint as an alias to
+        # a short Unix socket path. Admit one owner-controlled hop only; the
+        # daemon metadata, kernel peer and signed executable still establish
+        # host authority in preflight. Return the endpoint identity so existing
+        # before/after fences detect a redirected alias as well as socket swaps.
+        if path != canonical_codex_app_server_socket() or info.st_uid != os.getuid():
+            raise ValueError("Codex app-server socket alias is not owner-controlled and canonical")
+        alias_info = info
+        try:
+            target = Path(os.readlink(path))
+            if not target.is_absolute() or target.resolve(strict=True) != target:
+                raise ValueError("Codex app-server socket alias must point directly to a real socket")
+            target_parent_info = _checked_codex_socket_parent(target.parent)
+            info = target.lstat()
+        except OSError as error:
+            raise ValueError("Codex app-server socket alias target is unavailable") from error
     if (
         stat.S_ISLNK(info.st_mode)
         or not stat.S_ISSOCK(info.st_mode)
@@ -2119,6 +2150,24 @@ def _checked_codex_socket(path: Path) -> os.stat_result:
         or stat.S_IMODE(info.st_mode) != 0o600
     ):
         raise ValueError("Codex app-server socket must be an owner-only 0600 Unix socket")
+    try:
+        if (
+            _file_identity(target.lstat()) != _file_identity(info)
+            or _file_identity(_checked_codex_socket_parent(path.parent))
+            != _file_identity(parent_info)
+            or _file_identity(_checked_codex_socket_parent(target.parent))
+            != _file_identity(target_parent_info)
+            or (
+                alias_info is not None
+                and (
+                    _file_identity(path.lstat()) != _file_identity(alias_info)
+                    or Path(os.readlink(path)) != target
+                )
+            )
+        ):
+            raise ValueError("Codex app-server socket changed during validation")
+    except OSError as error:
+        raise ValueError("Codex app-server socket changed during validation") from error
     return info
 
 
@@ -3239,11 +3288,19 @@ def preflight_codex_app_server_mcp(
     expected_managed_path = (
         socket_path.parent.parent / "packages" / "standalone" / "current" / "codex"
     )
+    # Desktop reports its managed installer location even when that installer
+    # is absent. Both shipped layouts are metadata only: Desktop authority is
+    # still established below from the socket peer and signed executable.
+    managed_paths = {os.fspath(expected_managed_path)}
+    if isinstance(payload, Mapping) and payload.get("backend") is None:
+        managed_paths.add(os.fspath(
+            socket_path.parent.parent / "packages" / "app-server-daemon" / "current" / "bin" / "codex"
+        ))
     if (
         not isinstance(payload, Mapping)
         or payload.get("status") != "running"
         or payload.get("socketPath") != os.fspath(socket_path)
-        or payload.get("managedCodexPath") != os.fspath(expected_managed_path)
+        or payload.get("managedCodexPath") not in managed_paths
         or _bounded_codex_version(payload.get("cliVersion")) is None
         or _bounded_codex_version(payload.get("appServerVersion")) is None
     ):

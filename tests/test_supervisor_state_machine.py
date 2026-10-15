@@ -602,7 +602,10 @@ def test_expired_reasoner_turn_rearms_exact_boundary_once(system):
     )
 
 
-def test_each_expired_reasoner_turn_schedules_one_successor_wake(system):
+@pytest.mark.parametrize("receipt", [
+    "current", "legacy", "corrupt_input", "ordinary_marker", "real_lease", "wrong_kind", "corrupt_result",
+])
+def test_failed_reasoner_recovery_escalates_without_abandoning_the_objective(system, receipt):
     service = system["service"]
     work = _create_task(system, "client:reasoner-recovery-exhausted", "Recovery task")
     boundary = service.record_boundary(
@@ -670,29 +673,59 @@ def test_each_expired_reasoner_turn_schedules_one_successor_wake(system):
     )
     assert [(row["action"], row["state"]) for row in recovery_messages] == [
         ("recover_expired_reasoner_turn", "dead"),
-        ("recover_expired_reasoner_turn", "queued"),
     ]
-    assert (
-        service.db.fetchone(
-            "SELECT COUNT(*) AS count FROM events "
-            "WHERE event_type = 'reasoner.turn_recovery_exhausted'"
-        )["count"]
-        == 0
+    current = service.get_work(work["id"])
+    assert current["state"] == "user_needed"
+    assert current["attention_owner"] == "user"
+    assert current["generation"] == work["generation"]
+    assert current["requester_escalation"]["notification_state"] == "queued"
+    assert current["current_attempt"]["completion_claim"] == {}
+    assert service.reconcile_cao_supervision_obligations() == 0
+    decision = service.db.fetchone(
+        "SELECT kind FROM boundary_dispositions WHERE boundary_id = ?", (boundary["id"],),
     )
-    assert (
-        service.db.fetchone(
-            "SELECT 1 FROM boundary_dispositions WHERE boundary_id = ?",
-            (boundary["id"],),
-        )
-        is None
+    assert decision["kind"] == "wait_user"
+    assert service.db.fetchone(
+        "SELECT 1 FROM boundary_supersessions WHERE boundary_id = ?", (boundary["id"],),
+    ) is None
+
+    from cao_control_plane.goal_packets import canonical_digest
+
+    synthetic = service.db.fetchone(
+        "SELECT * FROM reasoner_turns WHERE boundary_id=? AND state='completed'", (boundary["id"],),
     )
-    assert (
-        service.db.fetchone(
-            "SELECT 1 FROM boundary_supersessions WHERE boundary_id = ?",
-            (boundary["id"],),
-        )
-        is None
-    )
+    boundary_row = service.db.fetchone("SELECT * FROM boundaries WHERE id=?", (boundary["id"],))
+    assert synthetic["input_digest"] == canonical_digest({
+        "boundary_id": boundary["id"], "boundary_input_digest": boundary_row["input_digest"],
+        "goal_packet_digest": boundary_row["goal_packet_digest"],
+        "task_packet_digest": boundary_row["task_packet_digest"], "generation": work["generation"],
+    })
+    if receipt != "current":
+        service.db.execute("UPDATE reasoner_turns SET input_digest=? WHERE id=?", (
+            "0" * 64 if receipt == "corrupt_input" else boundary_row["input_digest"], synthetic["id"],
+        ))
+    if receipt == "ordinary_marker":
+        service.db.execute("UPDATE reasoner_turns SET idempotency_key='ordinary' WHERE id=?", (synthetic["id"],))
+    if receipt == "real_lease":
+        service.db.execute("UPDATE reasoner_turns SET lease_token_digest=? WHERE id=?", ("0" * 64, synthetic["id"]))
+    if receipt == "wrong_kind":
+        service.db.execute("UPDATE boundary_dispositions SET kind='correct' WHERE reasoner_turn_id=?", (synthetic["id"],))
+    if receipt == "corrupt_result":
+        service.db.execute("UPDATE reasoner_turns SET result_digest=? WHERE id=?", ("0" * 64, synthetic["id"]))
+    if receipt not in {"current", "legacy"}:
+        with pytest.raises(RuntimeError, match=r"stored reasoner.*digest is invalid"):
+            Database(system["settings"])
+        return
+    prior = dict(service.db.fetchone("SELECT * FROM reasoner_turns WHERE id=?", (synthetic["id"],)))
+    reopened = Database(system["settings"])
+    assert dict(reopened.fetchone("SELECT * FROM reasoner_turns WHERE id=?", (synthetic["id"],))) == prior
+    assert dict(reopened.fetchone("SELECT * FROM boundaries WHERE id=?", (boundary["id"],))) == dict(boundary_row)
+    assert service.get_work(work["id"]) == current
+    # A second reopen and ordinary event pruning cannot manufacture another wake
+    # or discard this exact historical system receipt.
+    service.db.execute("DELETE FROM events WHERE event_type='boundary.disposed'")
+    again = Database(system["settings"])
+    assert dict(again.fetchone("SELECT * FROM reasoner_turns WHERE id=?", (synthetic["id"],))) == prior
 
 
 def test_route_drifted_expired_reasoner_notification_requires_terminal_disposition(system):
@@ -770,12 +803,14 @@ def test_route_drifted_expired_reasoner_notification_requires_terminal_dispositi
             turn_id=successor["id"],
             lease_token=successor["lease_token"],
             expected_generation=work["generation"],
-            kind=BoundaryDispositionKind.FAIL,
+            kind=BoundaryDispositionKind.WAIT_USER,
+            instruction="Advise how the remaining objective should proceed.",
+            resume_condition="Requester guidance is incorporated into a safe next action.",
             reason="The recovery route is no longer executable",
         ),
     )
 
-    assert disposition["kind"] == "fail"
+    assert disposition["kind"] == "wait_user"
     handled = service.db.fetchone(
         "SELECT state FROM message_deliveries WHERE message_id = ? AND recipient_id = ?",
         (recovery_message["id"], system["cao"]["id"]),
@@ -784,12 +819,12 @@ def test_route_drifted_expired_reasoner_notification_requires_terminal_dispositi
     assert service.db.fetchone(
         "SELECT kind FROM boundary_dispositions WHERE boundary_id = ?",
         (boundary["id"],),
-    )["kind"] == "fail"
+    )["kind"] == "wait_user"
     assert service.db.fetchone(
         "SELECT 1 FROM boundary_supersessions WHERE boundary_id = ?",
         (boundary["id"],),
     ) is None
-    assert service.get_work(work["id"])["state"] == "failed"
+    assert service.get_work(work["id"])["state"] == "user_needed"
 
 
 def test_boundary_has_exactly_one_durable_disposition(system):

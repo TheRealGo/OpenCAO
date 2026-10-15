@@ -13,7 +13,11 @@ import json
 from typing import Any
 
 import pytest
-from conftest import attach_cao_session_with_peer, current_cao_session_attachment
+from conftest import (
+    attach_cao_session_with_peer,
+    business_purpose_contract,
+    current_cao_session_attachment,
+)
 from fastapi.testclient import TestClient
 
 from cao_control_plane.api import create_app
@@ -36,6 +40,7 @@ from cao_control_plane.models import (
     ReportInput,
     ReportKind,
     ReviewInput,
+    SetWorkerPurposeInput,
     WorkAssignment,
     WorkClosePreparationInput,
 )
@@ -188,6 +193,7 @@ def _reviewed_attached_work(
     work = service.assign_work(
         system["cao"],
         WorkAssignment(
+            expected_purpose_version=1 if managed_thread is not None else None,
             worker_id=system["worker"]["id"],
             requester_id=system["user"]["id"],
             runtime_session_id=system["runtime"]["id"],
@@ -249,6 +255,7 @@ def _reviewed_attached_work(
         cao_runtime,
         boundary["id"],
         BoundaryDispositionInput(
+            expected_purpose_version=1 if managed_thread is not None else None,
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=reported["generation"],
@@ -264,8 +271,14 @@ def _reviewed_attached_work(
     reviewed = service.review(
         reviewer or cao_runtime,
         ReviewInput(
+            expected_purpose_version=1 if managed_thread is not None else None,
             attempt_id=attempt["id"],
             verdict="ok",
+            criterion_assessments=[
+                {"criterion_id": item["id"], "verdict": "met",
+                 "evidence": "The fixture result was reviewed against its sealed task conditions."}
+                for item in reported["review_criteria"]
+            ] if managed_thread is not None else [],
             summary="CAO review is OK; requester decision remains separate",
             idempotency_key=f"{idempotency_prefix}:review",
         ),
@@ -278,6 +291,7 @@ def _reviewed_attached_work(
         cao_runtime,
         review_message_id,
         evidence="The attached CAO conversation recorded its completed review.",
+        expected_purpose_version=1 if managed_thread is not None else None,
     )
     return reviewed
 
@@ -353,6 +367,16 @@ def _seed_managed_thread_for_work(
                 now,
             ),
         )
+    service.set_worker_purpose(
+        service.authenticate(str(attachment["context_token"])),
+        SetWorkerPurposeInput(
+            contract=business_purpose_contract(),
+            worker_thread_id=ids["thread_id"],
+            purpose="Sustain reliable service operation as requirements evolve.",
+            reason="The requester assigned this continuing business responsibility.",
+            idempotency_key="close-fixture-purpose",
+        ),
+    )
     return ids
 
 

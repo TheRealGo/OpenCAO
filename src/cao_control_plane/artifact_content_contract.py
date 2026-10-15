@@ -17,6 +17,8 @@ _TOKEN = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+$")
 _STRUCTURED_TEXT_TYPES = frozenset(
     {
         "application/json",
+        "application/x-ndjson",
+        "application/ndjson",
         "application/xml",
         "application/yaml",
         "application/x-yaml",

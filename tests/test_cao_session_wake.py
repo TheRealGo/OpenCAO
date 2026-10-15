@@ -499,6 +499,7 @@ def test_nonterminal_acknowledged_cao_wake_remains_actionable(
 
 def test_completion_boundary_coalesces_older_queued_progress_wake(
     system: dict[str, Any],
+    legacy_progress_wakes,
 ) -> None:
     attachment = _attach(system, thread_id="progress-before-completion")
     work = system["service"].assign_work(
@@ -573,6 +574,7 @@ def test_completion_boundary_coalesces_older_queued_progress_wake(
 
 def test_completion_boundary_releases_older_acknowledged_progress_wake(
     system: dict[str, Any],
+    legacy_progress_wakes,
 ) -> None:
     """A crash after Ack must not wedge every later wake on the attachment."""
 
@@ -702,7 +704,7 @@ def test_worker_boundary_resumes_the_exact_attached_cao_thread(system: dict[str,
     assert "cao.crc_" not in str(system["service"].list_runtimes())
 
 
-def test_each_incomplete_recovery_turn_schedules_one_successor_wake(
+def test_incomplete_recovery_hands_unmet_work_to_requester_consultation(
     system: dict[str, Any],
 ) -> None:
     attachment = _attach(system, thread_id="state-change-only-wake")
@@ -725,13 +727,13 @@ def test_each_incomplete_recovery_turn_schedules_one_successor_wake(
         """,
         (work["id"],),
     )
-    assert [row["state"] for row in recoveries] == ["dead", "queued"]
+    assert [row["state"] for row in recoveries] == ["dead"]
     assert (
         system["service"].db.fetchone(
             "SELECT COUNT(*) AS count FROM events "
             "WHERE event_type = 'reasoner.incomplete_turn_recovery_scheduled'"
         )["count"]
-        == 2
+        == 1
     )
     assert (
         system["service"].db.fetchone(
@@ -744,11 +746,14 @@ def test_each_incomplete_recovery_turn_schedules_one_successor_wake(
         "SELECT state FROM reasoner_turns WHERE work_item_id = ? ORDER BY created_at",
         (work["id"],),
     )
-    assert turns == []
+    assert [row["state"] for row in turns] == ["completed"]
+    current = system["service"].get_work(work["id"])
+    assert current["state"] == "user_needed"
+    assert current["requester_escalation"]["notification_state"] == "queued"
     assert system["service"].reconcile_cao_supervision_obligations() == 0
 
 
-def test_expired_then_incomplete_turn_each_schedule_one_successor_wake(
+def test_switching_recovery_modes_still_escalates_the_same_unmet_boundary(
     system: dict[str, Any],
 ) -> None:
     attachment = _attach(system, thread_id="cross-mode-recovery-budget")
@@ -792,7 +797,6 @@ def test_expired_then_incomplete_turn_each_schedule_one_successor_wake(
     )
     assert [(row["action"], row["state"]) for row in recoveries] == [
         ("recover_expired_reasoner_turn", "dead"),
-        ("recover_incomplete_reasoner_turn", "queued"),
     ]
     assert system["service"].reconcile_cao_supervision_obligations() == 0
 
@@ -845,6 +849,7 @@ def test_no_attachment_means_worker_report_does_not_autonomously_dispatch_cao(
 
 def test_progress_burst_gives_each_delivery_its_own_exact_cao_wake(
     system: dict[str, Any],
+    legacy_progress_wakes,
 ) -> None:
     attachment = _attach(system, thread_id="progress-burst-wake")
     service = system["service"]
@@ -989,6 +994,7 @@ def test_artifact_only_report_remains_durable_without_cao_wake(
 
 def test_mixed_progress_and_blocker_burst_coalesces_progress_and_disposes_boundary(
     system: dict[str, Any],
+    legacy_progress_wakes,
 ) -> None:
     attachment = _attach(system, thread_id="mixed-report-burst")
     service = system["service"]
@@ -3089,42 +3095,32 @@ def test_reconnect_never_reactivates_superseded_wake_beside_accepted_successor(
 def test_one_cold_cao_thread_failure_does_not_starve_later_attachments(
     system: dict[str, Any], settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    attachments = [
+        _attach(system, thread_id=native_thread_id)
+        for native_thread_id in ("cold-thread-unavailable", "independent-cold-thread")
+    ]
     dispatcher = Dispatcher(system["service"], settings)
     adapter = dispatcher.registry.get("codex-app-server")
     assert isinstance(adapter, CodexAppServerAdapter)
     observed: list[str] = []
 
-    def get_runtime(runtime_id: str) -> dict[str, Any]:
-        return {
-            "id": runtime_id,
-            "adapter": "codex-app-server",
-            "native_session_id": runtime_id,
-        }
-
     async def activate(runtime: Mapping[str, Any], *, message_id: str) -> str:
-        runtime_id = str(runtime["id"])
-        observed.append(f"{runtime_id}:{message_id}")
-        if runtime_id == "cold-thread-unavailable":
+        native_thread_id = str(runtime["native_session_id"])
+        observed.append(f"{native_thread_id}:{message_id}")
+        if native_thread_id == "cold-thread-unavailable":
             raise RuntimeError("one cold thread is temporarily unavailable")
         return "resumed"
 
-    monkeypatch.setattr(system["service"], "get_runtime", get_runtime)
     monkeypatch.setattr(adapter, "activate_desktop_cao_thread", activate)
     candidates = [
         {
-            "message_id": "msg-cold-thread-unavailable",
-            "attachment_id": "att-cold-thread-unavailable",
+            "message_id": f"msg-{attachment['native_thread_id']}",
+            "attachment_id": attachment["id"],
             "delivery_generation": 1,
-            "runtime_id": "cold-thread-unavailable",
-            "native_thread_id": "cold-thread-unavailable",
-        },
-        {
-            "message_id": "msg-independent-cold-thread",
-            "attachment_id": "att-independent-cold-thread",
-            "delivery_generation": 1,
-            "runtime_id": "independent-cold-thread",
-            "native_thread_id": "independent-cold-thread",
-        },
+            "runtime_id": attachment["runtime_session_id"],
+            "native_thread_id": attachment["native_thread_id"],
+        }
+        for attachment in attachments
     ]
 
     with pytest.raises(RuntimeError, match="one cold thread is temporarily unavailable"):
@@ -3617,6 +3613,7 @@ def test_expired_attachment_lease_can_open_a_new_transport_connection(
 
 def test_disconnected_wake_runtime_does_not_hide_attachment_inbox_from_new_connections(
     system: dict[str, Any],
+    legacy_progress_wakes,
 ) -> None:
     service = system["service"]
     attachment = _attach(system, thread_id="durable-attachment-inbox")
@@ -3752,6 +3749,7 @@ def test_missing_wake_runtime_is_replaced_before_completion_dispatch(
 
 def test_wake_route_replacement_never_rebinds_unknown_delivery(
     system: dict[str, Any],
+    legacy_progress_wakes,
 ) -> None:
     attachment = _attach(system, thread_id="unknown-wake-fence")
     service = system["service"]

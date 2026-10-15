@@ -50,6 +50,7 @@ def build_goal_packet(
     supervisor_attachment: Mapping[str, Any] | None = None,
     dependencies: Sequence[str] = (),
     managed_task_policy: Mapping[str, Any] | None = None,
+    worker_purpose: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the complete immutable goal-revision packet."""
 
@@ -92,6 +93,8 @@ def build_goal_packet(
         packet["dependencies"] = list(dependencies)
     if managed_task_policy is not None:
         packet["managed_task_policy"] = dict(managed_task_policy)
+    if worker_purpose is not None:
+        packet["worker_purpose"] = dict(worker_purpose)
     return packet
 
 

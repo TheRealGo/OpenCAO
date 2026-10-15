@@ -493,6 +493,7 @@ class A2AServer:
                 text,
                 in_reply_to=str(metadata.get("inReplyTo") or "") or None,
                 idempotency_key=message_id,
+                expected_purpose_version=metadata.get("expectedPurposeVersion"),
             )
             return self.get_task(task_id, actor=actor)
 
@@ -500,7 +501,7 @@ class A2AServer:
         if not worker_id:
             worker_id = self._default_worker_id()
         title = str(metadata.get("title") or text.splitlines()[0][:300] or "A2A task")
-        objective = str(metadata.get("objective") or text)
+        objective = str(metadata.get("instruction") or metadata.get("objective") or text)
         acceptance = metadata.get("acceptance", [])
         non_goals = metadata.get("nonGoals", [])
         if not isinstance(acceptance, list) or not isinstance(non_goals, list):
@@ -524,6 +525,7 @@ class A2AServer:
                 runtime_session_id=metadata.get("runtimeSessionId"),
                 managed_worker_thread_id=metadata.get("managedWorkerThreadId"),
                 managed_worker_thread_generation=metadata.get("managedWorkerThreadGeneration"),
+                expected_purpose_version=metadata.get("expectedPurposeVersion"),
                 requester_id=(
                     str(metadata.get("requesterId")) if metadata.get("requesterId") else None
                 ),

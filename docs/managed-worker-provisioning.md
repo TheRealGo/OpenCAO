@@ -64,6 +64,12 @@ silently rebound or retried.
 
 ## Runtime enrollment
 
+Codex launch discovery supports both the legacy Desktop resource executable
+and the packaged `codex-cli/CodexCLI.app/Contents/MacOS/codex` layout when the
+service PATH is minimal. Controlled lifecycle identity checks use the same
+signed Desktop executable layout, not a shell wrapper or an arbitrary PATH
+entry. Missing executables remain a bounded pre-launch failure.
+
 New creates the managed Worker specification and the first fenced runtime and
 enrollment epoch. It does not launch a model turn by itself. Dispatch of the
 first instruction issues a one-use launch ticket; the Worker exchanges it
