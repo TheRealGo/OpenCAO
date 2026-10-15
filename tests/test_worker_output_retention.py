@@ -83,12 +83,11 @@ def test_prune_preserves_only_exact_capture_sources_and_outbox_references(
         **binding,
         event=_event(kind="turn_end", item_id="", text="", status="completed"),
     )
-    assert output["notification_message_id"]
+    assert not output["notification_message_id"]
     references = {
         message_id
         for message_id in (
             binding["delivery_message_id"],
-            output["notification_message_id"],
             terminal["notification_message_id"],
         )
         if message_id

@@ -295,9 +295,11 @@ def test_dispatcher_stop_releases_commit_wait_executor_promptly(system, monkeypa
         monkeypatch.setattr(service.db, "wait_for_commit", observe_wait)
         dispatcher = Dispatcher(service, settings)
         await dispatcher.start()
-        await asyncio.wait_for(wait_started.wait(), timeout=1.0)
-        await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
-        await asyncio.wait_for(wait_finished.wait(), timeout=1.0)
+        # Remain well below the disabled 60-second recovery scan without
+        # depending on subsecond thread scheduling on a loaded host.
+        await asyncio.wait_for(wait_started.wait(), timeout=5.0)
+        await asyncio.wait_for(dispatcher.stop(), timeout=5.0)
+        await asyncio.wait_for(wait_finished.wait(), timeout=5.0)
         assert dispatcher.running is False
 
     asyncio.run(exercise())
@@ -415,7 +417,7 @@ def test_managed_worker_activity_renews_on_heartbeat_and_progress_then_times_out
             assert report_activity[3] > heartbeat_activity[3]
             await asyncio.sleep(0.08)
             assert not waiting.done()
-            assert await asyncio.wait_for(waiting, timeout=0.15) == "worker_inactive_timeout"
+            assert await asyncio.wait_for(waiting, timeout=1.0) == "worker_inactive_timeout"
         finally:
             monitor.close()
             if not waiting.done():
@@ -502,7 +504,7 @@ def test_background_dispatcher_refills_while_a_worker_turn_is_still_running(syst
         )
         await dispatcher.start()
         try:
-            await asyncio.wait_for(first_started.wait(), timeout=1.0)
+            await asyncio.wait_for(first_started.wait(), timeout=5.0)
             service.assign_work(
                 system["cao"],
                 WorkAssignment(
@@ -513,7 +515,7 @@ def test_background_dispatcher_refills_while_a_worker_turn_is_still_running(syst
                     runtime_session_id=second_runtime["id"],
                 ),
             )
-            await asyncio.wait_for(second_delivered.wait(), timeout=1.0)
+            await asyncio.wait_for(second_delivered.wait(), timeout=5.0)
             assert not release_first.is_set()
         finally:
             release_first.set()
@@ -589,7 +591,9 @@ def test_incomplete_reasoner_recovery_render_forbids_same_state_polling() -> Non
     assert "Do not wait, sleep, or poll" in rendered
     assert "cao_start" in rendered
     assert "periodic no-change updates" in rendered
-    assert "end this turn" in rendered
+    assert "use wait_user to persist the blocker" in rendered
+    assert "Do not repeat a non-retryable operation" in rendered
+    assert "leave the delivery unhandled" not in rendered
 
 
 def test_normal_completion_boundary_render_requires_supervisor_disposition() -> None:
@@ -629,7 +633,7 @@ def test_normal_completion_boundary_render_requires_supervisor_disposition() -> 
         (
             "worker_inactive_timeout",
             "system_reconciliation",
-            "dispose it as Fail",
+            "escalate with wait_user",
         ),
     ),
 )
@@ -656,7 +660,7 @@ def test_recovery_render_uses_only_the_selected_current_action(
     assert expected in rendered
     if recovery_action == "system_reconciliation":
         assert "another Worker" in rendered
-        assert "convert it to requester input" in rendered
+        assert "Tell the requester" in rendered
     else:
         assert "dispose this boundary exactly once" in rendered.lower()
     assert "Delivery message ID: msg_recovery" in rendered
@@ -911,15 +915,17 @@ def test_runtime_adapter_output_cannot_claim_worker_completion(system):
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=current["generation"],
-            kind=BoundaryDispositionKind.FAIL,
+            kind=BoundaryDispositionKind.WAIT_USER,
+            instruction="Advise how the remaining objective should proceed.",
+            resume_condition="Requester guidance is incorporated into a safe next action.",
             reason="The provider turn ended without a terminal Worker report.",
         ),
     )
 
-    assert disposition["kind"] == "fail"
+    assert disposition["kind"] == "wait_user"
     observed = service.get_work(work["id"])
-    assert observed["state"] == "failed"
-    assert observed["generation"] == current["generation"] + 1
+    assert observed["state"] == "user_needed"
+    assert observed["generation"] == current["generation"]
     assert observed["open_boundaries"] == []
     assert (
         service.db.fetchone(

@@ -198,6 +198,7 @@ def test_a2a_managed_assignment_uses_the_exact_logical_thread_pair(system):
                     "runtimeSessionId": ids["runtime_id"],
                     "managedWorkerThreadId": ids["thread_id"],
                     "managedWorkerThreadGeneration": 1,
+                    "expectedPurposeVersion": 1,
                     "acceptance": ["The generation-1 Assignment stays queued."],
                 },
             },
@@ -617,7 +618,7 @@ def test_tool_input_schema_rejects_renamed_and_extra_fields_before_execution(sys
     renamed_details = renamed_required_fields["result"]["structuredContent"]["error"][
         "details"
     ]
-    assert renamed_details["allowed_fields"] == ["evidence", "message_id"]
+    assert renamed_details["allowed_fields"] == ["evidence", "expected_purpose_version", "message_id"]
     assert renamed_details["required_fields"] == ["evidence", "message_id"]
 
 
@@ -649,7 +650,7 @@ def test_streamable_http_returns_model_actionable_tool_schema_errors(settings):
         "code": "invalid_tool_arguments",
         "message": "Tool input validation failed",
         "details": {
-            "allowed_fields": ["evidence", "message_id"],
+            "allowed_fields": ["evidence", "expected_purpose_version", "message_id"],
             "required_fields": ["evidence", "message_id"],
             "violations": [
                 {"rule": "additionalProperties"},

@@ -12,6 +12,54 @@ def codex_delivery_client_id(identity_source: str) -> str:
     return "cao-delivery-" + hashlib.sha256(identity_source.encode("utf-8")).hexdigest()
 
 
+def cao_informational_wake_sql(message_alias: str) -> str:
+    """Identify evidence notifications that do not own a decision Boundary."""
+    if not _SQL_ALIAS.fullmatch(message_alias):
+        raise ValueError("notification SQL aliases must be static identifiers")
+    return f"""
+        COALESCE(json_extract({message_alias}.payload_json, '$.boundary_id'), '') = ''
+        AND (
+            ({message_alias}.kind = 'progress'
+             AND COALESCE(json_extract({message_alias}.payload_json, '$.progress_event'), '') <> 'execution_started')
+            OR (
+                {message_alias}.kind = 'system'
+                AND json_extract({message_alias}.payload_json, '$.action') = 'worker_output'
+                AND EXISTS (
+                    SELECT 1 FROM worker_output_receipts AS informational_output
+                    WHERE informational_output.notification_message_id = {message_alias}.id
+                      AND informational_output.event_kind = 'message'
+                      AND informational_output.work_item_id = {message_alias}.work_item_id
+                      AND informational_output.attempt_id = {message_alias}.attempt_id
+                )
+            )
+        )
+    """
+
+
+def cao_superseding_boundary_sql(message_alias: str, delivery_alias: str) -> str:
+    """Find a later decision notification for the same sealed task and recipient."""
+    if not all(_SQL_ALIAS.fullmatch(alias) for alias in (message_alias, delivery_alias)):
+        raise ValueError("notification SQL aliases must be static identifiers")
+    return f"""
+        SELECT successor.id
+        FROM messages AS successor
+        JOIN message_deliveries AS successor_delivery ON successor_delivery.message_id = successor.id
+        JOIN boundaries AS successor_boundary
+          ON successor_boundary.id = json_extract(successor.payload_json, '$.boundary_id')
+         AND successor_boundary.work_item_id = successor.work_item_id
+         AND successor_boundary.attempt_id = successor.attempt_id
+        WHERE successor.work_item_id = {message_alias}.work_item_id
+          AND successor.attempt_id = {message_alias}.attempt_id
+          AND successor.goal_version = {message_alias}.goal_version
+          AND successor.goal_packet_digest = {message_alias}.goal_packet_digest
+          AND successor.task_packet_digest = {message_alias}.task_packet_digest
+          AND successor.sequence > {message_alias}.sequence
+          AND successor_delivery.recipient_id = {delivery_alias}.recipient_id
+          AND successor_delivery.recipient_attachment_id = {delivery_alias}.recipient_attachment_id
+        ORDER BY successor.sequence LIMIT 1
+    """
+
+
 def runtime_delivery_lane_head_sql(
     *,
     message_alias: str = "m",

@@ -74,6 +74,7 @@ from .models import (
     WorkResumeInput,
     WorkState,
 )
+from .notification_queue import QUEUE_FAILURE_CODES
 from .projection import build_projection
 from .release_identity import current_release_identity
 from .runtime import Dispatcher, read_cao_project_identity
@@ -172,6 +173,17 @@ def _dispatcher_readiness(dispatcher: Dispatcher, settings: Settings) -> dict[st
         "unknown_delivery_outcomes": int(raw.get("unknown_delivery_outcomes") or 0),
         "pending_push_deliveries": int(raw.get("pending_push_deliveries") or 0),
         "active_deliveries": int(raw.get("active_deliveries") or 0),
+        "cao_notification_queue_error": (
+            "cao_notification_queue_reconciliation_failed"
+            if raw.get("cao_notification_queue_error") else None
+        ),
+        "cao_notification_queue_unknown_outcomes": int(raw.get("cao_notification_queue_unknown_outcomes") or 0),
+        "cao_notification_queue_failure_counts": {
+            code: min(max(count, 0), 1000)
+            for code, count in (raw.get("cao_notification_queue_failure_counts", {})
+                                if isinstance(raw.get("cao_notification_queue_failure_counts"), Mapping) else {}).items()
+            if code in QUEUE_FAILURE_CODES and isinstance(count, int) and not isinstance(count, bool)
+        },
     }
 
 
@@ -784,7 +796,7 @@ def create_app(
                     "X-Accel-Buffering": "no",
                 },
             )
-        result = mcp.handle_modern(current, body)
+        result = await asyncio.to_thread(mcp.handle_modern, current, body)
         if result is None:
             return Response(status_code=202, headers=headers)
         if method in {"server/discover", "tools/list", "resources/list"}:
@@ -1259,6 +1271,7 @@ def create_app(
             work_id,
             str(body.get("message", "")),
             in_reply_to=body.get("in_reply_to"),
+            expected_purpose_version=body.get("expected_purpose_version"),
             idempotency_key=str(body.get("idempotency_key", "")),
         )
 
@@ -1329,6 +1342,8 @@ def create_app(
             body.get("runtime_session_id"),
             str(body.get("reason", "retry")),
             str(body.get("idempotency_key", "")),
+            expected_purpose_version=body.get("expected_purpose_version"),
+            expected_successor_purpose_version=body.get("expected_successor_purpose_version"),
             managed_worker_thread_id=body.get("managed_worker_thread_id"),
             managed_worker_thread_generation=body.get("managed_worker_thread_generation"),
         )
@@ -1396,6 +1411,7 @@ def create_app(
             current,
             message_id,
             evidence=str(body.get("evidence", "")),
+            expected_purpose_version=body.get("expected_purpose_version"),
         )
 
     @app.post("/api/v1/messages/{message_id}/delivery:resolve", tags=["messaging"])

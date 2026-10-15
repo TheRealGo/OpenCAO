@@ -89,6 +89,44 @@ def output_view(row: Mapping[str, Any] | sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def current_output_views_tx(
+    connection: sqlite3.Connection, work_id: str, attempt_id: str,
+) -> list[dict[str, Any]]:
+    """Current stream plus unresolved-boundary streams; never reattach old receipts."""
+    rows = connection.execute(
+        """SELECT output.* FROM worker_output_receipts output
+           WHERE output.work_item_id = ? AND (
+               output.stream_id = (
+                   SELECT id FROM worker_output_streams WHERE work_item_id = ? AND attempt_id = ?
+                   ORDER BY rowid DESC LIMIT 1
+               ) OR output.stream_id IN (
+                   SELECT terminal.stream_id FROM worker_output_receipts terminal
+                   JOIN boundaries b ON b.id = terminal.boundary_id
+                   LEFT JOIN boundary_dispositions d ON d.boundary_id = b.id
+                   LEFT JOIN boundary_supersessions s ON s.boundary_id = b.id
+                   WHERE b.work_item_id = ? AND d.id IS NULL AND s.boundary_id IS NULL
+               )
+           ) ORDER BY output.sequence""",
+        (work_id, work_id, attempt_id, work_id),
+    ).fetchall()
+    return [output_view(row) for row in rows]
+
+
+def _substantive_output_refs_tx(
+    connection: sqlite3.Connection, stream_id: str,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        "SELECT * FROM worker_output_receipts WHERE stream_id = ? AND event_kind = 'message' ORDER BY sequence",
+        (stream_id,),
+    ).fetchall()
+    finals = [row for row in rows if row["phase"] == "final"]
+    return [
+        {"output_id": str(row["id"]), "digest": str(row["content_digest"]),
+         "capture_state": str(row["capture_state"]), "complete": bool(row["complete"])}
+        for row in (finals or rows)
+    ]
+
+
 def begin_capture(
     service: ControlPlane,
     *,
@@ -380,7 +418,6 @@ def observe_output(
                 now,
             ),
         )
-        boundary_id = ""
         if event.kind == "turn_end":
             connection.execute(
                 "UPDATE worker_output_streams SET terminal_output_id = ? WHERE id = ?",
@@ -410,41 +447,9 @@ def observe_output(
         # Terminal receipts are durable pending-outbox entries. Only canonical
         # dispatch settlement may publish their Boundary and terminal wake.
         # Capture must never steal attention from runtime failure recovery.
-        notify = (
-            event.kind == "message"
-            and connection.execute(
-                "SELECT 1 FROM worker_output_receipts WHERE stream_id = ? AND notification_message_id IS NOT NULL LIMIT 1",
-                (stream["id"],),
-            ).fetchone()
-            is None
-        )
-        if notify:
-            message = service._message(
-                connection,
-                sender_id=str(attempt["worker_id"]),
-                recipient_id=str(work["supervisor_id"] or work["created_by"]),
-                kind=MessageKind.SYSTEM,
-                work_item_id=str(work["id"]),
-                attempt_id=attempt_id,
-                goal_version=int(work["goal_version"]),
-                idempotency_key=f"worker-output:{output_id}",
-                causation_id=delivery_message_id,
-                payload={
-                    "action": "worker_output",
-                    "output_id": output_id,
-                    "boundary_id": boundary_id or None,
-                    "summary": "Worker output is available as untrusted evidence."
-                    if event.kind == "message"
-                    else "Worker provider turn ended; inspect captured output and its terminal status.",
-                    "turn_status": event.status,
-                    "capture_state": capture_state,
-                    "generation": int(work["generation"]),
-                },
-            )
-            connection.execute(
-                "UPDATE worker_output_receipts SET notification_message_id = ?, boundary_id = ? WHERE id = ?",
-                (message["id"], boundary_id or None, output_id),
-            )
+        # Capture is evidence, not a request for another model invocation.
+        # Canonical settlement below publishes a decision Boundary for terminal
+        # output; structured questions/blockers/completion retain their wakes.
         service._event(
             connection,
             "worker_output.captured",
@@ -637,6 +642,7 @@ def finalize_capture_tx(
             payload={
                 "action": "worker_output",
                 "output_id": str(output["id"]),
+                "output_refs": _substantive_output_refs_tx(connection, str(stream["id"])),
                 "boundary_id": str(boundary["id"]) if boundary is not None else None,
                 "summary": "Worker provider turn settled; inspect captured output and the current Work boundary.",
                 "generation": int(work["generation"]),

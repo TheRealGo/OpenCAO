@@ -706,7 +706,7 @@ def test_text_output_has_operator_field_parity_and_ignores_unknown_payload_keys(
     rendered = render_dashboard_snapshot(_snapshot(), timezone=ZoneInfo("Asia/Tokyo"))
     for label in (
         "title unavailable",
-        "objective unavailable",
+        "instruction unavailable",
         "state active",
         "attempt state working",
         "progress stage 候補を検証中",
@@ -760,6 +760,26 @@ def test_server_categories_are_rendered_as_supplied_without_client_reclassificat
     assert "Work items:" not in empty
 
 
+def test_public_edge_rejects_unrecognized_supervision_status_values() -> None:
+    body = _snapshot()
+    operator = body["operator"]
+    assert isinstance(operator, dict)
+    worker = operator["working"][0]
+    worker["attention_reason"] = "untrusted-reason"
+    worker["current_work_items"][0]["cao_supervision_state"] = "untrusted-state"
+    app = create_dashboard_edge(
+        _settings([], transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body)))
+    )
+    with TestClient(app, base_url="http://localhost") as client:
+        _bootstrap(client)
+        public = client.get("/dashboard/api/snapshot").json()["operator"]["working"][0]
+    assert public["attention_reason"] is None
+    assert public["current_work_items"][0]["cao_supervision_state"] is None
+    rendered = render_dashboard_snapshot(body)
+    assert "untrusted-reason" not in rendered
+    assert "untrusted-state" not in rendered
+
+
 def test_edge_preserves_exact_worker_and_nested_work_allowlists() -> None:
     calls: list[httpx.Request] = []
     app = create_dashboard_edge(_settings(calls))
@@ -770,6 +790,8 @@ def test_edge_preserves_exact_worker_and_nested_work_allowlists() -> None:
     worker = operator["working"][0]
     assert set(worker) == {
         "worker_label",
+        "purpose_text",
+        "purpose_status",
         "attention_reason",
         "worker_state",
         "runner_adapter",
@@ -790,6 +812,9 @@ def test_edge_preserves_exact_worker_and_nested_work_allowlists() -> None:
         "work_title",
         "objective_summary",
         "objective_text",
+        "instruction_text",
+        "instruction_summary",
+        "purpose_text",
         "latest_report_text",
         "history_reference",
         "state",
@@ -896,7 +921,7 @@ def test_text_and_mobile_browser_keep_the_same_operator_content_fields() -> None
     rendered = render_dashboard_snapshot(body, timezone=ZoneInfo("Asia/Tokyo"))
     for expected in (
         "title Canonical title",
-        "objective Canonical objective",
+        "instruction Canonical objective",
         "progress stage Canonical stage",
         "latest report Worker reports progress",
         "report kind artifact",

@@ -144,7 +144,10 @@ Control Plane readiness and the server never reloads a client on its behalf.
 The responsive page renders the server-supplied `cao_processing`,
 `user_confirmation`, `stopped_or_failed`, `working`, and `ready` categories.
 When all are empty it says `現在稼働中の本番Workerはありません`. Current
-Work leads with objective, report and the next action; diagnostics are
+Worker cards lead with their enduring business purpose, including when no task
+is active. Work shows the instruction separately, with the purpose sealed at
+assignment. History labels task revisions as instructions. An unset purpose
+stays unset rather than using task text. Reports and next actions follow; diagnostics are
 conditional and collapsed. A single work-history reader provides selection,
 full-text disclosure and older pages, including retained historical Work after
 Worker Finish/Delete. This history does not contribute to active counts.
@@ -168,7 +171,7 @@ resynchronization event so an already-open surface fetches the migrated
 snapshot.
 
 The page uses semantic headings, lists, definition lists and native disclosure
-controls. Full objective/report fields preserve paragraph breaks and are
+controls. Full purpose/instruction/report fields preserve paragraph breaks and are
 rendered as text. Internal statuses and missing fields do not dominate the
 reading surface. Closure, liveness and recovery keep their canonical meanings;
 unknown values are never reconstructed. The edge independently allowlists all
@@ -421,7 +424,10 @@ The authorized workflow is fixed:
 2. take a disposable online backup, run the current `Database` migration on
    only that copy, verify the complete projection at the target schema, and
    delete the disposable copy;
-3. require the currently running Control Plane and Edge to be healthy. A
+3. require the currently running Control Plane and Edge to be healthy. Each
+   upgrade/restart HTTP probe has a bounded 30-second timeout because full
+   database and projection verification can exceed the short status probe's
+   five seconds as history grows. A timeout still fails the readiness gate. A
    source Control Plane whose only readiness failure is its projection may be
    upgraded only when the source database is integral, authority is canonical,
    the dispatcher and Edge are healthy, and the disposable target migration
@@ -581,3 +587,9 @@ tool through it; run this owner-local lifecycle action through a still-live
 host control path, continue the affected task, then require `cao_start` and
 `cao_list_managed_workers` to prove the current attachment and catalog before
 calling the refresh successful.
+
+Desktop daemon preflight accepts the shipped `standalone/current/codex` and
+`app-server-daemon/current/bin/codex` managed-path metadata. Neither metadata
+path establishes Desktop authority: the exact socket peer, owner LaunchAgent,
+process generation and signed mapped executable remain required. Managed PID
+backends retain their separately verified installer lineage.

@@ -4,7 +4,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+    model_validator,
+)
 
 from .provider_models import ProviderModel
 
@@ -322,6 +330,18 @@ class ProvisionManagedWorkerInput(APIModel):
         return label
 
 
+class PurposeCheckedInput(APIModel):
+    """The current business purpose read for this CAO instruction or judgment."""
+
+    expected_purpose_version: int | None = Field(
+        default=None,
+        ge=0,
+        strict=True,
+        exclude_if=lambda value: value is None,
+        description="Confirm the Worker's current business purpose version read for this decision.",
+    )
+
+
 class WorkerThreadLifecycleInput(APIModel):
     """Command for one logical Worker thread.
 
@@ -333,6 +353,59 @@ class WorkerThreadLifecycleInput(APIModel):
     worker_thread_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     expected_generation: int | None = Field(default=None, ge=1)
     idempotency_key: str = Field(min_length=1, max_length=256)
+
+
+class PurposeCriterion(APIModel):
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    condition: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    evidence: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+
+    @field_validator("condition", "evidence")
+    @classmethod
+    def clean_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class WorkerPurposeContract(APIModel):
+    """Fixed business outcomes and judgment boundaries, not a chosen method."""
+
+    outcome: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    scope: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    criteria: list[PurposeCriterion] = Field(min_length=1, max_length=16)
+    completion: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    authority: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    unmet_action: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+
+    @field_validator("outcome", "scope", "completion", "authority", "unmet_action")
+    @classmethod
+    def clean_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_fixed_contract(self) -> WorkerPurposeContract:
+        ids = [criterion.id for criterion in self.criteria]
+        if len(ids) != len(set(ids)):
+            raise ValueError("purpose criterion ids must be unique")
+        size = sum(len(value) for value in (
+            self.outcome, self.scope, self.completion, self.authority, self.unmet_action,
+        )) + sum(len(item.id) + len(item.condition) + len(item.evidence) for item in self.criteria)
+        if size > 8000:
+            raise ValueError("purpose contract must contain at most 8000 characters")
+        return self
+
+
+class SetWorkerPurposeInput(WorkerThreadLifecycleInput):
+    """Define the enduring business direction entrusted to this exact Worker."""
+
+    purpose: str = Field(min_length=1, max_length=8000, pattern=r"\S")
+    contract: WorkerPurposeContract
+    expected_purpose_version: int = Field(default=0, ge=0, strict=True)
+    reason: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+
+    @field_validator("purpose", "reason")
+    @classmethod
+    def clean_purpose_text(cls, value: str) -> str:
+        return value.strip()
 
 
 class DeleteWorkerThreadInput(WorkerThreadLifecycleInput):
@@ -347,11 +420,11 @@ class ResumeWorkerThreadInput(WorkerThreadLifecycleInput):
     """
 
 
-class InstructWorkerThreadInput(WorkerThreadLifecycleInput):
+class InstructWorkerThreadInput(WorkerThreadLifecycleInput, PurposeCheckedInput):
     """Record one sealed Work for an exact active managed Worker thread."""
 
     title: str | None = Field(default=None, min_length=1, max_length=300)
-    objective: str = Field(min_length=1)
+    objective: str = Field(min_length=1, validation_alias=AliasChoices("instruction", "objective"))
     maturity: GoalMaturity = GoalMaturity.UNSET
     acceptance: list[str] = Field(default_factory=list)
     non_goals: list[str] = Field(default_factory=list)
@@ -429,10 +502,10 @@ class AssignmentDependency(StrEnum):
     DOCKER_API_PING = "docker_api_ping"
 
 
-class WorkAssignment(APIModel):
+class WorkAssignment(PurposeCheckedInput):
     worker_id: str
     title: str = Field(min_length=1, max_length=300)
-    objective: str = Field(min_length=1)
+    objective: str = Field(min_length=1, validation_alias=AliasChoices("instruction", "objective"))
     maturity: GoalMaturity = GoalMaturity.DEFINED
     acceptance: list[str] = Field(default_factory=list)
     non_goals: list[str] = Field(default_factory=list)
@@ -537,7 +610,7 @@ class SubmittedIntent(APIModel):
     payload_digest: str = ""
 
 
-class IntentDisposition(APIModel):
+class IntentDisposition(PurposeCheckedInput):
     kind: IntentKind
     relation: IntentRelation | None = None
     target_work_item_id: str | None = None
@@ -594,9 +667,9 @@ class IntentDisposition(APIModel):
         return self
 
 
-class GoalRevision(APIModel):
+class GoalRevision(PurposeCheckedInput):
     expected_version: int = Field(ge=1)
-    objective: str = Field(min_length=1)
+    objective: str = Field(min_length=1, validation_alias=AliasChoices("instruction", "objective"))
     maturity: GoalMaturity
     acceptance: list[str] = Field(default_factory=list)
     non_goals: list[str] = Field(default_factory=list)
@@ -636,7 +709,7 @@ class ReasonerTurnAcquireInput(APIModel):
     idempotency_key: str = Field(min_length=1)
 
 
-class BoundaryDispositionInput(APIModel):
+class BoundaryDispositionInput(PurposeCheckedInput):
     turn_id: str = Field(min_length=1)
     lease_token: str = Field(min_length=1)
     expected_generation: int = Field(ge=1)
@@ -668,7 +741,7 @@ class BoundaryDispositionInput(APIModel):
         return self
 
 
-class WorkResumeInput(APIModel):
+class WorkResumeInput(PurposeCheckedInput):
     """Consume one exact CAO-owned pause after an explicit changed-condition decision."""
 
     expected_generation: int = Field(ge=1, le=2**63 - 1, strict=True)
@@ -739,7 +812,7 @@ class ArtifactInput(APIModel):
 
 
 class ArtifactContentReadInput(APIModel):
-    """Read one bounded text chunk from an exact verified artifact manifest."""
+    """Read one bounded text chunk from an exact verified registered artifact."""
 
     work_item_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     attempt_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -779,6 +852,9 @@ class ReportInput(APIModel):
     expected_task_packet_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_generation: int = Field(ge=1)
     summary: str = Field(min_length=1)
+    progress_event: Literal["execution_started"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     trajectory: Trajectory | None = None
     stage: str = ""
     next_boundary: str = ""
@@ -786,6 +862,14 @@ class ReportInput(APIModel):
     artifacts: list[ArtifactInput] = Field(default_factory=list)
     incorporated_message_ids: list[str] = Field(default_factory=list, max_length=1)
     idempotency_key: str = ""
+
+    @model_validator(mode="after")
+    def validate_execution_start(self) -> ReportInput:
+        if self.progress_event is not None and (
+            self.kind != ReportKind.PROGRESS or not self.evidence
+        ):
+            raise ValueError("execution_started requires a progress report with concrete evidence")
+        return self
 
     @field_validator("incorporated_message_ids")
     @classmethod
@@ -802,7 +886,7 @@ class ReportInput(APIModel):
         return value
 
 
-class ReplyInput(APIModel):
+class ReplyInput(PurposeCheckedInput):
     message: str = Field(min_length=1)
     in_reply_to: str | None = None
     idempotency_key: str = ""
@@ -819,15 +903,27 @@ class StatusRequestInput(APIModel):
     idempotency_key: str = Field(min_length=1, max_length=256)
 
 
-class ReviewInput(APIModel):
+class CriterionAssessment(APIModel):
+    criterion_id: str = Field(pattern=r"^task_(?:instruction|[1-9][0-9]*)$")
+    verdict: Literal["met", "unmet", "unverified"]
+    evidence: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+
+
+class ReviewInput(PurposeCheckedInput):
     attempt_id: str
     verdict: ReviewVerdict
     summary: str = Field(min_length=1)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
+    criterion_assessments: list[CriterionAssessment] = Field(
+        default_factory=list, max_length=64, exclude_if=lambda value: not value
+    )
+    expected_assignment_purpose_version: int | None = Field(
+        default=None, ge=1, strict=True, exclude_if=lambda value: value is None
+    )
     idempotency_key: str = ""
 
 
-class RequesterDecisionInput(APIModel):
+class RequesterDecisionInput(PurposeCheckedInput):
     """A requester decision observed and recorded by the attached CAO conversation."""
 
     review_id: str = Field(min_length=1)

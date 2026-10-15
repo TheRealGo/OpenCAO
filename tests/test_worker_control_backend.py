@@ -9,7 +9,11 @@ from threading import Barrier
 from typing import Any
 
 import pytest
-from conftest import attach_cao_session_with_peer, current_cao_session_attachment
+from conftest import (
+    attach_cao_session_with_peer,
+    business_purpose_contract,
+    current_cao_session_attachment,
+)
 
 from cao_control_plane.database import SCHEMA_VERSION, Database
 from cao_control_plane.errors import (
@@ -29,6 +33,7 @@ from cao_control_plane.models import (
     NewWorkerThreadInput,
     ResumeWorkerThreadInput,
     RuntimeHeartbeat,
+    SetWorkerPurposeInput,
     WorkerThreadLifecycleInput,
 )
 from cao_control_plane.projection import verify_projection
@@ -96,6 +101,17 @@ def _new(
             idempotency_key=idempotency_key or f"new-{suffix}",
         ),
     )
+    service.set_worker_purpose(
+        actor,
+        SetWorkerPurposeInput(
+            contract=business_purpose_contract(),
+            worker_thread_id=result["worker_thread_id"],
+            purpose="Maintain the quality of the service as requirements evolve.",
+            reason="The requester entrusts this continuing responsibility to the Worker.",
+            expected_purpose_version=0,
+            idempotency_key=f"purpose-{suffix}",
+        ),
+    )
     return result, directory
 
 
@@ -135,6 +151,7 @@ def _instruct(
             worker_thread_id=worker_thread_id,
             expected_generation=1,
             objective=objective,
+            expected_purpose_version=1,
             idempotency_key=key,
         ),
     )
@@ -586,6 +603,7 @@ def test_same_project_conversation_lists_and_instructs_existing_worker_without_g
         InstructWorkerThreadInput(
             worker_thread_id=thread_id,
             objective="Continue through the current CAO conversation.",
+            expected_purpose_version=1,
             idempotency_key="same-project-fork-instruction",
         ),
     )

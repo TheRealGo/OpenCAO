@@ -35,6 +35,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from .cloudflare_access import CloudflareAccessJWTValidator, CloudflareAccessSettings
 from .dashboard_history import HISTORY_KINDS, HISTORY_REFERENCE, full_operator_text
 from .dashboard_presentation import local_timestamp_display
+from .dashboard_status import ATTENTION_REASONS, CAO_SUPERVISION_STATES
 from .projection import sanitize_operator_text
 from .provider_models import model_identifier
 
@@ -103,20 +104,6 @@ _ATTEMPT_STATES = frozenset(
         "canceled",
     }
 )
-_ATTENTION_REASONS = frozenset(
-    {
-        "user-action-required",
-        "cao-action-required",
-        "cao-processing",
-        "external-action-required",
-        "progress-at-risk",
-        "awaiting-explicit-close",
-        "system-reconciliation",
-        "runner-failed",
-        "runner-missing",
-        "runner-stopped",
-    }
-)
 _AVAILABILITY_STATES = frozenset({"available", "unavailable"})
 _STATUS_REQUEST_STATES = frozenset({"pending", "overdue", "responded"})
 _COMPLETION_CONTRACTS = frozenset(
@@ -135,7 +122,6 @@ _RECOVERY_ACTIONS = frozenset(
 _RECOVERY_NOTIFICATION_STATES = frozenset(
     {"queued", "leased", "dispatched", "delivered", "acknowledged", "handled", "dead"}
 )
-_CAO_SUPERVISION_STATES = frozenset({"scheduled", "active", "unscheduled"})
 
 
 class DashboardAccessTokenValidator(Protocol):
@@ -745,13 +731,14 @@ def render_dashboard_snapshot(body: Mapping[str, Any], *, timezone: tzinfo | Non
 
 def _render_worker_lines(worker: Mapping[str, Any], *, timezone: tzinfo | None = None) -> list[str]:
     lines = [f"- {_display(worker['worker_label'])}"]
+    lines.append(f"  Business purpose: {_display(worker.get('purpose_text'))}")
     if worker["attention_reason"] is not None:
         lines.append(f"  attention reason {_display(worker['attention_reason'])}")
     for item in worker["current_work_items"]:
         lines.append(f"  - {item['display_label']}")
         lines.append(
             "    "
-            f"title {_display(item['work_title'])}; objective {_display(item['objective_text'] or item['objective_summary'])}; "
+            f"title {_display(item['work_title'])}; instruction {_display(item.get('instruction_text') or item['objective_text'] or item['objective_summary'])}; "
             f"progress stage {_display(item['progress_stage'])}; "
             f"latest report {_display(item['latest_report_text'] or item['latest_report_summary'])}; "
             f"report kind {_display(item['latest_report_kind'])}; "
@@ -896,8 +883,14 @@ def _worker_items(value: object) -> list[dict[str, Any]]:
         workers.append(
             {
                 "worker_label": worker_label or f"Worker {index}",
+                "purpose_text": full_operator_text(raw_worker.get("purpose_text")),
+                "purpose_status": (
+                    raw_worker.get("purpose_status")
+                    if raw_worker.get("purpose_status") in {"defined", "unset", "invalid"}
+                    else "unset"
+                ),
                 "attention_reason": _safe_status(
-                    raw_worker.get("attention_reason"), _ATTENTION_REASONS
+                    raw_worker.get("attention_reason"), ATTENTION_REASONS
                 ),
                 "worker_state": _safe_status(raw_worker.get("worker_state"), _RUNNER_SPEC_STATES),
                 "runner_adapter": _safe_status(raw_worker.get("runner_adapter"), _RUNNER_ADAPTERS),
@@ -953,6 +946,9 @@ def _work_items(value: object) -> list[dict[str, Any]]:
                 "work_title": sanitize_operator_text(raw_item.get("work_title")),
                 "objective_summary": sanitize_operator_text(raw_item.get("objective_summary")),
                 "objective_text": full_operator_text(raw_item.get("objective_text")),
+                "instruction_text": full_operator_text(raw_item.get("instruction_text")),
+                "instruction_summary": sanitize_operator_text(raw_item.get("instruction_summary")),
+                "purpose_text": full_operator_text(raw_item.get("purpose_text")),
                 "state": _safe_enum(raw_item.get("state")),
                 "attempt_state": attempt_state,
                 "progress_stage": sanitize_operator_text(raw_item.get("progress_stage")),
@@ -970,7 +966,7 @@ def _work_items(value: object) -> list[dict[str, Any]]:
                 ),
                 "cao_supervision_state": _safe_status(
                     raw_item.get("cao_supervision_state"),
-                    _CAO_SUPERVISION_STATES,
+                    CAO_SUPERVISION_STATES,
                 ),
                 "cao_supervision_updated_at": _safe_timestamp(
                     raw_item.get("cao_supervision_updated_at")

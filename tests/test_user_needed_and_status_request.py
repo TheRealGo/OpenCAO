@@ -373,6 +373,27 @@ def test_wait_user_projects_the_exact_requester_decision(system: dict) -> None:
     assert projected["user_needed"]["resume_condition"] == (
         "Resume after the requester records publish or hold."
     )
+    notice = projected["requester_escalation"]
+    assert notice["notification_state"] == "queued"
+    question = next(item for item in service.get_inbox(system["cao"])["items"]
+                    if item["payload"].get("boundary_id") == boundary["id"])
+    service.acknowledge(system["cao"], AckInput(message_ids=[question["id"]]))
+    service.mark_message_handled(
+        system["cao"], question["id"], evidence="The question was incorporated and escalated.",
+    )
+    service.acknowledge(system["cao"], AckInput(message_ids=[notice["message_id"]]))
+    service.mark_message_handled(
+        system["cao"], notice["message_id"], evidence="The decision was requested in conversation.",
+    )
+    assert service.get_work(work["id"])["state"] == "user_needed"
+    service.reply(
+        system["cao"], work["id"], "The requester chose hold; preserve the reviewed artifact.",
+        idempotency_key="structured-user-needed:answer",
+    )
+    resumed = service.get_work(work["id"])
+    assert resumed["state"] == "active"
+    assert resumed["requester_escalation"] is None
+    assert resumed["objective"] == work["objective"]
 
 
 def test_non_wait_boundary_disposition_replays_a_pre_resume_condition_digest(
@@ -795,12 +816,14 @@ def test_overdue_unclaimed_assignment_opens_one_runtime_recovery_boundary(
             turn_id=turn["id"],
             lease_token=turn["lease_token"],
             expected_generation=recovered["generation"],
-            kind=BoundaryDispositionKind.FAIL,
+            kind=BoundaryDispositionKind.WAIT_USER,
+            instruction="Advise how the remaining objective should proceed.",
+            resume_condition="Requester guidance is incorporated into a safe next action.",
             reason="The unclaimed Assignment exceeded its bounded delivery deadline.",
         ),
     )
-    assert disposition["kind"] == "fail"
-    assert service.get_work(work["id"])["state"] == "failed"
+    assert disposition["kind"] == "wait_user"
+    assert service.get_work(work["id"])["state"] == "user_needed"
 
     # Defense in depth: even if a stale database writer re-queues the old
     # Assignment after recovery, the Dispatcher must bind launchability to the

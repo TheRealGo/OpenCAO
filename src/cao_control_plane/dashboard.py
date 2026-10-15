@@ -19,6 +19,7 @@ from typing import Any
 from .canonical import canonical_json as _canonical_json
 from .canonical import canonical_sha256 as _digest
 from .dashboard_history import full_operator_text, history_reference, work_exchanges
+from .dashboard_status import ATTENTION_REASONS, CAO_SUPERVISION_STATES
 from .projection import (
     build_projection,
     project_work_items_from_connection,
@@ -26,6 +27,7 @@ from .projection import (
 )
 from .provider_models import model_identifier
 from .service import ControlPlane
+from .worker_purpose import purpose_display_text
 
 DASHBOARD_FORMAT = "cao-dashboard-read-model/v1"
 OPERATOR_FORMAT = "cao-dashboard-operator/v1"
@@ -101,26 +103,11 @@ _RECOVERY_ACTIONS = frozenset(
 _RECOVERY_NOTIFICATION_STATES = frozenset(
     {"queued", "leased", "dispatched", "delivered", "acknowledged", "handled", "dead"}
 )
-_CAO_SUPERVISION_STATES = frozenset({"scheduled", "active", "unscheduled"})
 _COMPLETION_CONTRACTS = frozenset(
     {"completion_required", "no_artifact_expected", "legacy_unclassified"}
 )
 _DELIVERY_STATES = frozenset(
     {"pending", "not_required", "legacy_unclassified", "ready", "delivery_missing"}
-)
-_ATTENTION_REASONS = frozenset(
-    {
-        "user-action-required",
-        "cao-action-required",
-        "cao-processing",
-        "external-action-required",
-        "progress-at-risk",
-        "awaiting-explicit-close",
-        "system-reconciliation",
-        "runner-failed",
-        "runner-missing",
-        "runner-stopped",
-    }
 )
 
 
@@ -236,57 +223,66 @@ class DashboardReadModel:
     def history(
         self, *, after: str = "", limit: int = 100
     ) -> dict[str, Any] | DashboardResyncRequired:
-        projection = build_projection(self.service.db)
-        authority = projection.snapshot["authority"]
+        # Replay needs the event envelope and its authority generation, not
+        # Work reconstruction or a global integrity audit. Read every cursor
+        # decision in one transaction so concurrent commits cannot mix epochs.
+        with self.service.db.connection_scope() as connection:
+            connection.execute("BEGIN")
+            try:
+                return self._history_from_connection(connection, after=after, limit=limit)
+            finally:
+                connection.rollback()
+
+    @staticmethod
+    def _history_from_connection(
+        connection: sqlite3.Connection, *, after: str, limit: int
+    ) -> dict[str, Any] | DashboardResyncRequired:
+        authority_row = connection.execute(
+            "SELECT mode, generation FROM control_authority WHERE singleton = 1"
+        ).fetchone()
+        authority: dict[str, Any] = (
+            dict(authority_row) if authority_row is not None else {"mode": "missing", "generation": 0}
+        )
         generation = int(authority["generation"])
         requested = DashboardCursor(generation, 0) if not after else DashboardCursor.decode(after)
-        current_cursor = DashboardCursor(
-            generation,
-            int(projection.watermark["event_sequence"]),
-        ).encode()
+        bounds = connection.execute(
+            """SELECT
+                (SELECT sequence FROM events ORDER BY sequence ASC LIMIT 1) AS first_sequence,
+                (SELECT sequence FROM events ORDER BY sequence DESC LIMIT 1) AS last_sequence"""
+        ).fetchone()
+        first = int(bounds["first_sequence"] or 0)
+        last = int(bounds["last_sequence"] or 0)
+        current_cursor = DashboardCursor(generation, last).encode()
         if requested.authority_generation != generation:
             return DashboardResyncRequired(
                 "authority-generation-changed", generation, current_cursor
             )
-
-        bounds = self.service.db.fetchone(
-            "SELECT MIN(sequence) AS first_sequence, MAX(sequence) AS last_sequence FROM events"
-        )
-        first = int(bounds["first_sequence"] or 0) if bounds else 0
-        last = int(bounds["last_sequence"] or 0) if bounds else 0
         if requested.sequence > last or (
             requested.sequence > 0 and (first == 0 or first > requested.sequence + 1)
         ):
             return DashboardResyncRequired("cursor-pruned-or-invalid", generation, current_cursor)
 
         effective_limit = min(max(limit, 1), 1000)
-        next_sequence = requested.sequence
-        items: list[dict[str, Any]] = []
-        while len(items) < effective_limit:
-            page = self.service.list_events(after=next_sequence, limit=1000)
-            raw_items = page["items"]
-            if not raw_items:
-                break
-            reached_limit = False
-            for raw in raw_items:
-                next_sequence = int(raw["sequence"])
-                if self._event_is_operator_visible(raw):
-                    items.append(self._event(raw, generation))
-                    if len(items) >= effective_limit:
-                        reached_limit = True
-                        break
-            if reached_limit or not page["next_cursor"]:
-                break
-        later = self.service.db.fetchone(
-            "SELECT 1 FROM events WHERE sequence > ? LIMIT 1", (next_sequence,)
-        )
+        rows = connection.execute(
+            """SELECT sequence, event_type, aggregate_type, created_at
+               FROM events
+               WHERE operator_scope = 'production' AND sequence > ? AND sequence <= ?
+               ORDER BY sequence ASC LIMIT ?""",
+            (requested.sequence, last, effective_limit + 1),
+        ).fetchall()
+        has_more = len(rows) > effective_limit
+        rows = rows[:effective_limit]
+        items = [DashboardReadModel._event(dict(row), generation) for row in rows]
+        # Hidden events advance the replay barrier without loading payloads.
+        # Stop before the next visible event when a page is full.
+        next_sequence = int(rows[-1]["sequence"]) if has_more else last
         return {
             "format": DASHBOARD_FORMAT,
             "authority": {"mode": str(authority["mode"]), "generation": generation},
             "after": after or None,
             "items": items,
             "next_cursor": DashboardCursor(generation, next_sequence).encode(),
-            "has_more": later is not None,
+            "has_more": has_more,
         }
 
     def work_history(self, *, work: str = "", before: str = "", limit: int = 20) -> dict[str, Any]:
@@ -471,11 +467,6 @@ class DashboardReadModel:
                 "occurred_at": str(raw["created_at"]),
             },
         }
-
-    def _event_is_operator_visible(self, raw: Mapping[str, Any]) -> bool:
-        """Use the immutable event-time scope; never reclassify history later."""
-
-        return raw.get("operator_scope") == "production"
 
 
 def build_operator_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -668,11 +659,9 @@ def _work_item_view(
     )
     cao_supervision_state = _enum(
         operator_content.get("cao_supervision_state"),
-        _CAO_SUPERVISION_STATES,
+        CAO_SUPERVISION_STATES,
     )
-    cao_supervision_updated_at = _timestamp(
-        operator_content.get("cao_supervision_updated_at")
-    )
+    cao_supervision_updated_at = _timestamp(operator_content.get("cao_supervision_updated_at"))
     report_kind = _enum(operator_content.get("latest_report_kind"), _REPORT_KINDS)
     report = sanitize_operator_text(operator_content.get("latest_worker_report_summary"))
     reported_at = _timestamp(operator_content.get("latest_reported_at"))
@@ -711,6 +700,9 @@ def _work_item_view(
         "worker_label": worker_label,
         "work_title": title,
         "objective_summary": objective,
+        "instruction_summary": objective,
+        "instruction_text": full_operator_text(operator_content.get("objective_text")),
+        "purpose_text": full_operator_text(operator_content.get("purpose_text")),
         "objective_text": full_operator_text(operator_content.get("objective_text")),
         "state": state,
         "attempt_state": attempt_state,
@@ -718,6 +710,7 @@ def _work_item_view(
         "trajectory": trajectory,
         "attention_owner": attention_owner,
         "supervision_pause": _supervision_pause_view(raw.get("supervision_pause")),
+        "requester_escalation": _requester_escalation_view(raw.get("requester_escalation")),
         "next_boundary_summary": next_boundary,
         "pending_supervisor_boundary": boundaries > 0,
         "recovery_action": recovery_action,
@@ -759,13 +752,15 @@ def _work_item_view(
         "closure_state": _closure_state(raw.get("closure_state"), state),
         "closure_summary": closure,
         "completed_at": (
-            _timestamp(raw.get("updated_at")) if _is_successful_completion_fields(
+            _timestamp(raw.get("updated_at"))
+            if _is_successful_completion_fields(
                 state=state,
                 attempt_state=attempt_state,
                 latest_cao_review=closure["cao_review"],
                 pending_supervisor_boundary=boundaries > 0,
                 recovery_action=recovery_action,
-            ) else None
+            )
+            else None
         ),
         "availability": {
             "work_title": _availability(title),
@@ -808,6 +803,20 @@ def _work_item_view(
     }
 
 
+def _requester_escalation_view(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {
+        "reason": sanitize_operator_text(value.get("reason")),
+        "decision": sanitize_operator_text(value.get("decision")),
+        "resume_condition": sanitize_operator_text(value.get("resume_condition")),
+        "requested_at": _timestamp(value.get("requested_at")),
+        "notification_state": _enum(
+            value.get("notification_state"), _RECOVERY_NOTIFICATION_STATES | {"unavailable"}
+        ),
+    }
+
+
 def _supervision_pause_view(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
@@ -835,6 +844,12 @@ def _worker_view(
 ) -> dict[str, Any]:
     return {
         "worker_label": worker_label,
+        "purpose_status": raw.get("purpose_status", "unset"),
+        "purpose_text": full_operator_text(
+            purpose_display_text(raw.get("worker_purpose"))
+            if isinstance(raw.get("worker_purpose"), Mapping)
+            else None
+        ),
         "attention_reason": (
             _worker_attention_reason(raw, current_work_items)
             if category in {"cao_processing", "user_confirmation", "stopped_or_failed"}
@@ -873,6 +888,11 @@ def _worker_attention_reason(
     ):
         return "user-action-required"
     if any(
+        item.get("cao_supervision_state") == "connection_required"
+        for item in current_work_items
+    ):
+        return "cao-connection-required"
+    if any(
         item.get("cao_supervision_state") in {"scheduled", "active"}
         for item in current_work_items
     ):
@@ -910,7 +930,7 @@ def _worker_attention_reason(
     connection = raw.get("runner_connection_state")
     if connection in {"failed", "missing", "stopped"}:
         reason = f"runner-{connection}"
-        return reason if reason in _ATTENTION_REASONS else None
+        return reason if reason in ATTENTION_REASONS else None
     if raw.get("principal_enabled") is not True or raw.get("worker_state") in {
         "stopped",
         "revoked",
@@ -1002,7 +1022,10 @@ def _worker_category(
         or item.get("attempt_state") in {"waiting_supervisor", "submitted"}
     ]
     if cao_work:
-        if any(item.get("cao_supervision_state") == "unscheduled" for item in cao_work):
+        if any(
+            item.get("cao_supervision_state") in {"unscheduled", "connection_required"}
+            for item in cao_work
+        ):
             return "stopped_or_failed"
         return "cao_processing"
     if any(

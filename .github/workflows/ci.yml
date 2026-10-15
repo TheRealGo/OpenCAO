@@ -95,7 +95,7 @@ jobs:
           operator = json.loads(pathlib.Path("${{ runner.temp }}/mcp-operator-tools.json").read_text());
           names = {tool.get("name") for tool in conversation.get("result", {}).get("tools", [])};
           operator_names = {tool.get("name") for tool in operator.get("result", {}).get("tools", [])};
-          required = {"cao_new_worker_thread", "cao_instruct_worker_thread", "cao_finish_worker_thread", "cao_resume_worker_thread", "cao_delete_worker_thread"};
+          required = {"cao_set_worker_purpose", "cao_revise_task", "cao_new_worker_thread", "cao_instruct_worker_thread", "cao_finish_worker_thread", "cao_resume_worker_thread", "cao_delete_worker_thread"};
           removed = {"cao_delegate_target", "cao_delegate_new_worker", "cao_abandon_system_reconciliation", "cao_provision_managed_worker", "cao_stop_managed_worker"};
           assert required <= names, required - names;
           assert "cao_get_inbox" in operator_names;

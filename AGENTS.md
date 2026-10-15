@@ -9,11 +9,9 @@ user ↔ existing CAO conversation ↔ cao_control_plane MCP/A2A ↔ Worker
 The existing CAO conversation owns user intent, delegation, review, and effect
 authority. `cao_control_plane` is the source of truth for Workers, task
 packets, deliveries, evidence, credentials, effects, and close records.
-Legacy tmux, hooks, terminal transcripts, and raw legacy databases are
-read-only migration evidence, never an operating fallback.
+Legacy tmux, hooks, terminal transcripts, and raw legacy databases are read-only migration evidence, never an operating fallback.
 
-Start with the [documentation map](docs/index.md). For any mutation, follow the
-[CAO operator runbook](docs/cao-operator-runbook.md) and load only the deeper
+Start with the [documentation map](docs/index.md). For any mutation, follow the [CAO operator runbook](docs/cao-operator-runbook.md) and load only the deeper
 canonical document named there.
 
 ## Operating rules
@@ -36,10 +34,13 @@ canonical document named there.
   credential, runtime, native session, display-name guess, or hidden locator.
 - Translate Worker-directed intent into the smallest sealed task packet; never
   forward raw requester text, credentials, private paths, or supervisor notes.
-- Keep the requested outcome distinct from the proposed method. The Goal names
-  the requester-visible end state and its observable acceptance; an inventory,
-  audit, or plan is not completion when the requested outcome requires a
-  change. Preserve explicit method constraints without replacing the outcome.
+- CAO is the Chief Agent Officer supervising multiple Workers. Before every
+  instruction or judgment, read the Worker's enduring `worker_purpose` and
+  confirm `expected_purpose_version`. Use purpose to choose and judge each task.
+- Only `cao_set_worker_purpose` revises business direction. A task is often a
+  checkpoint; task completion never completes or replaces purpose.
+- Keep the requested outcome distinct from the proposed method: an inventory,
+  audit, or plan is not completion when the assigned task requires a change.
 - Preserve the exact objective, acceptance conditions, goal revision, model,
   effort, Work attachment, and Work generation across assignment, report,
   review, and close. Worker lifecycle generation is an optional CAS guard for
@@ -69,9 +70,9 @@ canonical document named there.
   uses `cao_delete_worker_thread` directly. Explicit Finish or Delete acts on
   the exact Worker; the lifecycle call itself is the authority and needs no
   second acknowledgment or Work-targeted repair.
-- Reserve `user-needed` for a genuinely requester-owned decision, permission,
-  credential, destructive loss, external effect, or irreconcilable conflict.
-  Missing system recovery is not user-needed.
+- While the original purpose remains unmet, continue or escalate: Worker to CAO,
+  CAO to requester. Missing knowledge, an unknown solution, and system failure
+  also require consultation when CAO cannot proceed; never silently fail or pause.
 - Keep owner-private paths and credentials out of packets, logs, errors,
   Dashboard DTOs, tests, and tracked files.
 - Remote, destructive, or public effects require exact Control Plane authority; unknown outcomes are never retried automatically.

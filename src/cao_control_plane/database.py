@@ -38,8 +38,9 @@ from .goal_packets import (
 )
 from .security import canonical_json as security_canonical_json
 from .security import contains_control_plane_secret
+from .worker_purpose import work_purpose_tx
 
-SCHEMA_VERSION = 45
+SCHEMA_VERSION = 49
 APPLICATION_ID = 0x43414F32  # "CAO2"
 
 
@@ -596,6 +597,24 @@ CREATE TABLE IF NOT EXISTS cao_attachment_connections (
 CREATE INDEX IF NOT EXISTS cao_attachment_connections_attachment_state_expiry_idx
     ON cao_attachment_connections(attachment_id, state, lease_expires_at);
 
+-- State-read admission belongs to the durable attachment, never a bridge or
+-- wall-clock cooldown. Store only input identities and cursor digests.
+CREATE TABLE IF NOT EXISTS cao_state_read_inputs (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    attachment_id TEXT NOT NULL REFERENCES cao_session_attachments(id) ON DELETE CASCADE,
+    input_digest TEXT NOT NULL,
+    UNIQUE(attachment_id, input_digest)
+);
+CREATE TABLE IF NOT EXISTS cao_state_read_cursors (
+    attachment_id TEXT NOT NULL REFERENCES cao_session_attachments(id) ON DELETE CASCADE,
+    resource TEXT NOT NULL,
+    cause_digest TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    pending INTEGER NOT NULL CHECK(pending IN (0, 1)),
+    next_cursor_digest TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(attachment_id, resource)
+);
+
 CREATE TABLE IF NOT EXISTS cao_runtime_tickets (
     id TEXT PRIMARY KEY,
     attachment_id TEXT NOT NULL REFERENCES cao_session_attachments(id) ON DELETE CASCADE,
@@ -779,6 +798,33 @@ CREATE TABLE IF NOT EXISTS goal_revisions (
     PRIMARY KEY(work_item_id, version)
 );
 
+-- Business purpose belongs to the durable Worker, never its latest task.
+-- Retain purpose history when a Worker supervision handle is deleted.
+CREATE TABLE IF NOT EXISTS worker_purpose_revisions (
+    worker_thread_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version >= 1),
+    purpose TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES principals(id),
+    supervisor_attachment_id TEXT NOT NULL REFERENCES cao_session_attachments(id),
+    project_digest TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    packet_json TEXT NOT NULL,
+    packet_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(worker_thread_id, version)
+);
+CREATE TABLE IF NOT EXISTS work_purpose_bindings (
+    work_item_id TEXT NOT NULL,
+    goal_version INTEGER NOT NULL,
+    worker_thread_id TEXT NOT NULL,
+    purpose_version INTEGER NOT NULL,
+    PRIMARY KEY(work_item_id, goal_version),
+    FOREIGN KEY(work_item_id, goal_version)
+        REFERENCES goal_revisions(work_item_id, version) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(worker_thread_id, purpose_version)
+        REFERENCES worker_purpose_revisions(worker_thread_id, version)
+);
+
 CREATE TABLE IF NOT EXISTS attempts (
     id TEXT PRIMARY KEY,
     work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
@@ -848,6 +894,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_sender_idempotency_unique
     WHERE idempotency_key <> '';
 CREATE INDEX IF NOT EXISTS messages_work_sequence_idx
     ON messages(work_item_id, sequence);
+CREATE INDEX IF NOT EXISTS messages_attempt_kind_sequence_idx
+    ON messages(attempt_id, kind, sequence);
+CREATE INDEX IF NOT EXISTS messages_attempt_sender_sequence_idx
+    ON messages(attempt_id, sender_id, sequence);
+CREATE INDEX IF NOT EXISTS messages_causation_kind_idx
+    ON messages(causation_id, kind);
 
 CREATE TABLE IF NOT EXISTS message_deliveries (
     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -943,6 +995,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS artifacts_work_idx ON artifacts(work_item_id, created_at);
+CREATE INDEX IF NOT EXISTS artifacts_attempt_created_idx
+    ON artifacts(attempt_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS reviews (
     id TEXT PRIMARY KEY,
@@ -1327,6 +1381,8 @@ CREATE INDEX IF NOT EXISTS events_aggregate_idx
     ON events(aggregate_type, aggregate_id, sequence);
 CREATE INDEX IF NOT EXISTS events_created_idx
     ON events(created_at, sequence);
+CREATE INDEX IF NOT EXISTS events_actor_type_sequence_idx
+    ON events(actor_id, event_type, sequence);
 
 -- A Work cancellation supersedes every still-open Boundary on that Work, but
 -- it is not a CAO review disposition.  Keep the distinction durable: callers
@@ -1338,7 +1394,8 @@ CREATE TABLE IF NOT EXISTS boundary_supersessions (
     superseding_event_sequence INTEGER NOT NULL REFERENCES events(sequence),
     reason TEXT NOT NULL CHECK(
         reason IN (
-          'work_canceled', 'recovery_boundary_replaced', 'goal_replaced'
+          'work_canceled', 'recovery_boundary_replaced', 'goal_replaced',
+          'work_terminal_disposition'
         )
     ),
     created_at TEXT NOT NULL
@@ -1613,6 +1670,69 @@ def _install_work_close_receipt_binding_triggers(
         )
 
 
+def terminal_disposition_supersessions_sql() -> str:
+    """Exact existing Fail/Cancel authority for earlier unresolved Boundaries.
+
+    This relation never decides a Work outcome. It preserves a committed CAO
+    disposition and removes only the actionability of its earlier Boundaries.
+    The same proof is used by the writer, migration, trigger and projection.
+    """
+
+    opening_json = _safe_json_document_sql("opening.data_json")
+    closing_json = _safe_json_document_sql("closing.data_json")
+    exact_json = _safe_json_document_sql("exact.data_json")
+    return f"""
+        SELECT boundary.id AS boundary_id,
+               opening.sequence AS boundary_event_sequence,
+               closing.sequence AS superseding_event_sequence
+        FROM boundaries AS boundary
+        JOIN work_items AS work ON work.id = boundary.work_item_id
+        JOIN boundary_dispositions AS terminal
+          ON terminal.kind IN ('fail', 'cancel')
+        JOIN boundaries AS decided
+          ON decided.id = terminal.boundary_id
+         AND decided.work_item_id = boundary.work_item_id
+         AND decided.generation = terminal.generation
+        JOIN reasoner_turns AS turn
+          ON turn.id = terminal.reasoner_turn_id
+         AND turn.work_item_id = work.id
+         AND turn.boundary_id = decided.id
+         AND turn.generation = terminal.generation
+         AND turn.goal_packet_digest = decided.goal_packet_digest
+         AND turn.task_packet_digest = decided.task_packet_digest
+        JOIN events AS opening
+          ON opening.event_type = 'boundary.recorded'
+         AND opening.aggregate_type = 'work_item'
+         AND opening.aggregate_id = work.id
+         AND json_extract({opening_json}, '$.boundary_id') = boundary.id
+        JOIN events AS closing
+          ON closing.event_type = 'boundary.disposed'
+         AND closing.aggregate_type = 'work_item'
+         AND closing.aggregate_id = work.id
+         AND closing.actor_id = terminal.decided_by
+         AND closing.sequence > opening.sequence
+         AND json_extract({closing_json}, '$.boundary_id') = decided.id
+         AND json_extract({closing_json}, '$.disposition_id') = terminal.id
+         AND json_extract({closing_json}, '$.kind') = terminal.kind
+         AND json_extract({closing_json}, '$.generation') = terminal.generation
+        LEFT JOIN boundary_dispositions AS own ON own.boundary_id = boundary.id
+        WHERE own.id IS NULL
+          AND boundary.generation <= terminal.generation
+          AND work.generation = terminal.generation + 1
+          AND work.state = CASE terminal.kind WHEN 'fail' THEN 'failed' ELSE 'canceled' END
+          AND (SELECT COUNT(*) FROM events AS exact
+               WHERE exact.event_type = 'boundary.recorded'
+                 AND exact.aggregate_type = 'work_item'
+                 AND exact.aggregate_id = work.id
+                 AND json_extract({exact_json}, '$.boundary_id') = boundary.id) = 1
+          AND (SELECT COUNT(*) FROM events AS exact
+               WHERE exact.event_type = 'boundary.disposed'
+                 AND exact.aggregate_type = 'work_item'
+                 AND exact.aggregate_id = work.id
+                 AND json_extract({exact_json}, '$.disposition_id') = terminal.id) = 1
+    """
+
+
 def _install_boundary_supersession_binding_triggers(
     connection: sqlite3.Connection,
 ) -> None:
@@ -1635,6 +1755,13 @@ def _install_boundary_supersession_binding_triggers(
         BEFORE INSERT ON boundary_supersessions
         FOR EACH ROW BEGIN
             SELECT CASE WHEN NOT (
+              EXISTS (
+                SELECT 1 FROM ({terminal_disposition_supersessions_sql()}) AS proof
+                WHERE proof.boundary_id = NEW.boundary_id
+                  AND proof.boundary_event_sequence = NEW.boundary_event_sequence
+                  AND proof.superseding_event_sequence = NEW.superseding_event_sequence
+                  AND NEW.reason = 'work_terminal_disposition'
+              ) OR
               EXISTS (
                 SELECT 1
                 FROM boundaries AS boundary
@@ -2140,7 +2267,9 @@ def _ensure_recovery_boundary_supersession_schema(
     if table is None:
         return
     table_sql = str(table["sql"] or "")
-    if "recovery_boundary_replaced" not in table_sql or "goal_replaced" not in table_sql:
+    if any(reason not in table_sql for reason in (
+        "recovery_boundary_replaced", "goal_replaced", "work_terminal_disposition"
+    )):
         for trigger in (
             "boundary_supersessions_exact_binding_insert",
             "boundary_supersessions_immutable_update",
@@ -2158,7 +2287,7 @@ def _ensure_recovery_boundary_supersession_schema(
                 reason TEXT NOT NULL CHECK(
                     reason IN (
                       'work_canceled', 'recovery_boundary_replaced',
-                      'goal_replaced'
+                      'goal_replaced', 'work_terminal_disposition'
                     )
                 ),
                 created_at TEXT NOT NULL
@@ -2598,6 +2727,54 @@ def _checkpoint_and_compact_runtime_diagnostic_storage(connection: sqlite3.Conne
     require_truncated_wal()
     connection.execute("VACUUM")
     require_truncated_wal()
+
+
+def _legacy_system_escalation_input_matches(
+    connection: sqlite3.Connection, turn: sqlite3.Row, boundary: sqlite3.Row,
+) -> bool:
+    """Recognize only the completed system receipt emitted before its digest fix.
+
+    That writer stored the Boundary digest instead of wrapping it in the turn
+    input envelope. Keep this exact historical representation; never rehash an
+    arbitrary corrupt or model-owned decision. The immutable typed disposition
+    and deterministic non-lease seal identify this system-only origin even after
+    ordinary event retention has pruned diagnostic events.
+    """
+    if not (
+        turn["state"] == "completed"
+        and turn["work_item_id"] == boundary["work_item_id"]
+        and turn["generation"] == boundary["generation"]
+        and turn["input_digest"] == boundary["input_digest"]
+        and turn["idempotency_key"] == f"system-escalation:{boundary['id']}"
+        and turn["lease_token_digest"] == canonical_digest(f"system-escalation:{turn['id']}")
+        and turn["completed_at"] == turn["created_at"] == turn["lease_expires_at"]
+        and bool(turn["result_digest"])
+    ):
+        return False
+    decision = connection.execute(
+        """SELECT d.* FROM boundary_dispositions d JOIN work_items w ON w.id = ?
+           WHERE d.boundary_id = ? AND d.reasoner_turn_id = ?
+             AND d.kind = 'wait_user' AND d.generation = ?
+             AND d.decided_by = ? AND w.supervisor_id = d.decided_by""",
+        (turn["work_item_id"], boundary["id"], turn["id"], turn["generation"], turn["supervisor_id"]),
+    ).fetchone()
+    if decision is None:
+        return False
+    expected_request = canonical_digest({
+        "boundary_id": boundary["id"], "reason_code": "supervision_recovery_incomplete",
+        "kind": "wait_user", "origin": "system_supervision_recovery",
+    })
+    expected_result = canonical_digest({
+        "boundary_id": boundary["id"], "disposition_id": decision["id"],
+        "request_digest": expected_request,
+        "goal_packet_digest": boundary["goal_packet_digest"],
+        "task_packet_digest": boundary["task_packet_digest"],
+    })
+    return bool(
+        decision["request_digest"] == expected_request
+        and turn["result_digest"] == expected_result
+        and decision["created_at"] == turn["created_at"]
+    )
 
 
 def _backfill_goal_and_task_packets(connection: sqlite3.Connection) -> None:
@@ -3085,6 +3262,7 @@ def _backfill_goal_and_task_packets(connection: sqlite3.Connection) -> None:
             supervisor_attachment=supervisor_attachment(str(row["work_item_id"]), version),
             dependencies=packet_dependencies(row["packet_json"]),
             managed_task_policy=packet_managed_task_policy(row["packet_json"]),
+            worker_purpose=work_purpose_tx(connection, str(row["work_item_id"]), version),
         )
         computed_digest = goal_packet_digest(packet)
         stored_digest = str(row["packet_digest"] or "")
@@ -3270,7 +3448,10 @@ def _backfill_goal_and_task_packets(connection: sqlite3.Connection) -> None:
         stored_binding = require_task_binding(table="reasoner turn", row=row, expected=expected)
         stored_input_digest = str(row["input_digest"] or "")
         if stored_input_digest and stored_input_digest != input_digest:
-            raise RuntimeError("stored reasoner turn input digest is invalid")
+            if not _legacy_system_escalation_input_matches(connection, row, boundary):
+                raise RuntimeError("stored reasoner turn input digest is invalid")
+            input_digest = stored_input_digest  # Preserve the exact legacy audit receipt.
+
         result_digest = str(row["result_digest"] or "")
         if row["state"] == "completed":
             disposition = connection.execute(
@@ -3366,7 +3547,9 @@ def _validate_close_lifecycle_bindings(connection: sqlite3.Connection) -> None:
               AND w.requester_id = d.requester_id
               AND w.supervisor_id = d.recorded_by
               AND w.supervisor_attachment_id = d.supervisor_attachment_id
-              AND w.generation = d.work_generation
+              -- Task revision advances the Work without rewriting historical
+              -- decisions, whose exact Attempt and Review remain below.
+              AND w.generation >= d.work_generation
               AND attachment.principal_id = d.recorded_by
               -- The attachment row holds only the *current* conversation
               -- epoch.  A durable requester decision seals its own earlier
@@ -4269,7 +4452,7 @@ def _user_needed_boundary_candidates_sql() -> str:
              AND boundary.goal_version = attempt.goal_version
              AND boundary.goal_packet_digest = attempt.goal_packet_digest
              AND boundary.task_packet_digest = attempt.task_packet_digest
-             AND boundary.source_principal_id = attempt.worker_id
+             AND boundary.source_principal_id IN (attempt.worker_id, work.supervisor_id)
             JOIN boundary_dispositions AS disposition
               ON disposition.boundary_id = boundary.id
              AND disposition.kind = 'wait_user'
@@ -4341,7 +4524,7 @@ def _validate_and_backfill_user_needed_boundaries(
               OR attempt.goal_version <> boundary.goal_version
               OR attempt.goal_packet_digest <> boundary.goal_packet_digest
               OR attempt.task_packet_digest <> boundary.task_packet_digest
-              OR boundary.source_principal_id <> attempt.worker_id
+              OR boundary.source_principal_id NOT IN (attempt.worker_id, work.supervisor_id)
               OR disposition.boundary_id IS NULL
               OR disposition.kind <> 'wait_user'
               OR disposition.generation <> work.generation
@@ -4414,7 +4597,7 @@ def _validate_and_backfill_user_needed_boundaries(
            OR source_attempt.id IS NULL
            OR source_attempt.work_item_id <> continuation.work_item_id
            OR source_attempt.id <> boundary.attempt_id
-           OR source_attempt.worker_id <> boundary.source_principal_id
+           OR boundary.source_principal_id NOT IN (source_attempt.worker_id, work.supervisor_id)
            OR source_attempt.goal_version <> boundary.goal_version
            OR source_attempt.goal_packet_digest <> boundary.goal_packet_digest
            OR source_attempt.task_packet_digest <> boundary.task_packet_digest
@@ -4549,7 +4732,7 @@ def _install_boundary_continuation_triggers(connection: sqlite3.Connection) -> N
                 AND boundary.work_item_id = NEW.id
                 AND boundary.generation = NEW.generation
                 AND boundary.goal_version = NEW.goal_version
-                AND boundary.source_principal_id = attempt.worker_id
+                AND boundary.source_principal_id IN (attempt.worker_id, NEW.supervisor_id)
                 AND attempt.worker_id = NEW.assigned_worker_id
                 AND attempt.state = 'input_required'
                 AND attempt.goal_version = boundary.goal_version
@@ -4689,7 +4872,7 @@ def _install_boundary_continuation_triggers(connection: sqlite3.Connection) -> N
               AND boundary.goal_version = source_attempt.goal_version
               AND boundary.goal_packet_digest = source_attempt.goal_packet_digest
               AND boundary.task_packet_digest = source_attempt.task_packet_digest
-              AND boundary.source_principal_id = source_attempt.worker_id
+              AND boundary.source_principal_id IN (source_attempt.worker_id, work.supervisor_id)
               AND disposition.generation = NEW.source_generation
               AND disposition.decided_by = NEW.decided_by
               AND turn.supervisor_id = NEW.decided_by
@@ -6016,11 +6199,30 @@ def _pre_dispatch_timeout_recovery_is_proven(
     )
 
 
+def _recovery_attention_matches(row: Mapping[str, Any], *, requester_continuation: bool) -> bool:
+    if (
+        str(row["work_state"]) == "waiting_supervisor"
+        and str(row["attention_owner"]) == "cao"
+        and str(row["attempt_state"]) == "waiting_supervisor"
+    ):
+        return True
+    # Only the caller that verified the exact current WAIT_USER authority may
+    # request continuation. All execution and unknown-effect proofs still apply.
+    return bool(
+        requester_continuation
+        and str(row["work_state"]) == "user_needed"
+        and str(row["attention_owner"]) == "user"
+        and str(row["attempt_state"]) == "input_required"
+        and str(row["user_needed_boundary_id"] or "") == str(row["id"])
+    )
+
+
 def _same_thread_recovery_is_executable(
     connection: sqlite3.Connection,
     row: Mapping[str, Any],
     *,
     reason: str,
+    requester_continuation: bool = False,
 ) -> bool:
     """Apply every no-MCP/no-effect fence before advertising disposition."""
 
@@ -6045,10 +6247,8 @@ def _same_thread_recovery_is_executable(
         or not worker_thread_id
         or worker_thread_generation is None
         or worker_thread_generation < 1
-        or str(row["work_state"]) != "waiting_supervisor"
-        or str(row["attention_owner"]) != "cao"
+        or not _recovery_attention_matches(row, requester_continuation=requester_continuation)
         or int(row["work_generation"]) != int(row["boundary_generation"])
-        or str(row["attempt_state"]) != "waiting_supervisor"
     ):
         return False
     specs = connection.execute(
@@ -6324,6 +6524,7 @@ def _same_thread_reconciliation_is_executable(
     row: Mapping[str, Any],
     *,
     reason: str,
+    requester_continuation: bool = False,
 ) -> bool:
     """Prove an unknown post-MCP Codex Assignment can be reconciled in place.
 
@@ -6352,10 +6553,8 @@ def _same_thread_reconciliation_is_executable(
         or not worker_thread_id
         or worker_thread_generation is None
         or worker_thread_generation < 1
-        or str(row["work_state"]) != "waiting_supervisor"
-        or str(row["attention_owner"]) != "cao"
+        or not _recovery_attention_matches(row, requester_continuation=requester_continuation)
         or int(row["work_generation"]) != int(row["boundary_generation"])
-        or str(row["attempt_state"]) != "waiting_supervisor"
     ):
         return False
 
@@ -7015,6 +7214,10 @@ def _ensure_event_operator_scope_schema(
             "DEFAULT 'unclassified' CHECK(operator_scope IN "
             "('production', 'acceptance-test', 'system', 'unclassified'))"
         )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS events_operator_scope_sequence_idx "
+        "ON events(operator_scope, sequence)"
+    )
     if not column_was_added and existing_schema_version >= 39:
         return
 
@@ -7117,6 +7320,42 @@ def _supersede_boundary_deliveries(
                 boundary_id,
                 now,
             ),
+        )
+
+
+def supersede_terminal_work_boundaries(
+    connection: sqlite3.Connection, *, work_item_id: str | None = None
+) -> None:
+    """Apply existing terminal authority without creating a new CAO judgment."""
+
+    rows = connection.execute(
+        f"""
+        SELECT proof.* FROM ({terminal_disposition_supersessions_sql()}) AS proof
+        LEFT JOIN boundary_supersessions AS existing
+          ON existing.boundary_id = proof.boundary_id
+        WHERE existing.boundary_id IS NULL
+          AND (? IS NULL OR proof.boundary_id IN (
+            SELECT id FROM boundaries WHERE work_item_id = ?
+          ))
+        """,
+        (work_item_id, work_item_id),
+    ).fetchall()
+    for row in rows:
+        connection.execute(
+            """
+            INSERT INTO boundary_supersessions(
+                boundary_id, boundary_event_sequence, superseding_event_sequence,
+                reason, created_at
+            ) VALUES(?, ?, ?, 'work_terminal_disposition', ?)
+            """,
+            (
+                row["boundary_id"], row["boundary_event_sequence"],
+                row["superseding_event_sequence"], utc_now(),
+            ),
+        )
+        _supersede_boundary_deliveries(
+            connection, boundary_id=str(row["boundary_id"]),
+            reason="work_terminal_disposition",
         )
 
 
@@ -8807,6 +9046,10 @@ class Database:
                         43: "provider-owned Worker output receipts and attachment notification lanes",
                         44: "typed supervision pauses, explicit resumption, and scoped durable memory",
                         45: "persistent directory identity and sealed project scope migration",
+                        46: "indexed dashboard activity and event replay reads",
+                        47: "durable Worker business purpose and checked supervision",
+                        48: "requester escalation for exact CAO-owned system boundaries",
+                        49: "durable conversation state-read admission",
                     }
                     if existing < 31:
                         _backfill_managed_worker_threads(connection)
@@ -9522,6 +9765,7 @@ class Database:
                             """,
                             (version, migrations[version], now),
                         )
+                    supersede_terminal_work_boundaries(connection)
                     _backfill_goal_replacement_boundary_supersessions(connection)
                     _backfill_managed_worker_recovery_actions(connection, self.settings)
                     connection.execute(

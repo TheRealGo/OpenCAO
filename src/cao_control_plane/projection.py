@@ -32,7 +32,13 @@ from .close_contract import (
     evaluate_close,
 )
 from .close_inventory_edge import OwnerPrivateCloseInventory
-from .database import Database, work_pause_record_binding_sql, work_pause_resumption_binding_sql
+from .connection_contract import cao_automatic_wake_ready_tx
+from .database import (
+    Database,
+    terminal_disposition_supersessions_sql,
+    work_pause_record_binding_sql,
+    work_pause_resumption_binding_sql,
+)
 from .errors import ConflictError
 from .goal_packets import (
     build_goal_packet,
@@ -41,8 +47,15 @@ from .goal_packets import (
     task_packet_digest,
 )
 from .provider_models import model_identifier
+from .requester_escalation import requester_escalation_tx
 from .security import canonical_json, matches, redact_control_plane_secrets
 from .supervision_control import pause_view_tx
+from .worker_purpose import (
+    purpose_display_text,
+    purpose_row_view,
+    readable_worker_purpose_tx,
+    work_purpose_tx,
+)
 
 _FORMAT = "cao-control-plane-projection/v1"
 _TERMINAL_RUNTIME_STATES = ("stopped", "failed", "missing")
@@ -1263,13 +1276,13 @@ def _work_items_projection(
                      AND message.sender_id = w.assigned_worker_id
                      AND (message.kind IN ('progress', 'question', 'blocker', 'artifact', 'completion_claim')
                           OR (message.kind = 'system' AND json_extract(message.payload_json, '$.action') = 'worker_output'
-                              AND EXISTS (SELECT 1 FROM worker_output_receipts output WHERE output.notification_message_id = message.id)))
+                              AND message.id IN (SELECT notification_message_id FROM worker_output_receipts WHERE notification_message_id IS NOT NULL)))
                    ORDER BY message.sequence DESC
                    LIMIT 1
                ) AS operator_worker_report_payload,
                (
                    SELECT CASE WHEN message.kind = 'system' AND json_extract(message.payload_json, '$.action') = 'worker_output'
-                               AND EXISTS (SELECT 1 FROM worker_output_receipts output WHERE output.notification_message_id = message.id)
+                               AND message.id IN (SELECT notification_message_id FROM worker_output_receipts WHERE notification_message_id IS NOT NULL)
                                THEN 'worker_output' ELSE message.kind END
                    FROM messages message
                    WHERE message.work_item_id = w.id
@@ -1277,7 +1290,7 @@ def _work_items_projection(
                      AND message.sender_id = w.assigned_worker_id
                      AND (message.kind IN ('progress', 'question', 'blocker', 'artifact', 'completion_claim')
                           OR (message.kind = 'system' AND json_extract(message.payload_json, '$.action') = 'worker_output'
-                              AND EXISTS (SELECT 1 FROM worker_output_receipts output WHERE output.notification_message_id = message.id)))
+                              AND message.id IN (SELECT notification_message_id FROM worker_output_receipts WHERE notification_message_id IS NOT NULL)))
                    ORDER BY message.sequence DESC
                    LIMIT 1
                ) AS operator_worker_report_kind,
@@ -1289,7 +1302,7 @@ def _work_items_projection(
                      AND message.sender_id = w.assigned_worker_id
                      AND (message.kind IN ('progress', 'question', 'blocker', 'artifact', 'completion_claim')
                           OR (message.kind = 'system' AND json_extract(message.payload_json, '$.action') = 'worker_output'
-                              AND EXISTS (SELECT 1 FROM worker_output_receipts output WHERE output.notification_message_id = message.id)))
+                              AND message.id IN (SELECT notification_message_id FROM worker_output_receipts WHERE notification_message_id IS NOT NULL)))
                    ORDER BY message.sequence DESC
                    LIMIT 1
                ) AS operator_worker_report_created_at,
@@ -1438,6 +1451,7 @@ def _work_items_projection(
                 "attention_owner": str(row["attention_owner"]),
                 "generation": int(row["generation"]),
                 "supervision_pause": _supervision_pause_projection(connection, row),
+                "requester_escalation": _requester_escalation_projection(connection, row),
                 "operator_scope": str(row["operator_scope"]),
                 "created_at": str(row["work_created_at"]),
                 "updated_at": str(row["work_updated_at"]),
@@ -1453,6 +1467,9 @@ def _work_items_projection(
                 "operator_content": {
                     "work_title": sanitize_operator_text(row["operator_work_title"]),
                     "objective_summary": sanitize_operator_text(row["operator_objective"]),
+                    "purpose_text": _operator_work_purpose_text(
+                        connection, str(row["id"]), int(row["goal_version"])
+                    ),
                     "objective_text": sanitize_operator_text(
                         row["operator_objective"], limit=None, collapse_whitespace=False
                     ),
@@ -1639,6 +1656,18 @@ def _snapshot(
     }
 
 
+def _operator_work_purpose_text(
+    connection: sqlite3.Connection, work_item_id: str, goal_version: int
+) -> str | None:
+    try:
+        purpose = work_purpose_tx(connection, work_item_id, goal_version)
+    except (ConflictError, TypeError, ValueError):
+        return None
+    return sanitize_operator_text(
+        purpose_display_text(purpose), limit=None, collapse_whitespace=False
+    )
+
+
 def _operator_workers_projection(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     """Project every Worker as a first-class, scope-bearing inventory row.
 
@@ -1656,6 +1685,7 @@ def _operator_workers_projection(connection: sqlite3.Connection) -> list[dict[st
                principal.operator_scope,
                principal.operator_label,
                spec.id AS managed_spec_id,
+               worker_thread.id AS worker_thread_id,
                spec.state AS managed_spec_state,
                spec.adapter AS managed_spec_adapter,
                spec.requested_model AS managed_spec_requested_model,
@@ -1721,12 +1751,24 @@ def _operator_workers_projection(connection: sqlite3.Connection) -> list[dict[st
     ).fetchall()
     workers: list[dict[str, Any]] = []
     for row in rows:
+        purpose, purpose_status = readable_worker_purpose_tx(
+            connection, str(row["worker_thread_id"] or "")
+        )
+        if purpose is not None:
+            purpose = {
+                **purpose,
+                "text": sanitize_operator_text(
+                    purpose["text"], limit=None, collapse_whitespace=False
+                ),
+            }
         scope = str(row["operator_scope"] or "unclassified")
         raw_label = sanitize_operator_text(row["operator_label"])
         label = raw_label if raw_label else None
         workers.append(
             {
                 "principal_id": str(row["principal_id"]),
+                "worker_purpose": purpose,
+                "purpose_status": purpose_status,
                 "operator_scope": scope,
                 "operator_label": label,
                 "principal_enabled": bool(row["principal_enabled"]),
@@ -2106,6 +2148,11 @@ def _operator_cao_supervision_projection(
             "cao_supervision_updated_at": _operator_timestamp(boundaries[0]["created_at"]),
         }
     boundary = boundaries[0]
+    if not cao_automatic_wake_ready_tx(connection, boundary["supervisor_attachment_id"]):
+        return {
+            "cao_supervision_state": "connection_required",
+            "cao_supervision_updated_at": _operator_timestamp(boundary["created_at"]),
+        }
     active_turn = connection.execute(
         """
         SELECT updated_at FROM reasoner_turns
@@ -2456,6 +2503,20 @@ def _watermark(connection: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _requester_escalation_projection(
+    connection: sqlite3.Connection, work: sqlite3.Row
+) -> dict[str, Any] | None:
+    escalation = requester_escalation_tx(connection, work)
+    if escalation is None:
+        return None
+    return {
+        field: sanitize_operator_text(escalation[field])
+        for field in (
+            "reason", "decision", "resume_condition", "requested_at", "notification_state"
+        )
+    }
+
+
 def _supervision_pause_projection(
     connection: sqlite3.Connection, work: sqlite3.Row
 ) -> dict[str, Any] | None:
@@ -2541,6 +2602,17 @@ def _violations(
     close_receipt_violations: tuple[ProjectionViolation, ...],
 ) -> list[ProjectionViolation]:
     violations: list[ProjectionViolation] = []
+    for purpose_row in connection.execute("SELECT * FROM worker_purpose_revisions"):
+        try:
+            purpose_row_view(purpose_row)
+        except (ValueError, TypeError, ConflictError):
+            violations.append(
+                ProjectionViolation(
+                    "worker.purpose_invalid",
+                    "worker_thread",
+                    (str(purpose_row["worker_thread_id"]),),
+                )
+            )
     integrity = [str(row[0]) for row in connection.execute("PRAGMA integrity_check")]
     if integrity != ["ok"]:
         violations.append(
@@ -2725,10 +2797,17 @@ def _violations(
         connection,
         "boundary.supersession_invalid",
         "boundary",
-        """
+        f"""
         SELECT supersession.boundary_id AS id
         FROM boundary_supersessions AS supersession
         WHERE NOT (
+          EXISTS (
+            SELECT 1 FROM ({terminal_disposition_supersessions_sql()}) AS proof
+            WHERE proof.boundary_id = supersession.boundary_id
+              AND proof.boundary_event_sequence = supersession.boundary_event_sequence
+              AND proof.superseding_event_sequence = supersession.superseding_event_sequence
+              AND supersession.reason = 'work_terminal_disposition'
+          ) OR
           EXISTS (
             SELECT 1
             FROM boundaries AS boundary
@@ -3053,9 +3132,10 @@ def _close_lifecycle_violations(
 ) -> None:
     """Verify the attachment-scoped decision/receipt chain independently.
 
-    These checks intentionally duplicate the durable trigger predicates.  The
-    projection must still fail closed for an imported database, a historic
-    writer that lacked the trigger, or corruption discovered after commit.
+    Admission requires the current generation; historical decisions retain
+    their original generation after correction or task revision. Their sealed
+    Attempt/Review bindings must remain exact, and future generations remain
+    invalid. Current completion acceptance is checked separately above.
     """
 
     _add_rows(
@@ -3079,7 +3159,7 @@ def _close_lifecycle_violations(
               AND w.requester_id = d.requester_id
               AND w.supervisor_id = d.recorded_by
               AND w.supervisor_attachment_id = d.supervisor_attachment_id
-              AND w.generation = d.work_generation
+              AND w.generation >= d.work_generation
               AND attachment.principal_id = d.recorded_by
               AND attachment.generation >= d.supervisor_attachment_generation
               AND r.reviewer_role = 'cao'
@@ -3325,9 +3405,10 @@ def _packet_violations(
                     ),
                     dependencies=dependencies or [],
                     managed_task_policy=managed_task_policy,
+                    worker_purpose=work_purpose_tx(connection, identity[0], identity[1]),
                 )
                 computed = goal_packet_digest(expected_packet)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, ConflictError):
                 expected_packet = {}
                 computed = ""
             invalid = (

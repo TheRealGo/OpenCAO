@@ -1086,8 +1086,10 @@ def test_fresh_real_app_server_model_turns_keep_full_cao_catalog_after_start(
     assert repeated_content["attachment"] == attached_content["attachment"]
     listed_content = listed.get("structuredContent")
     assert isinstance(listed_content, dict)
-    assert set(listed_content) == {"workers"}
-    assert listed_content.get("workers") == []
+    # The model already listed this resource. Readiness probes keep attachment
+    # verified, but they do not grant another untriggered model state read.
+    assert listed_content["error"]["details"]["reason_code"] == "cao_state_polling_prohibited"
+    assert listed_content["error"]["details"]["retryable"] is False
     assert "cao_list_managed_workers" in initial_catalog_tools
     assert "cao_delete_worker_thread" in initial_catalog_tools
     assert set(catalog_tools) == set(initial_catalog_tools)
@@ -1124,6 +1126,7 @@ def test_fresh_real_app_server_model_turns_keep_full_cao_catalog_after_start(
         "call-worker-list",
         "call-worker-delete",
     } <= observed_outputs
+    assert '"workers"' in _function_call_output(model_requests[3], "call-worker-list")
     assert "Worker thread is not available in this CAO conversation" in (
         _function_call_output(model_requests[5], "call-worker-delete")
     )

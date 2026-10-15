@@ -30,6 +30,18 @@ CURRENT_CAO_CATALOG_DIGEST = catalog_digest(conversation_proxy_tools())
 CURRENT_CAO_PROXY_ABI_VERSION = CAO_CONVERSATION_PROXY_ABI_VERSION
 
 
+def business_purpose_contract() -> dict[str, Any]:
+    return {
+        "outcome": "Keep service outcomes reliable as requirements evolve.",
+        "scope": "The responsibilities explicitly assigned to this Worker.",
+        "criteria": [{"id": "reliability", "condition": "The assigned outcome is supported by verified evidence.",
+                      "evidence": "A reproducible result and its source conditions."}],
+        "completion": "Complete each bounded checkpoint when its fixed conditions are verified; continuing responsibility remains.",
+        "authority": "Operate only within the assigned scope; no unrequested external effects.",
+        "unmet_action": "Continue the unmet conditions or escalate a concrete blocker to CAO.",
+    }
+
+
 def current_cao_session_attachment(**values: Any) -> CAOSessionAttachment:
     """Build a test attachment that presents the proxy contract it loaded."""
 
@@ -167,3 +179,16 @@ def system(settings: Settings) -> dict[str, Any]:
         "worker_principal_token": created["token"],
         "runtime": runtime,
     }
+
+
+@pytest.fixture
+def legacy_progress_wakes(system, monkeypatch):
+    """Retain replay/coalescing coverage for rows created before progress became history-only."""
+    original = system["service"]._message
+
+    def old_message(connection, **kwargs):
+        if kwargs.get("kind") == "progress":
+            kwargs["create_delivery"] = True
+        return original(connection, **kwargs)
+
+    monkeypatch.setattr(system["service"], "_message", old_message)

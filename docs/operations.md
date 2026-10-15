@@ -16,6 +16,12 @@ Default directory: `~/.local/state/cao-a2a` (`0700`). Database, WAL, shared-memo
 
 ## Health, readiness, and diagnosis
 
+Readiness verifies historical requester decisions against their original sealed
+Attempt and Review, allowing an older Work generation after correction or task
+revision. A historical rejection does not become invalid when the Work advances.
+New decision admission and current completion acceptance still require the current
+Work generation; historical decisions cannot accept a later task.
+
 These surfaces answer different questions and are not substitutes:
 
 | Surface | Authentication | Meaning |
@@ -132,8 +138,14 @@ after ownership ended and a fresh successful Dispatcher cycle indicates a
 stale or unhealthy Dispatcher and must not be repaired by retrying the unknown
 Delivery.
 
-Before claiming CAO wakes, the Dispatcher also coalesces an unclaimed queued
-`progress` wake when the same Work and Attempt already has a later question,
+Routine Worker progress and captured output are retained without creating a
+CAO Delivery. A report answering an exact pending status request still wakes
+CAO once; later unsolicited progress returns to history-only. Questions, blockers,
+completion claims and settled provider turns
+without a report still create an actionable Boundary. Before claiming CAO wakes,
+the Dispatcher also coalesces an older unclaimed queued informational wake
+(structured `progress` or automatic output availability)
+when the same sealed task, Work and Attempt already has a later question,
 blocker, completion, or recovery Boundary on the same attachment. Only the
 wake Delivery becomes terminal history with
 `cao_progress_wake_superseded_by_boundary`; the original progress Message,
@@ -141,17 +153,69 @@ Event, Attempt, and all Worker evidence remain immutable. This prevents a
 stale progress turn from delaying the actionable Boundary without turning
 silence or elapsed time into lifecycle evidence.
 
+Accepted native notifications have a separate execution lifetime. A CAO may
+read and settle a Delivery during an already active conversation turn while
+its wake still waits in Codex's persistent queue. The Dispatcher reconciles
+that queue on relevant committed state changes and on its bounded recovery
+scan, including after restart. Existing successful queue-admission evidence,
+the exact attachment, logical Delivery identity, current generation and
+unchanged notification input must all match before it uses the official
+`thread/queue/delete` operation on that exact queued submission.
+
+Handled and terminal-dead Deliveries retain all their recorded state; only
+their obsolete native wake is removed. An accepted informational wake may be
+superseded only after the provider confirms deletion and a later Boundary
+notification for the same sealed task still exists. Worker output receipts,
+message payloads, purpose, Review and disposition records remain intact; queue
+cleanup never manufactures a read, ACK, handled receipt or acceptance. Current
+unread output, actionable boundaries, unknown dispatches, other attachments,
+user input and edited queued notifications are outside this operation.
+
+If queue consumption wins the race, `deleted=false` preserves the active turn
+and its Delivery. Each removal intent is recorded before the provider call,
+and its exact response is recorded separately. A failed or missing deletion
+response leaves a durable unresolved outcome, exposed as
+`cao_notification_queue_unknown_outcomes`, including after a process restart;
+the next scan reads the queue again before considering any effect. Queue
+absence alone is never proof of consumption or CAO completion. Cleanup failure
+is reported separately as `cao_notification_queue_error` with bounded
+`cao_notification_queue_failure_counts` for timeout, authorization, missing
+runtime/adapter, provider operation and reconciliation failures. Raw exception
+text and private locators are never returned. A later scan with no obsolete
+notifications clears the transient diagnostic; durable unknown removal evidence
+remains intact. Cleanup failure does not block ordinary Worker delivery,
+attachment, or lifecycle authority.
+
 `cao-a2a effect run` computes the exact argv and working-directory digests,
 reserves authority, executes without a shell, and records only an exit code and
 output digest. `cao-a2a effect recover` marks reservations left `started` by a
 prior process as `unknown`; matching effects remain blocked until verified.
 
-An expired CAO ReasonerTurn is recovered by a bounded deadline scan. The old
-turn becomes immutable `abandoned` and its incomplete delivery is superseded
-with evidence. At most one recovery Message per open Boundary may re-arm the
-CAO; a later interruption exhausts that shared recovery budget and waits for
-an actual state change. This scan never infers completion or sends routine
-status probes.
+An expired CAO ReasonerTurn or proven incomplete provider turn admits one
+repair wake for its exact Boundary. Both paths share the same durable recovery
+identity; switching between them cannot restart the repair loop. If that repair
+also ends without a decision, the system records a `wait_user` disposition and
+queues requester consultation in the same transaction. Its completed synthetic
+turn has explicit `system_supervision_recovery` provenance: it is neither an
+LLM judgment nor purpose verification. Work, purpose, unknown effects and the
+same-Work continuation remain intact. No periodic scan can convert this into
+another identical reasoning wake, task success, or unowned failure.
+
+An authenticated Continue/Correct disposition denied by unsettled execution
+likewise returns an actual `wait_user` result. No Worker command is sent. The
+original request digest makes retries return that same consultation outcome.
+Callers must inspect the returned kind instead of treating any successful API
+response as execution of their requested operation. Stale authority, invalid
+leases and malformed requests remain errors with no escalation side effect.
+
+Requester communication has its own recovery: one proven incomplete notice
+may be reissued, but interruption of its replacement records
+`requester_communication_unavailable` with a terminal failed Delivery. The
+consultation remains visibly unresolved in Work, inbox and Dashboard; it never
+replays Worker work or recursively invokes the model. A subsequent explicit
+requester response can continue the same Work. Transport failures retain their
+existing exact-connection recovery path. This is escalation of an unmet duty,
+not an automatic stop or acceptance condition for the entrusted purpose.
 
 ## Canonical authority
 

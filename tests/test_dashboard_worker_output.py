@@ -56,8 +56,8 @@ def test_dashboard_projects_automatic_output_metadata_without_any_model_report(
         "SELECT payload_json, created_at FROM messages WHERE id = ?",
         (latest["notification_message_id"],),
     )
-    assert notification is not None
-    expected_summary = json.loads(notification["payload_json"])["summary"]
+    assert (notification is not None) is settled
+    expected_summary = json.loads(notification["payload_json"])["summary"] if notification else None
 
     projection = build_projection(service.db).snapshot
     operator = build_operator_view(projection)
@@ -65,9 +65,9 @@ def test_dashboard_projects_automatic_output_metadata_without_any_model_report(
     edge = _edge_snapshot(dashboard)
     for view in (operator, dashboard["operator"], edge["operator"]):
         item = view["work_items"][0]
-        assert item["latest_report_kind"] == "worker_output"
+        assert item["latest_report_kind"] == ("worker_output" if settled else None)
         assert item["latest_report_summary"] == expected_summary
-        assert item["latest_reported_at"] == notification["created_at"]
+        assert item["latest_reported_at"] == (notification["created_at"] if notification else None)
         assert item["pending_supervisor_boundary"] is settled
         assert item["state"] == ("waiting_supervisor" if settled else "active")
         assert item["progress_stage"] is None

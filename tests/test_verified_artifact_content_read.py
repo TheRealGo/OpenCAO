@@ -680,6 +680,7 @@ def test_artifact_read_rejects_unverified_binary_oversize_and_invalid_chunk(
         media_type="text/plain",
         key="unverified",
         report_kind=ReportKind.ARTIFACT,
+        source_uri="https://example.invalid/unverified-result",
     )
     with pytest.raises(ConflictError) as unverified_error:
         system["service"].read_artifact_content(
@@ -734,7 +735,10 @@ def test_artifact_read_rejects_unverified_binary_oversize_and_invalid_chunk(
             actor,
             ArtifactContentReadInput.model_validate(_read_arguments(oversized_work, oversized)),
         )
-    assert oversized_error.value.details == {"reason_code": "artifact_content_too_large"}
+    assert oversized_error.value.details == {
+        "reason_code": "artifact_content_too_large", "max_artifact_bytes": 1_048_576,
+        "next_action": "request_bounded_utf8_evidence",
+    }
 
     with pytest.raises(PydanticValidationError):
         ArtifactContentReadInput.model_validate(

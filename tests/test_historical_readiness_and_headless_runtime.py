@@ -14,6 +14,7 @@ from cao_control_plane.models import (
     BoundaryDispositionInput,
     BoundaryDispositionKind,
     CompletionContract,
+    GoalRevision,
     ReportInput,
     RequesterDecisionInput,
     ReviewInput,
@@ -183,8 +184,10 @@ def test_v26_migration_keeps_unproven_boundary_history_fail_closed(
     )
 
 
+@pytest.mark.parametrize("decision_verdict", ["accepted", "rejected"])
 def test_new_attachment_connection_preserves_historical_requester_acceptance_projection(
     system: dict[str, Any],
+    decision_verdict: str,
 ) -> None:
     service = system["service"]
     attachment_request = current_cao_session_attachment(
@@ -251,14 +254,40 @@ def test_new_attachment_connection_preserves_historical_requester_acceptance_pro
         conversation,
         RequesterDecisionInput(
             review_id=reviewed["reviews"][-1]["id"],
-            verdict="accepted",
-            summary="The requester accepted the reviewed result.",
+            verdict=decision_verdict,
+            summary=f"The requester {decision_verdict} the reviewed result.",
             evidence=[],
             conversation_evidence_id="historical-requester-acceptance",
             idempotency_key="decision:historical-requester-acceptance",
         ),
     )
     decision = completed["requester_decisions"][-1]
+    if decision_verdict == "rejected":
+        decision_before = dict(
+            service.db.fetchone("SELECT * FROM requester_decisions WHERE id = ?", (decision["id"],))
+        )
+        revised = service.revise_goal(
+            conversation,
+            work["id"],
+            GoalRevision(
+                expected_version=1,
+                maturity="defined",
+                objective="Deliver the corrected result while retaining requester history.",
+                acceptance=["Historical rejection is valid for its original sealed packet."],
+                reason="The requester rejected the earlier result.",
+                idempotency_key="revise:historical-requester-rejection",
+            ),
+        )
+        assert revised["goal_version"] == 2
+        assert revised["generation"] > decision["work_generation"]
+        assert (
+            dict(
+                service.db.fetchone(
+                    "SELECT * FROM requester_decisions WHERE id = ?", (decision["id"],)
+                )
+            )
+            == decision_before
+        )
     service.db.execute(
         "UPDATE runtime_sessions SET state = 'missing' WHERE id = ?",
         (attachment["runtime_session_id"],),
@@ -332,10 +361,25 @@ def test_new_attachment_connection_preserves_historical_requester_acceptance_pro
     )
     projection = verify_projection(service.db)
     assert projection.healthy is True
+    assert verify_projection(Database(system["settings"])).healthy is True
     assert {
         "requester_decision.binding_invalid",
         "work.completed_without_requester_acceptance",
     }.isdisjoint(violation.code for violation in projection.violations)
+    if decision_verdict == "rejected":
+        # History cannot accept a later task, and a decision from a future
+        # generation must still fail the imported-data integrity check.
+        service.db.execute("UPDATE work_items SET state = 'completed' WHERE id = ?", (work["id"],))
+        assert "work.completed_without_requester_acceptance" in {
+            violation.code for violation in verify_projection(service.db).violations
+        }
+        service.db.execute(
+            "UPDATE work_items SET generation = ? WHERE id = ?",
+            (decision["work_generation"] - 1, work["id"]),
+        )
+        assert "requester_decision.binding_invalid" in {
+            violation.code for violation in verify_projection(service.db).violations
+        }
 
 
 def test_completion_correction_relaunches_waiting_logical_runtime_with_fresh_epoch(

@@ -31,6 +31,7 @@ from .artifact_preservation_edge import (
     OwnerPrivateArtifactPreservation,
 )
 from .attachment_issuer import AttachmentCatalogRefreshRequired
+from .canonical import canonical_sha256
 from .close_contract import (
     ArtifactPreservation,
     CleanupAction,
@@ -48,7 +49,11 @@ from .config import (
     ManagedWorkerReasoningEffort,
     Settings,
 )
-from .connection_contract import CAO_CONVERSATION_PROXY_ABI_VERSION
+from .connection_contract import (
+    CAO_CONVERSATION_PROXY_ABI_VERSION,
+    cao_automatic_wake_ready_sql,
+    cao_automatic_wake_ready_tx,
+)
 from .database import (
     Database,
     _backfill_managed_worker_recovery_actions,
@@ -56,11 +61,14 @@ from .database import (
     _safe_json_document_sql,
     _same_thread_reconciliation_is_executable,
     _same_thread_recovery_is_executable,
+    supersede_terminal_work_boundaries,
     utc_after,
     utc_now,
 )
 from .delivery_lane import (
+    cao_informational_wake_sql,
     cao_notification_inbox_visible_sql,
+    cao_superseding_boundary_sql,
     codex_delivery_client_id,
     runtime_delivery_lane_head_sql,
 )
@@ -129,6 +137,7 @@ from .models import (
     RuntimeHeartbeat,
     RuntimeRegistration,
     RuntimeState,
+    SetWorkerPurposeInput,
     StatusRequestInput,
     SubmittedIntent,
     Trajectory,
@@ -148,6 +157,7 @@ from .private_policy import (
     PrivatePolicyError,
     ensure_default_dynamic_workspace_policy,
 )
+from .requester_escalation import requester_escalation_delivery_tx, requester_escalation_tx
 from .runtime_enrollment import (
     EnrollmentCapabilityError,
     ProcessIdentity,
@@ -175,12 +185,25 @@ from .supervision_control import (
 from .worker_output import (
     WorkerOutputEvent,
     begin_capture,
+    current_output_views_tx,
     finalize_capture_tx,
     observe_output,
     output_view,
     read_output,
     reconcile_abandoned_captures,
     require_reviewable_output_tx,
+)
+from .worker_purpose import (
+    PURPOSE_GUIDANCE,
+    bind_work_purpose_tx,
+    confirm_work_purpose_tx,
+    confirm_worker_purpose_tx,
+    purpose_alignment,
+    purpose_packet,
+    readable_worker_purpose_tx,
+    task_review_criteria,
+    work_purpose_tx,
+    worker_purpose_tx,
 )
 
 
@@ -233,6 +256,7 @@ class _ManagedWorkerCommandAdmission:
     enrollment_id: str
     route: Literal["current", "advanced"]
     attempt_mode: Literal["reuse_current", "new_attempt"]
+    queue_only: bool = False
 
 
 def _is_sha256_digest(value: str) -> bool:
@@ -512,7 +536,9 @@ _TASK_PRIVATE_LOCATOR = re.compile(
     r"%(?:USERPROFILE|HOMEPATH)%)[/\\][^\s,;]+)",
     re.IGNORECASE,
 )
-_TASK_POSIX_PRIVATE_LOCATOR = re.compile(r"(?:~(?:[A-Za-z0-9._-]+)?/|/+)[^\s,;\"')>\]}]+")
+_TASK_POSIX_PRIVATE_LOCATOR = re.compile(
+    r"(?:~(?:[A-Za-z0-9._-]+)?/|/+)[^\s,;\"')>\]}、。・「」『』]+"
+)
 _TASK_HTTP_URL = re.compile(r"\bhttps?://[^\s<>\"']+", re.IGNORECASE)
 _TASK_HTTP_ROUTE = re.compile(
     r"\b(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT|TRACE)\s+"
@@ -702,7 +728,29 @@ def _contains_private_locator(value: Any) -> bool:
                     or category[:1] in {"L", "M", "N", "S"}
                 ):
                     continue
-            if _TASK_POSIX_PRIVATE_LOCATOR.match(without_public_urls, index) is not None:
+            locator = _TASK_POSIX_PRIVATE_LOCATOR.match(without_public_urls, index)
+            if locator is None:
+                continue
+            candidate = locator.group(0)
+            if index > 0 and character == "/" and "/" not in candidate[1:]:
+                # Percentages and prose enumerations are inline separators, not
+                # absolute locators. Explicit/quoted paths and multi-component
+                # paths retain the same rejection boundary.
+                previous = without_public_urls[index - 1]
+                percentage = (
+                    previous == "%" and index > 1 and without_public_urls[index - 2].isdigit()
+                    and (candidate[1:2].isdigit() or re.fullmatch(
+                        r"/[A-Za-z][A-Za-z0-9_]*=(?:true|false|[0-9]+)", candidate
+                    ))
+                )
+                enumeration = (
+                    previous in ")]}」』" and candidate[1:2]
+                    and ord(candidate[1]) > 127 and candidate[1].isalpha()
+                    and "." not in candidate
+                )
+                if percentage or enumeration:
+                    continue
+            if locator is not None:
                 return True
         return False
     if isinstance(value, Mapping):
@@ -1282,6 +1330,7 @@ class ControlPlane:
                     "created_at": str(row["principal_created_at"]),
                     "updated_at": str(row["principal_updated_at"]),
                     "_cao_conversation_credential_id": str(row["id"]),
+                    "_cao_readiness_proof_key": hashlib.sha256(token.encode()).hexdigest(),
                     "_cao_attachment_id": str(row["attachment_id"]),
                     "_cao_attachment_generation": int(row["attachment_generation"]),
                     "_cao_connection_id": str(row["connection_id"]),
@@ -3212,6 +3261,7 @@ class ControlPlane:
         thread_id: str,
         principal_id: str,
         normalize_actor_id: str | None = None,
+        work_item_id: str | None = None,
     ) -> str:
         """Return the first durable blocker to one new logical instruction."""
 
@@ -3234,12 +3284,13 @@ class ControlPlane:
                 "ON supersession.boundary_id = boundary.id "
                 "WHERE work.managed_worker_thread_id = ? "
                 "AND work.assigned_worker_id = ? "
+                "AND (? IS NULL OR work.id = ?) "
                 "AND boundary.recovery_action IN ("
                 "'dispose_continue_or_correct', 'reconcile_continue_same_thread', "
                 "'system_reconciliation') "
                 "AND disposition.id IS NULL "
                 "AND supersession.boundary_id IS NULL LIMIT 1",
-                (thread_id, principal_id),
+                (thread_id, principal_id, work_item_id, work_item_id),
             ),
             (
                 "runtime_busy",
@@ -3266,6 +3317,19 @@ class ControlPlane:
                 "JOIN messages AS message ON message.id = delivery.message_id "
                 "LEFT JOIN attempts AS attempt ON attempt.id = message.attempt_id "
                 "WHERE delivery.recipient_id = ? "
+                # Retired transport evidence belongs to its original Work. It
+                # is not replayed, settled, or allowed to veto a distinct Work.
+                # Current routes and unbound evidence still fence the lane.
+                "AND (? IS NULL OR message.work_item_id = ? OR NOT EXISTS ("
+                "SELECT 1 FROM managed_worker_thread_epochs AS old_epoch "
+                "WHERE old_epoch.thread_id = ? "
+                "AND old_epoch.runtime_session_id = delivery.runtime_session_id "
+                "AND old_epoch.retired_at IS NOT NULL "
+                "AND attempt.state IN ('completed', 'canceled', 'failed') "
+                "AND NOT EXISTS (SELECT 1 FROM managed_worker_thread_epochs AS live_epoch "
+                "WHERE live_epoch.thread_id = old_epoch.thread_id "
+                "AND live_epoch.runtime_session_id = old_epoch.runtime_session_id "
+                "AND live_epoch.retired_at IS NULL))) "
                 "AND (delivery.state = 'dispatched' "
                 "OR (delivery.state IN ('queued', 'leased') AND NOT ("
                 "COALESCE(attempt.state, '') IN ('completed', 'canceled', 'failed') AND ("
@@ -3274,7 +3338,7 @@ class ControlPlane:
                 "COALESCE(delivery.lease_until, '') <= ?))))) "
                 "OR (delivery.state IN ('delivered', 'acknowledged') "
                 "AND attempt.state IN ('assigned', 'accepted', 'working'))) LIMIT 1",
-                (principal_id, utc_now()),
+                (principal_id, work_item_id, work_item_id, thread_id, utc_now()),
             ),
             (
                 "effect_outcome_unsettled",
@@ -3361,6 +3425,7 @@ class ControlPlane:
             connection,
             thread_id=thread_id,
             principal_id=str(work["assigned_worker_id"]),
+            work_item_id=str(work["id"]),
         )
         if blocker:
             raise ConflictError(
@@ -3369,6 +3434,34 @@ class ControlPlane:
                 blocker_kind=blocker,
                 retryable=False,
             )
+
+    @staticmethod
+    def _task_is_unclaimed_queued_tx(
+        connection: sqlite3.Connection, work: sqlite3.Row, attempt: sqlite3.Row,
+    ) -> bool:
+        """Prove a task revision records only a never-claimed Assignment."""
+        if work["state"] != "active" or attempt["state"] != "assigned":
+            return False
+        deliveries = connection.execute(
+            "SELECT delivery.*, message.kind AS message_kind FROM message_deliveries AS delivery JOIN messages AS message "
+            "ON message.id = delivery.message_id WHERE message.attempt_id = ? "
+            "AND delivery.recipient_id = ?",
+            (attempt["id"], attempt["worker_id"]),
+        ).fetchall()
+        if (sum(row["message_kind"] == "assignment" for row in deliveries) != 1
+            or any(row["state"] != "queued" or row["owner_token"] or row["attempts"] != 0 for row in deliveries)):
+            return False
+        if connection.execute(
+            "SELECT 1 FROM runtime_enrollment_tickets WHERE attempt_id = ? AND state IN ('pending', 'consumed') "
+            "UNION ALL SELECT 1 FROM worker_output_receipts WHERE attempt_id = ? "
+            "UNION ALL SELECT 1 FROM artifacts WHERE attempt_id = ? LIMIT 1",
+            (attempt["id"], attempt["id"], attempt["id"]),
+        ).fetchone() is not None:
+            return False
+        return connection.execute(
+            "SELECT 1 FROM effect_operations WHERE cleanup_work_item_id = ? AND status IN ('started', 'unknown') LIMIT 1",
+            (work["id"],),
+        ).fetchone() is None
 
     def _admit_managed_worker_command_tx(
         self,
@@ -3532,12 +3625,36 @@ class ControlPlane:
                 retryable=False,
             )
 
+        if kind == "create_work" and self._worker_has_execution_owned_attempt_tx(
+            connection, principal_id=worker_id
+        ):
+            # Recording later Work cannot rotate the route of an Assignment
+            # that is starting or executing, including before MCP enrollment.
+            return _ManagedWorkerCommandAdmission(
+                worker_thread_id=selected_thread_id, thread_generation=thread_generation,
+                connection_generation=int(row["connection_generation"]),
+                runtime_session_id=str(row["epoch_runtime_session_id"]),
+                enrollment_id=str(row["epoch_enrollment_id"]), route="current",
+                attempt_mode="new_attempt",
+            )
+        if (kind == "replace_goal" and work is not None and previous_attempt is not None
+            and same_worker_as_work
+            and str(previous_attempt["runtime_session_id"] or "") == str(row["epoch_runtime_session_id"])
+            and self._task_is_unclaimed_queued_tx(connection, work, previous_attempt)):
+            return _ManagedWorkerCommandAdmission(
+                worker_thread_id=selected_thread_id, thread_generation=thread_generation,
+                connection_generation=int(row["connection_generation"]),
+                runtime_session_id=str(row["epoch_runtime_session_id"]),
+                enrollment_id=str(row["epoch_enrollment_id"]), route="current",
+                attempt_mode="new_attempt", queue_only=True,
+            )
         blocker = (
             self._worker_thread_instruction_blocker_tx(
                 connection,
                 thread_id=selected_thread_id,
                 principal_id=worker_id,
                 normalize_actor_id=actor_id,
+                work_item_id=str(work["id"]) if work is not None else None,
             )
             if kind != "create_work"
             else ""
@@ -3625,6 +3742,9 @@ class ControlPlane:
         ).fetchone()
         if thread is not None:
             value["worker_thread_id"] = str(thread["id"])
+            value["worker_purpose"], value["purpose_status"] = readable_worker_purpose_tx(
+                connection, str(thread["id"])
+            )
             value["thread_state"] = str(thread["state"])
             value["thread_generation"] = int(thread["generation"])
             value["connection_generation"] = int(thread["connection_generation"] or 0)
@@ -4008,6 +4128,121 @@ class ControlPlane:
         )
         return refreshed
 
+    def set_worker_purpose(
+        self, actor: dict[str, Any], request: SetWorkerPurposeInput
+    ) -> dict[str, Any]:
+        """Revise business direction without replacing a task or Worker lifecycle."""
+        attachment_id, attachment_generation = self._worker_thread_command_attachment(
+            actor, operation="purpose definition"
+        )
+        _require_worker_safe_task_payload({
+            "purpose": request.purpose, "reason": request.reason,
+            "contract": request.contract.model_dump(mode="json"),
+        })
+        request_digest = _digest(request.model_dump(mode="json"))
+        with self.db.transaction() as connection:
+            self._require_current_cao_attachment_actor_tx(
+                connection, actor, allow_runtime_credential=False
+            )
+            thread = self._managed_worker_thread_tx(
+                connection,
+                actor=actor,
+                attachment_id=attachment_id,
+                attachment_generation=attachment_generation,
+                worker_thread_id=request.worker_thread_id,
+            )
+            cached = self._idempotent_get_tx(
+                connection,
+                str(actor["id"]),
+                "set_worker_purpose",
+                request.idempotency_key,
+                request_digest,
+            )
+            if cached is not None:
+                return cached
+            self._require_worker_thread_generation(thread, request.expected_generation)
+            previous = worker_purpose_tx(connection, request.worker_thread_id)
+            version = int(previous["version"]) if previous else 0
+            if version != request.expected_purpose_version:
+                raise ConflictError(
+                    "Read the current Worker purpose before revising its business direction",
+                    reason_code="worker_purpose_version_conflict",
+                    current_purpose_version=version,
+                )
+            packet = purpose_packet(
+                worker_thread_id=request.worker_thread_id,
+                version=version + 1,
+                purpose=request.purpose,
+                actor_id=str(actor["id"]),
+                attachment_id=attachment_id,
+                project_digest=str(actor["_cao_project_digest"]),
+                reason=request.reason,
+                contract=request.contract.model_dump(mode="json"),
+            )
+            digest = canonical_sha256(packet)
+            connection.execute(
+                """INSERT INTO worker_purpose_revisions (
+                    worker_thread_id, version, purpose, created_by,
+                    supervisor_attachment_id, project_digest, reason,
+                    packet_json, packet_digest, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    request.worker_thread_id,
+                    version + 1,
+                    request.purpose,
+                    actor["id"],
+                    attachment_id,
+                    actor["_cao_project_digest"],
+                    request.reason,
+                    _json(packet),
+                    digest,
+                    utc_now(),
+                ),
+            )
+            self._event(
+                connection,
+                "worker.purpose_defined",
+                "worker_thread",
+                request.worker_thread_id,
+                str(actor["id"]),
+                {"purpose_version": version + 1, "purpose_digest": digest},
+                operator_scope=str(thread["operator_scope"]),
+            )
+            result = {
+                "worker_thread_id": request.worker_thread_id,
+                "worker_purpose": worker_purpose_tx(connection, request.worker_thread_id),
+                "supervision_guidance": PURPOSE_GUIDANCE,
+            }
+            self._idempotent_put(
+                connection,
+                str(actor["id"]),
+                "set_worker_purpose",
+                request.idempotency_key,
+                request_digest,
+                result,
+            )
+            return result
+
+    def _confirm_work_purpose_tx(
+        self,
+        connection: sqlite3.Connection,
+        actor_id: str,
+        work: sqlite3.Row,
+        expected_version: int | None,
+        decision: str,
+    ) -> None:
+        purpose = confirm_work_purpose_tx(connection, work, expected_version)
+        if purpose is not None:
+            self._event(
+                connection,
+                "work.purpose_confirmed",
+                "work_item",
+                str(work["id"]),
+                actor_id,
+                {"decision": decision, "worker_purpose": purpose},
+                operator_scope=str(work["operator_scope"]),
+            )
+
     def instruct_worker_thread(
         self, actor: dict[str, Any], request: InstructWorkerThreadInput
     ) -> dict[str, Any]:
@@ -4091,6 +4326,7 @@ class ControlPlane:
                 _require_worker_safe_task_payload(managed_task_policy)
             requester_id = self._resolve_requester_id_tx(connection, None)
             assignment = WorkAssignment(
+                expected_purpose_version=request.expected_purpose_version,
                 worker_id=str(row["principal_id"]),
                 runtime_session_id=admission.runtime_session_id,
                 title=title,
@@ -8010,6 +8246,21 @@ class ControlPlane:
                 attachment_id,
             ),
         ).fetchall()
+        candidates = list(candidates)
+        failed_notices = connection.execute(
+            """
+            SELECT message.id FROM messages message
+            JOIN message_deliveries delivery ON delivery.message_id = message.id
+            WHERE delivery.recipient_attachment_id = ? AND delivery.state = 'dead'
+              AND delivery.reactivation_policy = 'retryable'
+              AND json_valid(message.payload_json)
+              AND json_extract(message.payload_json, '$.action') = 'requester_escalation'
+            """, (attachment_id,),
+        ).fetchall()
+        for notice in failed_notices:
+            current = requester_escalation_delivery_tx(connection, str(notice["id"]))
+            if current is not None and str(current["lease_expires_at"]) > now:
+                candidates.append(dict(current) | {"message_id": str(current["id"])})
         reactivated = 0
         seen_boundaries: set[str] = set()
         for candidate in candidates:
@@ -8106,7 +8357,7 @@ class ControlPlane:
         ):
             raise ValidationError("activation scan ceiling must be a nonnegative integer")
         now = utc_now()
-        query = """
+        query = f"""
             SELECT delivery.message_id, message.sequence AS message_sequence,
                    delivery.generation AS delivery_generation,
                    delivery.recipient_attachment_id AS attachment_id,
@@ -8126,6 +8377,7 @@ class ControlPlane:
               AND (? IS NULL OR message.sequence <= ?)
               AND attachment.state = 'active'
               AND attachment.lease_expires_at > ?
+              AND {cao_automatic_wake_ready_sql()}
               AND runtime.adapter = 'codex-app-server'
               AND attachment.native_thread_id <> ''
               AND runtime.native_session_id = attachment.native_thread_id
@@ -8197,7 +8449,8 @@ class ControlPlane:
         only digest-bound provenance. Status alone may describe an unloaded
         writer's still-running turn and is never sufficient. A second
         identical terminal proof for the same attachment/Delivery generation
-        admits one successor only while its exact Boundary remains unresolved.
+        admits one successor only while its exact Boundary remains unresolved
+        and the owning conversation has an admitted current catalog contract.
         """
 
         if (
@@ -8228,6 +8481,8 @@ class ControlPlane:
         now = utc_now()
         event_type = "cao.supervision_provider_turn_incomplete_observed"
         with self.db.transaction() as connection:
+            if not cao_automatic_wake_ready_tx(connection, attachment_id):
+                return "not_required"
             row = connection.execute(
                 """
                 SELECT message.id AS message_id, delivery.recipient_id,
@@ -8284,8 +8539,18 @@ class ControlPlane:
                 """,
                 (message_id, attachment_id, delivery_generation, now, now),
             ).fetchone()
+            escalation = None
             if row is None:
-                return "not_required"
+                escalation = requester_escalation_delivery_tx(connection, message_id)
+                if (
+                    escalation is None
+                    or escalation["recipient_attachment_id"] != attachment_id
+                    or escalation["generation"] != delivery_generation
+                    or escalation["delivery_state"] not in {"delivered", "acknowledged"}
+                    or str(escalation["lease_expires_at"]) <= now
+                ):
+                    return "not_required"
+                row = escalation
             if not hmac.compare_digest(
                 str(row["native_thread_id"]).encode(), native_thread_id.encode()
             ):
@@ -8346,6 +8611,12 @@ class ControlPlane:
                 # An old host generation, changed provider turn, or changed
                 # terminal outcome cannot corroborate the first observation.
                 return "not_required"
+            if escalation is not None:
+                return self._recover_incomplete_requester_escalation_tx(
+                    connection, message_id=message_id,
+                    recipient_id=str(row["recipient_id"]),
+                    delivery_generation=delivery_generation,
+                )
             return self._recover_incomplete_reasoner_delivery_tx(
                 connection,
                 message_id=message_id,
@@ -8416,11 +8687,13 @@ class ControlPlane:
         }
         with self.db.transaction() as connection:
             boundaries = connection.execute(
-                """
+                f"""
                 SELECT boundary.*, work.supervisor_id,
                        work.supervisor_attachment_id
                 FROM boundaries AS boundary
                 JOIN work_items AS work ON work.id = boundary.work_item_id
+                JOIN cao_session_attachments AS attachment
+                  ON attachment.id = work.supervisor_attachment_id
                 LEFT JOIN boundary_dispositions AS disposition
                   ON disposition.boundary_id = boundary.id
                 LEFT JOIN boundary_supersessions AS supersession
@@ -8431,6 +8704,7 @@ class ControlPlane:
                   AND work.attention_owner = 'cao'
                   AND work.state NOT IN ('completed', 'canceled', 'failed', 'suspended')
                   AND work.supervisor_attachment_id IS NOT NULL
+                  AND {cao_automatic_wake_ready_sql()}
                 ORDER BY boundary.created_at, boundary.id
                 LIMIT ?
                 """,
@@ -8497,108 +8771,50 @@ class ControlPlane:
         return rearmed
 
     def reconcile_cao_progress_wake_deliveries(self, *, limit: int = 100) -> int:
-        """Coalesce non-executing progress wakes superseded by a later Boundary.
+        """Coalesce superseded informational wakes before native execution.
 
-        Worker reports remain immutable history. Only the unclaimed CAO wake
-        Delivery, or one the CAO already acknowledged before its turn was
-        interrupted, is terminalized. Once the same Attempt has recorded a
-        later question, blocker, completion, or recovery Boundary, retaining
-        that older informational progress Delivery would delay the actionable
-        state and can permanently fence the attachment lane. Leased,
-        dispatched, and merely delivered wakes keep their outcome fence.
+        Both structured progress and automatic output availability retain all
+        original evidence. Accepted native entries need exact provider deletion
+        before a merely delivered wake can be superseded.
         """
-
         now = utc_now()
         with self.db.transaction() as connection:
             rows = connection.execute(
-                """
-                SELECT progress.id AS message_id,
-                       progress_delivery.recipient_id,
-                       progress_delivery.generation,
-                       (
-                         SELECT boundary_message.id
-                         FROM messages AS boundary_message
-                         JOIN message_deliveries AS boundary_delivery
-                           ON boundary_delivery.message_id = boundary_message.id
-                          AND boundary_delivery.recipient_id =
-                              progress_delivery.recipient_id
-                          AND boundary_delivery.recipient_attachment_id =
-                              progress_delivery.recipient_attachment_id
-                         WHERE boundary_message.work_item_id = progress.work_item_id
-                           AND boundary_message.attempt_id = progress.attempt_id
-                           AND boundary_message.sequence > progress.sequence
-                           AND json_extract(
-                                 boundary_message.payload_json, '$.boundary_id'
-                               ) IS NOT NULL
-                         ORDER BY boundary_message.sequence
-                         LIMIT 1
-                       ) AS superseding_message_id
-                FROM message_deliveries AS progress_delivery
-                JOIN messages AS progress
-                  ON progress.id = progress_delivery.message_id
-                JOIN principals AS recipient
-                  ON recipient.id = progress_delivery.recipient_id
-                WHERE progress_delivery.state IN ('queued', 'acknowledged')
-                  AND progress_delivery.recipient_attachment_id IS NOT NULL
+                f"""
+                SELECT m.id AS message_id, d.recipient_id, d.generation,
+                       ({cao_superseding_boundary_sql('m', 'd')}) AS superseding_message_id
+                FROM message_deliveries AS d
+                JOIN messages AS m ON m.id = d.message_id
+                JOIN principals AS recipient ON recipient.id = d.recipient_id
+                WHERE d.state IN ('queued', 'acknowledged')
+                  AND d.recipient_attachment_id IS NOT NULL
                   AND recipient.role = 'cao'
-                  AND progress.kind = 'progress'
-                  AND progress.work_item_id IS NOT NULL
-                  AND progress.attempt_id IS NOT NULL
-                  AND EXISTS (
-                    SELECT 1
-                    FROM messages AS boundary_message
-                    JOIN message_deliveries AS boundary_delivery
-                      ON boundary_delivery.message_id = boundary_message.id
-                     AND boundary_delivery.recipient_id =
-                         progress_delivery.recipient_id
-                     AND boundary_delivery.recipient_attachment_id =
-                         progress_delivery.recipient_attachment_id
-                    WHERE boundary_message.work_item_id = progress.work_item_id
-                      AND boundary_message.attempt_id = progress.attempt_id
-                      AND boundary_message.sequence > progress.sequence
-                      AND json_extract(
-                            boundary_message.payload_json, '$.boundary_id'
-                          ) IS NOT NULL
-                  )
-                ORDER BY progress.sequence
-                LIMIT ?
+                  AND {cao_informational_wake_sql('m')}
+                  AND ({cao_superseding_boundary_sql('m', 'd')}) IS NOT NULL
+                ORDER BY m.sequence LIMIT ?
                 """,
                 (max(1, min(limit, 1000)),),
             ).fetchall()
             coalesced = 0
             for row in rows:
                 updated = connection.execute(
-                    """
-                    UPDATE message_deliveries
-                    SET state = 'dead', next_attempt_at = ?, lease_until = NULL,
-                        owner_token = '',
-                        last_error = 'cao_progress_wake_superseded_by_boundary',
-                        updated_at = ?
-                    WHERE message_id = ? AND recipient_id = ?
-                      AND generation = ? AND state IN ('queued', 'acknowledged')
-                    """,
-                    (
-                        now,
-                        now,
-                        row["message_id"],
-                        row["recipient_id"],
-                        row["generation"],
-                    ),
+                    """UPDATE message_deliveries
+                       SET state = 'dead', next_attempt_at = ?, lease_until = NULL,
+                           owner_token = '', reactivation_policy = 'terminal',
+                           last_error = 'cao_progress_wake_superseded_by_boundary', updated_at = ?
+                       WHERE message_id = ? AND recipient_id = ?
+                         AND generation = ? AND state IN ('queued', 'acknowledged')""",
+                    (now, now, row['message_id'], row['recipient_id'], row['generation']),
                 ).rowcount
                 if updated != 1:
                     continue
                 coalesced += 1
                 self._event(
-                    connection,
-                    "message.delivery_superseded",
-                    "message",
-                    str(row["message_id"]),
-                    "",
-                    {
-                        "reason_code": "cao_progress_wake_superseded_by_boundary",
-                        "superseding_message_id": str(row["superseding_message_id"]),
-                    },
-                    causation_id=str(row["superseding_message_id"]),
+                    connection, 'message.delivery_superseded', 'message',
+                    str(row['message_id']), '',
+                    {'reason_code': 'cao_progress_wake_superseded_by_boundary',
+                     'superseding_message_id': str(row['superseding_message_id'])},
+                    causation_id=str(row['superseding_message_id']),
                 )
             return coalesced
 
@@ -14148,6 +14364,13 @@ class ControlPlane:
                         directive_id=result_directive_id,
                     )
                 else:
+                    self._confirm_work_purpose_tx(
+                        connection,
+                        str(actor["id"]),
+                        target,
+                        request.expected_purpose_version,
+                        "augment",
+                    )
                     attempt = self._latest_attempt_tx(connection, str(target["id"]))
                     if attempt is None:
                         raise ConflictError("augment directive has no current attempt")
@@ -14282,6 +14505,10 @@ class ControlPlane:
                     raise ConflictError(
                         "reasoner turn idempotency key was reused for another boundary"
                     )
+                cached["worker_purpose"] = worker_purpose_tx(
+                    connection, str(work["managed_worker_thread_id"] or "")
+                )
+                cached["supervision_guidance"] = PURPOSE_GUIDANCE
                 return cached
             if int(work["generation"]) != expected_generation:
                 raise StaleGenerationError(expected_generation, int(work["generation"]))
@@ -14453,6 +14680,10 @@ class ControlPlane:
                     "generation": expected_generation,
                 },
             )
+            result["worker_purpose"] = worker_purpose_tx(
+                connection, str(work["managed_worker_thread_id"] or "")
+            )
+            result["supervision_guidance"] = PURPOSE_GUIDANCE
             result["supervision_memory"] = self._supervision_memory_context_tx(
                 connection, actor, work
             )
@@ -14466,14 +14697,124 @@ class ControlPlane:
             )
             return result
 
+    @staticmethod
+    def _has_reasoner_recovery_tx(connection: sqlite3.Connection, boundary_id: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM messages WHERE json_valid(payload_json) "
+            "AND json_extract(payload_json, '$.boundary_id') = ? "
+            "AND json_extract(payload_json, '$.action') IN "
+            "('recover_expired_reasoner_turn', 'recover_incomplete_reasoner_turn') LIMIT 1",
+            (boundary_id,),
+        ).fetchone() is not None
+
+    def _escalate_supervision_tx(
+        self, connection: sqlite3.Connection, *, boundary: sqlite3.Row,
+        work: sqlite3.Row, reason_code: str, reason: str,
+        turn: sqlite3.Row | None = None, request_digest: str = "",
+    ) -> dict[str, Any]:
+        """Persist a system-owned inability to supervise, never task acceptance.
+
+        Call only after proving exact current Boundary authority and either a
+        non-retryable command denial or an observed failed recovery. The
+        synthetic completed turn is audit provenance, not an LLM judgment or
+        confirmation of purpose. The same Work can resume through WAIT_USER.
+        """
+        now = utc_now()
+        turn_id = str(turn["id"]) if turn is not None else _id("turn")
+        disposition_id = _id("bdisp")
+        instruction = (
+            "The objective remains unmet. Explain the supervision failure to the requester "
+            "and obtain guidance or a safe recovery decision; do not repeat the blocked operation."
+        )
+        resume_condition = "Requester guidance or verified recovery permits safe continuation."
+        decision_digest = request_digest or _digest({
+            "boundary_id": boundary["id"], "reason_code": reason_code,
+            "kind": "wait_user", "origin": "system_supervision_recovery",
+        })
+        result_digest = _digest({
+            "boundary_id": boundary["id"], "disposition_id": disposition_id,
+            "request_digest": decision_digest,
+            "goal_packet_digest": boundary["goal_packet_digest"],
+            "task_packet_digest": boundary["task_packet_digest"],
+        })
+        if turn is None:
+            connection.execute(
+                """INSERT INTO reasoner_turns(
+                    id, supervisor_id, work_item_id, boundary_id, generation,
+                    goal_version, goal_packet_digest, task_packet_digest, input_digest,
+                    result_digest, state, lease_token_digest, lease_expires_at,
+                    idempotency_key, completed_at, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?)""",
+                (turn_id, work["supervisor_id"], work["id"], boundary["id"],
+                 boundary["generation"], boundary["goal_version"], boundary["goal_packet_digest"],
+                 boundary["task_packet_digest"], _digest({
+                     "boundary_id": boundary["id"],
+                     "boundary_input_digest": boundary["input_digest"],
+                     "goal_packet_digest": boundary["goal_packet_digest"],
+                     "task_packet_digest": boundary["task_packet_digest"],
+                     "generation": boundary["generation"],
+                 }), result_digest,
+                 _digest(f"system-escalation:{turn_id}"), now,
+                 f"system-escalation:{boundary['id']}", now, now, now),
+            )
+        else:
+            connection.execute(
+                "UPDATE reasoner_turns SET state = 'completed', result_digest = ?, "
+                "completed_at = ?, updated_at = ? WHERE id = ?",
+                (result_digest, now, now, turn_id),
+            )
+        connection.execute(
+            """INSERT INTO boundary_dispositions(
+                id, boundary_id, reasoner_turn_id, decided_by, generation, kind,
+                reason, instruction, resume_condition, request_digest, created_at
+            ) VALUES(?, ?, ?, ?, ?, 'wait_user', ?, ?, ?, ?, ?)""",
+            (disposition_id, boundary["id"], turn_id, work["supervisor_id"],
+             boundary["generation"], reason, instruction, resume_condition, decision_digest, now),
+        )
+        connection.execute(
+            "UPDATE attempts SET state = 'input_required', updated_at = ? WHERE id = ?",
+            (now, boundary["attempt_id"]),
+        )
+        connection.execute(
+            "UPDATE work_items SET state = 'user_needed', attention_owner = 'user', "
+            "user_needed_boundary_id = ?, updated_at = ? WHERE id = ?",
+            (boundary["id"], now, work["id"]),
+        )
+        self._supersede_boundary_deliveries_tx(
+            connection, boundary_id=str(boundary["id"]),
+            recipient_id=str(work["supervisor_id"]), reason=f"system-escalation:{disposition_id}",
+        )
+        self._message(
+            connection, sender_id=str(work["supervisor_id"]),
+            recipient_id=str(work["supervisor_id"]), kind=MessageKind.SYSTEM,
+            payload={"action": "requester_escalation", "source_boundary_id": boundary["id"],
+                     "disposition_id": disposition_id, "disposition": "wait_user",
+                     "reason": reason, "decision": instruction, "resume_condition": resume_condition,
+                     "origin": "system_supervision_recovery", "reason_code": reason_code},
+            work_item_id=str(work["id"]), attempt_id=str(boundary["attempt_id"]),
+            goal_version=int(boundary["goal_version"]),
+            idempotency_key=f"requester-escalation:{boundary['id']}",
+        )
+        self._event(
+            connection, "boundary.disposed", "work_item", str(work["id"]),
+            str(work["supervisor_id"]),
+            {"boundary_id": str(boundary["id"]), "disposition_id": disposition_id,
+             "generation": int(boundary["generation"]), "kind": "wait_user",
+             "reason_code": reason_code, "origin": "system_supervision_recovery"},
+        )
+        result = connection.execute(
+            "SELECT * FROM boundary_dispositions WHERE id = ?", (disposition_id,),
+        ).fetchone()
+        assert result is not None
+        return dict(result)
+
     def recover_expired_reasoner_turns(self) -> int:
         """Advance unresolved Boundaries whose CAO decision lease expired.
 
-        This is deadline recovery, not Worker polling.  The expired turn is
-        abandoned, its exact boundary delivery is superseded, and that actual
-        state transition creates one successor wake. An unresolved supervision
-        obligation never becomes permanently dormant merely because a prior
-        CAO turn also expired. A stale turn can never later commit a disposition.
+        The first observed interruption admits one repair wake. Interruption
+        of that recovery becomes durable requester consultation on the same
+        Work, never a repeated wake loop or an unowned terminal failure. A stale
+        turn cannot commit a decision after either transition.
         """
 
         now = utc_now()
@@ -14482,20 +14823,29 @@ class ControlPlane:
             turns = connection.execute(
                 """
                 SELECT t.*, b.source_principal_id, b.attempt_id,
+                       work.supervisor_attachment_id,
                        b.kind AS boundary_kind,
                        b.metadata_json AS boundary_metadata_json,
                        b.recovery_action AS boundary_recovery_action
                 FROM reasoner_turns AS t
                 JOIN boundaries AS b ON b.id = t.boundary_id
+                JOIN work_items AS work ON work.id = b.work_item_id
                 LEFT JOIN boundary_dispositions AS d ON d.boundary_id = b.id
                 LEFT JOIN boundary_supersessions AS s ON s.boundary_id = b.id
                 WHERE t.state = ? AND t.lease_expires_at < ? AND d.id IS NULL
                   AND s.boundary_id IS NULL
+                  AND b.generation = work.generation
+                  AND b.goal_version = work.goal_version
+                  AND work.state NOT IN ('completed', 'canceled', 'failed', 'suspended')
                 ORDER BY t.lease_expires_at, t.id
                 """,
                 (ReasonerTurnState.LEASED.value, now),
             ).fetchall()
             for turn in turns:
+                if not cao_automatic_wake_ready_tx(
+                    connection, turn["supervisor_attachment_id"]
+                ):
+                    continue
                 updated = connection.execute(
                     """
                     UPDATE reasoner_turns
@@ -14511,6 +14861,21 @@ class ControlPlane:
                     ),
                 ).rowcount
                 if updated != 1:
+                    continue
+                if self._has_reasoner_recovery_tx(connection, str(turn["boundary_id"])):
+                    boundary = connection.execute(
+                        "SELECT * FROM boundaries WHERE id = ?", (turn["boundary_id"],),
+                    ).fetchone()
+                    work = connection.execute(
+                        "SELECT * FROM work_items WHERE id = ?", (turn["work_item_id"],),
+                    ).fetchone()
+                    assert boundary is not None and work is not None
+                    self._escalate_supervision_tx(
+                        connection, boundary=boundary, work=work,
+                        reason_code="supervision_recovery_incomplete",
+                        reason="Supervision recovery ended without a decision; requester guidance is required.",
+                    )
+                    recovered += 1
                     continue
                 self._supersede_boundary_deliveries_tx(
                     connection,
@@ -14551,6 +14916,62 @@ class ControlPlane:
                 )
                 recovered += 1
         return recovered
+
+    def _recover_incomplete_requester_escalation_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        message_id: str,
+        recipient_id: str,
+        delivery_generation: int,
+    ) -> _IncompleteReasonerRecoveryOutcome:
+        """Re-arm only requester communication after a proven incomplete CAO turn."""
+        notice = requester_escalation_delivery_tx(connection, message_id)
+        now = utc_now()
+        if (
+            notice is None or notice["recipient_id"] != recipient_id
+            or notice["generation"] != delivery_generation
+            or notice["delivery_state"] not in {"dispatched", "delivered", "acknowledged"}
+            or str(notice["lease_expires_at"]) <= now
+            or not cao_automatic_wake_ready_tx(connection, notice["recipient_attachment_id"])
+        ):
+            return "not_required"
+        if str(notice["idempotency_key"]).startswith("requester-escalation-recovery:"):
+            connection.execute(
+                "UPDATE message_deliveries SET state = 'dead', lease_until = NULL, "
+                "owner_token = '', reactivation_policy = 'terminal', "
+                "last_error = 'requester_communication_unavailable', updated_at = ? "
+                "WHERE message_id = ? AND recipient_id = ? AND generation = ?",
+                (now, message_id, recipient_id, delivery_generation),
+            )
+            self._event(
+                connection, "cao.requester_communication_unavailable", "work_item",
+                str(notice["work_item_id"]), recipient_id,
+                {"message_id": message_id, "boundary_id": str(notice["boundary_id"])},
+                causation_id=message_id,
+            )
+            return "not_required"
+        connection.execute(
+            """UPDATE message_deliveries SET state = 'dead', lease_until = NULL,
+                   owner_token = '', reactivation_policy = 'terminal',
+                   last_error = 'requester_escalation_turn_incomplete', updated_at = ?
+               WHERE message_id = ? AND recipient_id = ? AND generation = ?""",
+            (now, message_id, recipient_id, delivery_generation),
+        )
+        successor = self._message(
+            connection, sender_id=str(notice["sender_id"]), recipient_id=recipient_id,
+            kind=MessageKind.SYSTEM, payload=json.loads(notice["payload_json"]),
+            work_item_id=str(notice["work_item_id"]), attempt_id=str(notice["attempt_id"]),
+            goal_version=int(notice["goal_version"]),
+            idempotency_key=f"requester-escalation-recovery:{message_id}:{delivery_generation}",
+        )
+        self._event(
+            connection, "cao.requester_escalation_rearmed", "work_item",
+            str(notice["work_item_id"]), recipient_id,
+            {"message_id": message_id, "successor_message_id": str(successor["id"])},
+            causation_id=message_id,
+        )
+        return "scheduled"
 
     def _recover_incomplete_reasoner_delivery_tx(
         self,
@@ -14594,7 +15015,8 @@ class ControlPlane:
             return "not_required"
         current_message = connection.execute(
             """
-            SELECT message.*, delivery.state AS delivery_state
+            SELECT message.*, delivery.state AS delivery_state,
+                   delivery.recipient_attachment_id
             FROM messages AS message
             JOIN message_deliveries AS delivery ON delivery.message_id = message.id
             JOIN boundaries AS boundary
@@ -14649,6 +15071,10 @@ class ControlPlane:
         ).fetchone()
         if current_message is None:
             return "not_required"
+        if not cao_automatic_wake_ready_tx(
+            connection, current_message["recipient_attachment_id"]
+        ):
+            return "not_required"
         turn = connection.execute(
             """
             SELECT * FROM reasoner_turns
@@ -14681,6 +15107,17 @@ class ControlPlane:
                     now,
                 ),
             )
+        if self._has_reasoner_recovery_tx(connection, boundary_id):
+            work = connection.execute(
+                "SELECT * FROM work_items WHERE id = ?", (boundary["work_item_id"],),
+            ).fetchone()
+            assert work is not None
+            self._escalate_supervision_tx(
+                connection, boundary=boundary, work=work,
+                reason_code="supervision_recovery_incomplete",
+                reason="Supervision recovery ended without a decision; requester guidance is required.",
+            )
+            return "scheduled"
         self._supersede_boundary_deliveries_tx(
             connection,
             boundary_id=boundary_id,
@@ -14926,6 +15363,9 @@ class ControlPlane:
             )
             if cached is not None:
                 return cached
+            self._confirm_work_purpose_tx(
+                connection, str(actor["id"]), work, request.expected_purpose_version, "resume"
+            )
             if int(work["generation"]) != request.expected_generation:
                 raise StaleGenerationError(request.expected_generation, int(work["generation"]))
             pause = pause_view_tx(connection, work)
@@ -15023,6 +15463,7 @@ class ControlPlane:
                 boundary_id,
                 request,
                 expected_work_item_id=expected_work_item_id,
+                escalate_command_denial=True,
             )
 
     def _dispose_boundary_tx(
@@ -15033,6 +15474,7 @@ class ControlPlane:
         request: BoundaryDispositionInput,
         *,
         expected_work_item_id: str | None = None,
+        escalate_command_denial: bool = False,
     ) -> dict[str, Any]:
         """Apply exactly one fenced decision to a recorded boundary."""
 
@@ -15090,6 +15532,18 @@ class ControlPlane:
                 raise ConflictError(
                     "boundary was already disposed differently",
                     disposition_id=existing["id"],
+                )
+            self._confirm_work_purpose_tx(
+                connection,
+                str(actor["id"]),
+                work,
+                request.expected_purpose_version,
+                "boundary_disposition",
+            )
+            if request.kind == BoundaryDispositionKind.FAIL:
+                raise ConflictError(
+                    "Unfinished work must continue or be escalated to the requester",
+                    reason_code="unfinished_work_requires_escalation",
                 )
             supersession = connection.execute(
                 "SELECT reason, created_at FROM boundary_supersessions WHERE boundary_id = ?",
@@ -15152,7 +15606,7 @@ class ControlPlane:
                 (runtime_recovery_owned and recovery_action == "dispose_continue_or_correct")
                 or same_thread_reconciliation_executable
             )
-            system_reconciliation_terminal = bool(
+            system_reconciliation_required = bool(
                 (system_recovery_owned or runtime_recovery_owned)
                 and recovery_action == "system_reconciliation"
             )
@@ -15162,17 +15616,20 @@ class ControlPlane:
                         BoundaryDispositionKind.CONTINUE,
                         BoundaryDispositionKind.CORRECT,
                         BoundaryDispositionKind.PAUSE,
+                        BoundaryDispositionKind.WAIT_USER,
                     }
                     if managed_recovery_executable
                     else (
-                        {BoundaryDispositionKind.FAIL} if system_reconciliation_terminal else set()
+                        {BoundaryDispositionKind.WAIT_USER}
+                        if system_reconciliation_required
+                        else set()
                     )
                 )
                 if request.kind not in allowed_recovery_dispositions:
                     # Executable recovery continues the exact logical Worker.
-                    # A non-executable system reconciliation instead closes the
-                    # Work as a bounded system failure; it is never converted
-                    # into requester input, acceptance, or an unsafe retry.
+                    # A non-executable recovery requires requester guidance.
+                    # Escalation preserves the unmet Work and the unknown-effect
+                    # fence; it grants no authority to retry an execution.
                     raise ConflictError(
                         "system recovery boundary requires its recovery workflow",
                         reason_code="system_recovery_owned",
@@ -15230,19 +15687,41 @@ class ControlPlane:
                         BoundaryDispositionKind.CORRECT,
                         BoundaryDispositionKind.RETRY,
                         BoundaryDispositionKind.PAUSE,
+                        BoundaryDispositionKind.WAIT_USER,
                     }:
                         raise ConflictError(
                             "a needs-work completion review requires a corrective disposition",
                             review_id=boundary_review["id"],
                         )
-            if request.kind == BoundaryDispositionKind.PAUSE:
+            if request.kind in {BoundaryDispositionKind.PAUSE, BoundaryDispositionKind.WAIT_USER}:
                 _require_worker_safe_task_payload(
                     {
                         "reason": request.reason,
+                        "instruction": request.instruction,
                         "resume_condition": request.resume_condition,
                     }
                 )
+            if request.kind == BoundaryDispositionKind.PAUSE:
                 self._require_pause_safe_tx(connection, work, attempt, boundary)
+            if escalate_command_denial and request.kind in {
+                BoundaryDispositionKind.CONTINUE, BoundaryDispositionKind.CORRECT,
+            } and not managed_recovery_executable:
+                try:
+                    self._preflight_managed_worker_command_tx(
+                        connection, actor_id=str(actor["id"]), work=work,
+                    )
+                except ConflictError as error:
+                    if (error.details or {}).get("reason_code") != "worker_command_outcome_unsettled":
+                        raise
+                    # The verified command could not execute. Commit a distinct,
+                    # visible consultation outcome instead of leaving its lease
+                    # to trigger an identical model invocation indefinitely.
+                    return self._escalate_supervision_tx(
+                        connection, boundary=boundary, work=work,
+                        reason_code="worker_command_outcome_unsettled",
+                        reason="The requested continuation is blocked by an unsettled execution outcome.",
+                        turn=turn, request_digest=request_digest,
+                    )
             disposition_id = _id("bdisp")
             now = utc_now()
             connection.execute(
@@ -15282,77 +15761,10 @@ class ControlPlane:
                         boundary=boundary,
                         reconcile_unknown=runtime_reconciliation,
                     )
-                    superseded_deliveries = connection.execute(
-                        """
-                        SELECT delivery.message_id, delivery.recipient_id,
-                               delivery.runtime_session_id, delivery.generation,
-                               delivery.state, delivery.last_error
-                        FROM message_deliveries AS delivery
-                        JOIN messages AS message
-                          ON message.id = delivery.message_id
-                        WHERE message.attempt_id = ?
-                          AND delivery.recipient_id = ?
-                          AND delivery.runtime_session_id = ?
-                          AND delivery.state IN ('queued', 'leased', 'dispatched')
-                        ORDER BY message.sequence, delivery.recipient_id
-                        """,
-                        (
-                            attempt["id"],
-                            attempt["worker_id"],
-                            attempt["runtime_session_id"],
-                        ),
-                    ).fetchall()
-                    for delivery in superseded_deliveries:
-                        updated_delivery = connection.execute(
-                            """
-                        UPDATE message_deliveries
-                        SET state = 'dead', next_attempt_at = ?,
-                            lease_until = NULL, owner_token = '',
-                            last_error = ?, updated_at = ?
-                        WHERE message_id = ? AND recipient_id = ?
-                          AND runtime_session_id = ? AND generation = ?
-                          AND state = ?
-                            """,
-                            (
-                                now,
-                                (
-                                    "runtime_reconciliation_superseded"
-                                    if runtime_reconciliation
-                                    else "runtime_recovery_superseded"
-                                ),
-                                now,
-                                delivery["message_id"],
-                                delivery["recipient_id"],
-                                delivery["runtime_session_id"],
-                                delivery["generation"],
-                                delivery["state"],
-                            ),
-                        ).rowcount
-                        if updated_delivery != 1:
-                            raise ConflictError(
-                                "managed runtime recovery delivery changed",
-                                reason_code="worker_instruction_outcome_unknown",
-                                recovery_state="system_reconciliation_required",
-                                retryable=False,
-                            )
-                        prior_error = str(delivery["last_error"] or "")
-                        self._event(
-                            connection,
-                            "message.delivery_superseded",
-                            "message",
-                            str(delivery["message_id"]),
-                            str(actor["id"]),
-                            {
-                                "reason_code": (
-                                    "runtime_reconciliation_superseded"
-                                    if runtime_reconciliation
-                                    else "runtime_recovery_superseded"
-                                ),
-                                "prior_state": str(delivery["state"]),
-                                **({"provider_failure_code": prior_error} if prior_error else {}),
-                            },
-                            causation_id=str(boundary["id"]),
-                        )
+                    self._retire_runtime_recovery_deliveries_tx(
+                        connection, actor_id=str(actor["id"]), attempt=attempt,
+                        boundary=boundary, runtime_reconciliation=runtime_reconciliation,
+                    )
                     self._retry_attempt_tx(
                         connection,
                         actor["id"],
@@ -15534,20 +15946,9 @@ class ControlPlane:
                             work["id"],
                         ),
                     )
-            elif request.kind in {
-                BoundaryDispositionKind.CANCEL,
-                BoundaryDispositionKind.FAIL,
-            }:
-                work_state = (
-                    WorkState.CANCELED
-                    if request.kind == BoundaryDispositionKind.CANCEL
-                    else WorkState.FAILED
-                )
-                attempt_state = (
-                    AttemptState.CANCELED
-                    if request.kind == BoundaryDispositionKind.CANCEL
-                    else AttemptState.FAILED
-                )
+            elif request.kind == BoundaryDispositionKind.CANCEL:
+                work_state = WorkState.CANCELED
+                attempt_state = AttemptState.CANCELED
                 self._fence_reasoner_turns_tx(connection, str(work["id"]))
                 connection.execute(
                     "UPDATE attempts SET state = ?, updated_at = ? WHERE id = ?",
@@ -15599,6 +16000,29 @@ class ControlPlane:
                 recipient_id=actor["id"],
                 evidence=f"boundary-disposition:{disposition_id}",
             )
+            if request.kind in {BoundaryDispositionKind.WAIT_USER, BoundaryDispositionKind.PAUSE}:
+                # Persist the requester-facing handoff in the same transaction
+                # as the decision. Handling the old Boundary cannot consume this
+                # independent notification or stand in for requester guidance.
+                self._message(
+                    connection,
+                    sender_id=str(actor["id"]),
+                    recipient_id=str(work["supervisor_id"]),
+                    kind=MessageKind.SYSTEM,
+                    payload={
+                        "action": "requester_escalation",
+                        "source_boundary_id": boundary_id,
+                        "disposition_id": disposition_id,
+                        "disposition": request.kind.value,
+                        "reason": request.reason,
+                        "decision": request.instruction,
+                        "resume_condition": request.resume_condition,
+                    },
+                    work_item_id=str(work["id"]),
+                    attempt_id=str(attempt["id"]),
+                    goal_version=int(work["goal_version"]),
+                    idempotency_key=f"requester-escalation:{boundary_id}",
+                )
             self._event(
                 connection,
                 "boundary.disposed",
@@ -15613,6 +16037,7 @@ class ControlPlane:
                 },
             )
             if terminal:
+                supersede_terminal_work_boundaries(connection, work_item_id=str(work["id"]))
                 self._resume_interrupted_target_tx(connection, str(work["id"]), actor["id"])
             row = connection.execute(
                 "SELECT * FROM boundary_dispositions WHERE id = ?",
@@ -15801,6 +16226,7 @@ class ControlPlane:
                 raise ConflictError("work item has no attempt")
             current_packet = _load(self._current_goal_tx(connection, work)["packet_json"], {})
             successor = WorkAssignment(
+                expected_purpose_version=request.expected_purpose_version,
                 worker_id=str(work["assigned_worker_id"]),
                 title=str(work["title"]),
                 objective=request.objective,
@@ -16254,6 +16680,8 @@ class ControlPlane:
         reason: str = "retry",
         idempotency_key: str = "",
         *,
+        expected_purpose_version: int | None = None,
+        expected_successor_purpose_version: int | None = None,
         managed_worker_thread_id: str | None = None,
         managed_worker_thread_generation: int | None = None,
     ) -> dict[str, Any]:
@@ -16275,6 +16703,12 @@ class ControlPlane:
             or managed_worker_thread_generation < 1
         ):
             raise ValidationError("managed Worker thread generation is invalid")
+        if expected_purpose_version is not None and (
+            isinstance(expected_purpose_version, bool)
+            or not isinstance(expected_purpose_version, int)
+            or expected_purpose_version < 0
+        ):
+            raise ValidationError("purpose confirmation must be a nonnegative integer")
         request_fields = {
             "work_item_id": work_id,
             "worker_id": worker_id,
@@ -16283,6 +16717,12 @@ class ControlPlane:
             "managed_worker_thread_id": managed_worker_thread_id,
             "managed_worker_thread_generation": managed_worker_thread_generation,
         }
+        if expected_purpose_version is not None:
+            request_fields["expected_purpose_version"] = expected_purpose_version
+        if expected_successor_purpose_version is not None:
+            request_fields["expected_successor_purpose_version"] = (
+                expected_successor_purpose_version
+            )
         request_digest = _digest(request_fields)
         compatible_request_digests: tuple[str, ...] = ()
         if managed_worker_thread_id is None:
@@ -16545,6 +16985,25 @@ class ControlPlane:
                 worker_thread_id=managed_worker_thread_id,
                 expected_worker_thread_generation=managed_worker_thread_generation,
             )
+            self._confirm_work_purpose_tx(
+                connection, str(actor["id"]), work, expected_purpose_version, "retry"
+            )
+            if admission is not None and target_worker != str(previous["worker_id"]):
+                successor_purpose = confirm_worker_purpose_tx(
+                    connection,
+                    admission.worker_thread_id,
+                    expected_successor_purpose_version,
+                    required=True,
+                )
+                self._event(
+                    connection,
+                    "work.purpose_confirmed",
+                    "work_item",
+                    work_id,
+                    str(actor["id"]),
+                    {"decision": "handoff", "worker_purpose": successor_purpose},
+                    operator_scope=str(work["operator_scope"]),
+                )
             if existing is None:
                 unresolved = connection.execute(
                     """
@@ -16735,7 +17194,10 @@ class ControlPlane:
         from .supervision_memory import search_memories_tx
 
         goal = self._current_goal_tx(connection, work)
-        query = evidence_text(goal["objective"])[:2000] or "Work supervision history"
+        purpose = worker_purpose_tx(connection, str(work["managed_worker_thread_id"] or ""))
+        query = (
+            ((str(purpose["text"]) + " ") if purpose else "") + evidence_text(goal["objective"])
+        )[:2000] or "Work supervision history"
         history = {
             "work_item_id": str(work["id"]),
             "boundary_count": int(
@@ -16760,7 +17222,9 @@ class ControlPlane:
                 "guidance": MEMORY_GUIDANCE,
             }
         try:
-            recall = search_memories_tx(connection, actor, MemorySearchInput(query=query))
+            recall = search_memories_tx(
+                connection, actor, MemorySearchInput(query=query), source_work_item_id=str(work["id"])
+            )
         except (sqlite3.DatabaseError, ValidationError, ConflictError):
             # Recall is a replaceable reasoning capability, not permission to
             # block unrelated Work/Worker lifecycle or fabricate an empty memory.
@@ -16951,47 +17415,14 @@ class ControlPlane:
                 (request.attempt_id, request.work_item_id),
             ).fetchone()
             assert attempt is not None
-            completion_claim = _load(str(attempt["completion_claim_json"]), {})
-            manifest_attempt: Mapping[str, Any] | sqlite3.Row = attempt
-            if not completion_claim:
-                captured_manifest = connection.execute(
-                    """SELECT output.artifact_manifest_json FROM worker_output_receipts output
-                       JOIN boundaries b ON b.id = output.boundary_id
-                       JOIN work_items w ON w.id = b.work_item_id
-                       LEFT JOIN boundary_dispositions d ON d.boundary_id = b.id
-                       LEFT JOIN boundary_supersessions s ON s.boundary_id = b.id
-                       WHERE output.attempt_id = ? AND output.event_kind = 'turn_end'
-                         AND b.kind = 'worker_output' AND b.generation = w.generation
-                         AND d.id IS NULL AND s.boundary_id IS NULL
-                       ORDER BY output.sequence DESC LIMIT 1""",
-                    (request.attempt_id,),
-                ).fetchone()
-                if captured_manifest is not None:
-                    completion_claim = {
-                        "artifact_manifest_scope": "verified_attempt_artifacts_v2",
-                        "artifacts": _load(str(captured_manifest["artifact_manifest_json"]), []),
-                    }
-                    manifest_attempt = {
-                        **dict(attempt),
-                        "completion_claim_json": _json(completion_claim),
-                    }
-            if (
-                not isinstance(completion_claim, Mapping)
-                or completion_claim.get("artifact_manifest_scope")
-                != "verified_attempt_artifacts_v2"
-            ):
+            # Registration and preservation establish read authority for this exact
+            # Work/Attempt; completion-manifest membership is a separate acceptance
+            # gate. Progress and blocker evidence must be inspectable before review.
+            if not re.fullmatch(r"[0-9a-f]{64}", str(artifact["digest"])) or str(
+                artifact["uri"]
+            ) != f"owner-private-artifact:{artifact['digest']}":
                 raise ConflictError(
-                    "artifact is not in the verified completion manifest",
-                    reason_code="artifact_content_manifest_unverified",
-                )
-            manifest = self._completion_claim_artifact_rows_tx(connection, manifest_attempt)
-            if manifest is None or not any(
-                str(item["id"]) == request.artifact_id
-                and str(item["digest"]) == str(artifact["digest"])
-                for item in manifest
-            ):
-                raise ConflictError(
-                    "artifact is not in the verified completion manifest",
+                    "artifact has not been verified in owner-private storage",
                     reason_code="artifact_content_manifest_unverified",
                 )
 
@@ -17055,6 +17486,9 @@ class ControlPlane:
                 raise ConflictError(
                     "verified artifact content is unavailable",
                     reason_code=error.code,
+                    **({"max_artifact_bytes": 1_048_576,
+                        "next_action": "request_bounded_utf8_evidence"}
+                       if error.code == "artifact_content_too_large" else {}),
                 ) from None
             audit_data = {
                 "format": "cao-verified-artifact-text-read/v1",
@@ -17164,6 +17598,26 @@ class ControlPlane:
                 row = connection.execute(
                     "SELECT * FROM attempts WHERE id = ?", (attempt_id,)
                 ).fetchone()
+            elif actor["role"] == PrincipalRole.WORKER.value:
+                runtime = self._require_worker_runtime_actor_tx(connection, actor)
+                scoped = connection.execute(
+                    "SELECT attempt.* FROM runtime_enrollment_tickets AS ticket "
+                    "JOIN attempts AS attempt ON attempt.id = ticket.attempt_id "
+                    "WHERE ticket.enrollment_id = ? AND ticket.generation = ? "
+                    "AND ticket.state = 'consumed' AND attempt.worker_id = ? "
+                    "AND attempt.state NOT IN ('completed', 'failed', 'canceled') "
+                    "ORDER BY ticket.created_at DESC LIMIT 1",
+                    (runtime["id"], int(runtime["generation"]), actor["id"]),
+                ).fetchone()
+                row = scoped if scoped is not None else connection.execute(
+                    "SELECT attempt.* FROM attempts AS attempt WHERE worker_id = ? AND runtime_session_id = ? "
+                    "AND state NOT IN ('completed', 'failed', 'canceled') "
+                    "ORDER BY CASE WHEN state IN ('assigned', 'accepted', 'working') THEN 0 ELSE 1 END, "
+                    "COALESCE((SELECT MIN(message.sequence) FROM messages AS message "
+                    "WHERE message.attempt_id = attempt.id AND message.kind = 'assignment'), 9223372036854775807), "
+                    "created_at, attempt_number, id LIMIT 1",
+                    (actor["id"], actor["_runtime_session_id"]),
+                ).fetchone()
             else:
                 row = connection.execute(
                     """
@@ -17234,6 +17688,10 @@ class ControlPlane:
             "generation": int(work["generation"]),
             "goal_version": int(work["goal_version"]),
             "objective": str(work["objective"]),
+            "instruction": str(work["objective"]),
+            "worker_purpose": work["worker_purpose"],
+            "assignment_purpose": work["assignment_purpose"],
+            "purpose_changed_since_assignment": work["purpose_changed_since_assignment"],
             "maturity": str(work["maturity"]),
             "acceptance": list(work["acceptance"]),
             "non_goals": list(work["non_goals"]),
@@ -17286,6 +17744,8 @@ class ControlPlane:
                     safe_payload[field] = dict(value)
                 elif isinstance(value, (str, int)) and not isinstance(value, bool):
                     safe_payload[field] = value
+            if isinstance(payload.get("worker_purpose"), Mapping):
+                safe_payload["worker_purpose"] = dict(payload["worker_purpose"])
             message_kind = str(message.get("kind") or "")
             text_fields: tuple[str, ...] = ()
             if message_kind == MessageKind.ASSIGNMENT.value:
@@ -18179,7 +18639,12 @@ class ControlPlane:
             return dict(row)
 
     def mark_message_handled(
-        self, actor: dict[str, Any], message_id: str, *, evidence: str
+        self,
+        actor: dict[str, Any],
+        message_id: str,
+        *,
+        evidence: str,
+        expected_purpose_version: int | None = None,
     ) -> dict[str, Any]:
         if actor.get("_cao_runtime_credential_id") or actor.get("_cao_conversation_credential_id"):
             self._require_role(actor, PrincipalRole.CAO)
@@ -18245,6 +18710,17 @@ class ControlPlane:
                         "supervisor boundary must be disposed before its message is handled",
                         boundary_id=boundary_id,
                     )
+            if (
+                not boundary_id
+                and actor.get("role") == PrincipalRole.CAO.value
+                and message["work_item_id"]
+            ):
+                work = self._require_authorized_work_tx(
+                    connection, actor, str(message["work_item_id"])
+                )
+                self._confirm_work_purpose_tx(
+                    connection, str(actor["id"]), work, expected_purpose_version, "handle_report"
+                )
             connection.execute(
                 """
                 UPDATE message_deliveries
@@ -18490,7 +18966,7 @@ class ControlPlane:
                 report_kind=request.kind,
                 now=now,
             )
-            self._handle_status_requests_from_report_tx(
+            answered_status_request = self._handle_status_requests_from_report_tx(
                 connection,
                 actor_id=actor["id"],
                 runtime_id=expected_runtime_id,
@@ -18620,6 +19096,10 @@ class ControlPlane:
                     ),
                 )
             kind = MessageKind(request.kind.value)
+            first_execution_start = request.progress_event == "execution_started" and connection.execute(
+                "SELECT 1 FROM events WHERE event_type = 'attempt.execution_started' AND aggregate_id = ? LIMIT 1",
+                (attempt_id,),
+            ).fetchone() is None
             payload = {
                 "summary": request.summary,
                 "trajectory": trajectory,
@@ -18629,6 +19109,7 @@ class ControlPlane:
                 "artifacts": artifact_views,
                 "incorporated_message_ids": list(request.incorporated_message_ids),
                 "boundary_id": boundary["id"] if boundary else None,
+                **({"progress_event": request.progress_event} if request.progress_event else {}),
             }
             message = self._message(
                 connection,
@@ -18642,16 +19123,17 @@ class ControlPlane:
                 idempotency_key=(
                     f"report:{request.idempotency_key}" if request.idempotency_key else ""
                 ),
-                # Every meaningful Worker report wakes the exact immutable CAO
-                # conversation selected at delegation.  Deliveries remain
-                # individual durable facts: each lane head owns one CAO turn,
-                # and only after that exact Delivery is handled may the next
-                # Delivery be queued.  A turn must never drain a later message
-                # whose own native wake can already be admitted.  An artifact-
-                # only report remains history/read-model input and does not
-                # autonomously resume the model.
-                create_delivery=request.kind != ReportKind.ARTIFACT,
+                # Keep routine progress/artifacts in history without invoking
+                # CAO. An explicit status ask still receives one solicited reply;
+                # only decision boundaries transfer Work attention to CAO.
+                create_delivery=needs_disposition or answered_status_request or first_execution_start,
             )
+            if first_execution_start:
+                self._event(
+                    connection, "attempt.execution_started", "attempt", attempt_id,
+                    actor["id"], {"message_id": message["id"], "source": "worker_report"},
+                    causation_id=message["id"],
+                )
             self._event(
                 connection,
                 f"attempt.{request.kind.value}",
@@ -18855,11 +19337,11 @@ class ControlPlane:
         attempt_id: str,
         report_kind: ReportKind,
         now: str,
-    ) -> None:
+    ) -> bool:
         """Treat a fenced Worker report as incorporation of prior status asks."""
 
         if report_kind == ReportKind.ARTIFACT:
-            return
+            return False
 
         rows = connection.execute(
             """
@@ -18905,6 +19387,7 @@ class ControlPlane:
                     },
                     causation_id=str(row["id"]),
                 )
+        return bool(rows)
 
     def request_status(
         self,
@@ -19066,7 +19549,7 @@ class ControlPlane:
               AND boundary.goal_version = ?
               AND boundary.goal_packet_digest = ?
               AND boundary.task_packet_digest = ?
-              AND boundary.source_principal_id = ?
+              AND boundary.source_principal_id IN (?, ?)
               AND disposition.generation = boundary.generation
               AND disposition.decided_by = ?
               AND turn.supervisor_id = disposition.decided_by
@@ -19086,6 +19569,7 @@ class ControlPlane:
                 source_attempt["goal_packet_digest"],
                 source_attempt["task_packet_digest"],
                 source_attempt["worker_id"],
+                actor_id,
                 actor_id,
             ),
         ).fetchone()
@@ -19183,6 +19667,7 @@ class ControlPlane:
         message_text: str,
         idempotency_key: str,
         request_digest: str,
+        expected_purpose_version: int | None = None,
     ) -> dict[str, Any]:
         """Resume an exact disposed WAIT_USER contract with requester input."""
 
@@ -19202,6 +19687,9 @@ class ControlPlane:
             )
             if cached is not None:
                 return cached
+            self._confirm_work_purpose_tx(
+                connection, str(actor["id"]), work, expected_purpose_version, "requester_reply"
+            )
             attempt = self._latest_attempt_tx(connection, work_id)
             if (
                 attempt is None
@@ -19227,19 +19715,32 @@ class ControlPlane:
                     reason_code="worker_command_binding_conflict",
                     retryable=False,
                 )
-            admission = self._admit_managed_worker_command_tx(
-                connection,
-                actor_id=str(actor["id"]),
-                kind="correct",
-                worker_id=str(attempt["worker_id"]),
-                supervisor_attachment_id=(
-                    str(work["supervisor_attachment_id"])
-                    if work["supervisor_attachment_id"]
-                    else None
-                ),
-                work=work,
-                previous_attempt=attempt,
-            )
+            admission: _ManagedWorkerCommandAdmission | None
+            recovery_action = str(boundary["recovery_action"] or "")
+            runtime_reconciliation = recovery_action == "reconcile_continue_same_thread"
+            if recovery_action in {"dispose_continue_or_correct", "reconcile_continue_same_thread"}:
+                admission = self._runtime_recovery_retry_target_tx(
+                    connection, work=work, attempt=attempt, boundary=boundary,
+                    reconcile_unknown=runtime_reconciliation,
+                )
+                self._retire_runtime_recovery_deliveries_tx(
+                    connection, actor_id=str(actor["id"]), attempt=attempt, boundary=boundary,
+                    runtime_reconciliation=runtime_reconciliation,
+                )
+            else:
+                admission = self._admit_managed_worker_command_tx(
+                    connection,
+                    actor_id=str(actor["id"]),
+                    kind="correct",
+                    worker_id=str(attempt["worker_id"]),
+                    supervisor_attachment_id=(
+                        str(work["supervisor_attachment_id"])
+                        if work["supervisor_attachment_id"]
+                        else None
+                    ),
+                    work=work,
+                    previous_attempt=attempt,
+                )
             now = utc_now()
             target_attempt = attempt
             generation = expected_generation
@@ -19254,7 +19755,7 @@ class ControlPlane:
                     command_kind="correct",
                     admission=admission,
                     command_context={
-                        "action": "correct",
+                        "action": "reconcile_continue" if runtime_reconciliation else "correct",
                         "reason": "Requester supplied the exact WAIT_USER decision",
                         "instruction": message_text,
                         "source_boundary_id": boundary_id,
@@ -19331,6 +19832,7 @@ class ControlPlane:
         message_text: str,
         turn_idempotency_key: str,
         legacy_context: bool,
+        expected_purpose_version: int | None = None,
     ) -> dict[str, Any]:
         """Own and CORRECT one Boundary inside the caller's transaction."""
 
@@ -19539,6 +20041,7 @@ class ControlPlane:
                 kind=BoundaryDispositionKind.CORRECT,
                 reason="Supervisor response to a recorded boundary",
                 instruction=message_text,
+                expected_purpose_version=expected_purpose_version,
             ),
             expected_work_item_id=str(work["id"]),
         )
@@ -19551,6 +20054,7 @@ class ControlPlane:
         message_text: str,
         *,
         in_reply_to: str | None = None,
+        expected_purpose_version: int | None = None,
         idempotency_key: str = "",
     ) -> dict[str, Any]:
         """Atomically answer one exact Boundary with a fenced CORRECT command."""
@@ -19562,6 +20066,11 @@ class ControlPlane:
                 "work_item_id": work_id,
                 "message": message_text,
                 "in_reply_to": in_reply_to,
+                **(
+                    {"expected_purpose_version": expected_purpose_version}
+                    if expected_purpose_version is not None
+                    else {}
+                ),
             }
         )
         if not message_text:
@@ -19589,6 +20098,7 @@ class ControlPlane:
             )
             if cached is not None:
                 return cached
+            confirm_work_purpose_tx(connection, work, expected_purpose_version)
             require_not_paused(work)
             attempt = self._latest_attempt_tx(connection, work_id)
             if attempt is None:
@@ -19601,6 +20111,15 @@ class ControlPlane:
                 "reply_context",
                 context_key,
                 request_digest,
+                compatible_request_digests=(
+                    _digest(
+                        {
+                            "work_item_id": work_id,
+                            "message": message_text,
+                            "in_reply_to": in_reply_to,
+                        }
+                    ),
+                ),
             )
             legacy_context = context is not None
             if context is None:
@@ -19689,6 +20208,7 @@ class ControlPlane:
                         else f"reply:{boundary_id}:{_digest(message_text)}"
                     ),
                     legacy_context=legacy_context,
+                    expected_purpose_version=expected_purpose_version,
                 )
                 self._idempotent_put(
                     connection,
@@ -19709,6 +20229,7 @@ class ControlPlane:
             message_text=message_text,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            expected_purpose_version=expected_purpose_version,
         )
 
     def review(self, actor: dict[str, Any], request: ReviewInput) -> dict[str, Any]:
@@ -19739,6 +20260,9 @@ class ControlPlane:
             )
             if cached is not None:
                 return cached
+            self._confirm_work_purpose_tx(
+                connection, str(actor["id"]), work, request.expected_purpose_version, "review"
+            )
             if request.verdict not in {
                 ReviewVerdict.OK,
                 ReviewVerdict.NEEDS_WORK,
@@ -19779,6 +20303,44 @@ class ControlPlane:
                 or not attempt["task_packet_digest"]
             ):
                 raise ConflictError("review targets a stale or partial task packet")
+            assignment_purpose = work_purpose_tx(connection, str(work["id"]), int(work["goal_version"]))
+            current_purpose = worker_purpose_tx(connection, str(work["managed_worker_thread_id"] or ""))
+            structured = bool(assignment_purpose and assignment_purpose.get("contract"))
+            if assignment_purpose != current_purpose and (
+                structured or (current_purpose and current_purpose.get("contract"))
+            ) and request.expected_assignment_purpose_version != (
+                assignment_purpose["version"] if assignment_purpose else None
+            ):
+                raise ConflictError(
+                    "Confirm the frozen assignment purpose before reviewing after a purpose change",
+                    reason_code="review_assignment_purpose_confirmation_required",
+                    assignment_purpose_version=assignment_purpose["version"] if assignment_purpose else None,
+                )
+            criteria = task_review_criteria(goal)
+            expected_ids = [criterion["id"] for criterion in criteria]
+            assessments = request.criterion_assessments
+            actual_ids = [assessment.criterion_id for assessment in assessments]
+            if (structured or assessments) and (
+                len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != set(expected_ids)
+            ):
+                raise ConflictError(
+                    "Review each frozen task criterion with evidence; do not add new criteria",
+                    reason_code="review_criteria_mismatch", expected_criterion_ids=expected_ids,
+                )
+            if assessments and (
+                (request.verdict == ReviewVerdict.OK and any(item.verdict != "met" for item in assessments))
+                or (request.verdict == ReviewVerdict.NEEDS_WORK and all(item.verdict == "met" for item in assessments))
+            ):
+                raise ConflictError("Review verdict contradicts the criterion assessments",
+                                    reason_code="review_criteria_verdict_conflict")
+            if any(item.get("kind") == "criterion_assessment" for item in request.evidence):
+                raise ValidationError("Use criterion_assessments for criterion evidence")
+            review_evidence = [*request.evidence, *({
+                "kind": "criterion_assessment", **item.model_dump(mode="json"),
+                "goal_version": int(work["goal_version"]),
+                "assignment_purpose_version": assignment_purpose["version"] if assignment_purpose else None,
+                "goal_packet_digest": str(attempt["goal_packet_digest"]),
+            } for item in assessments)]
             if request.verdict == ReviewVerdict.OK:
                 if (
                     open_completion_boundary is not None
@@ -19797,7 +20359,7 @@ class ControlPlane:
                         "source": "cao_reviewed_worker_output",
                         "output_id": str(captured["id"]),
                         "summary": request.summary,
-                        "evidence": request.evidence,
+                        "evidence": review_evidence,
                         "artifacts": _load(str(captured["artifact_manifest_json"]), []),
                         "artifact_manifest_scope": "verified_attempt_artifacts_v2",
                         "goal_packet_digest": str(attempt["goal_packet_digest"]),
@@ -19857,7 +20419,7 @@ class ControlPlane:
                     attempt["task_packet_digest"],
                     request.verdict.value,
                     request.summary,
-                    _json(request.evidence),
+                    _json(review_evidence),
                     now,
                 ),
             )
@@ -20060,6 +20622,13 @@ class ControlPlane:
             )
             if cached is not None:
                 return cached
+            self._confirm_work_purpose_tx(
+                connection,
+                str(actor["id"]),
+                work,
+                request.expected_purpose_version,
+                "requester_decision",
+            )
             if review["verdict"] != ReviewVerdict.OK.value:
                 raise ConflictError("requester decision requires an OK CAO review")
             goal = self._current_goal_tx(connection, work)
@@ -21807,6 +22376,13 @@ class ControlPlane:
         provider_source_boundary_id = self._provider_instruction_source_boundary_tx(
             connection, str(request.runtime_session_id)
         )
+        business_purpose = confirm_worker_purpose_tx(
+            connection,
+            admission.worker_thread_id
+            if admission is not None
+            else str(target["managed_worker_thread_id"] or ""),
+            request.expected_purpose_version,
+        )
         next_version = int(target["goal_version"]) + 1
         next_generation = int(target["generation"]) + 1
         preserve_suspension = target["state"] == WorkState.SUSPENDED.value
@@ -21826,6 +22402,7 @@ class ControlPlane:
         managed_task_policy = prior_goal_packet.get("managed_task_policy")
         if managed_task_policy is not None and not isinstance(managed_task_policy, Mapping):
             raise ConflictError("current goal task policy binding is malformed")
+        bind_work_purpose_tx(connection, str(target["id"]), next_version, business_purpose)
         goal_packet = build_goal_packet(
             work_item_id=str(target["id"]),
             version=next_version,
@@ -21852,6 +22429,7 @@ class ControlPlane:
             ),
             dependencies=[item.value for item in request.dependencies],
             managed_task_policy=managed_task_policy,
+            worker_purpose=business_purpose,
         )
         goal_digest = goal_packet_digest(goal_packet)
         self._fence_reasoner_turns_tx(connection, str(target["id"]))
@@ -21909,6 +22487,11 @@ class ControlPlane:
             connection.execute(
                 "UPDATE attempts SET state = ?, updated_at = ? WHERE id = ?",
                 (AttemptState.CANCELED.value, now, previous["id"]),
+            )
+        if admission is not None and admission.queue_only:
+            self._dead_letter_terminal_worker_deliveries_tx(
+                connection, thread_id=admission.worker_thread_id,
+                principal_id=request.worker_id, actor_id=actor_id,
             )
         attempt_id = _id("att")
         task_packet = build_task_packet(
@@ -22246,6 +22829,12 @@ class ControlPlane:
                     "managed runtime selection does not match the exact admitted route",
                     reason_code="managed_runtime_selection_conflict",
                 )
+        business_purpose = confirm_worker_purpose_tx(
+            connection,
+            admission.worker_thread_id if admission is not None else "",
+            request.expected_purpose_version,
+            required=admission is not None,
+        )
         runtime_session_id = (
             admission.runtime_session_id
             if admission is not None
@@ -22281,6 +22870,7 @@ class ControlPlane:
         now = utc_now()
         acceptance = [item.strip() for item in request.acceptance if item.strip()]
         non_goals = [item.strip() for item in request.non_goals if item.strip()]
+        bind_work_purpose_tx(connection, work_id, 1, business_purpose)
         goal_packet = build_goal_packet(
             work_item_id=work_id,
             version=1,
@@ -22303,6 +22893,7 @@ class ControlPlane:
             supervisor_attachment=supervisor_attachment,
             dependencies=[item.value for item in request.dependencies],
             managed_task_policy=managed_task_policy,
+            worker_purpose=business_purpose,
         )
         goal_digest = goal_packet_digest(goal_packet)
         task_packet = build_task_packet(
@@ -22862,6 +23453,84 @@ class ControlPlane:
         self._resume_interrupted_target_tx(connection, str(work["id"]), actor_id)
         return self._work_bundle_tx(connection, str(work["id"]))
 
+    def _retire_runtime_recovery_deliveries_tx(
+        self, connection: sqlite3.Connection, *, actor_id: str,
+        attempt: sqlite3.Row, boundary: sqlite3.Row, runtime_reconciliation: bool,
+    ) -> None:
+        """Retire only the exact deliveries whose recovery proof was just verified."""
+        now = utc_now()
+        superseded_deliveries = connection.execute(
+            """
+            SELECT delivery.message_id, delivery.recipient_id,
+                   delivery.runtime_session_id, delivery.generation,
+                   delivery.state, delivery.last_error
+            FROM message_deliveries AS delivery
+            JOIN messages AS message
+              ON message.id = delivery.message_id
+            WHERE message.attempt_id = ?
+              AND delivery.recipient_id = ?
+              AND delivery.runtime_session_id = ?
+              AND delivery.state IN ('queued', 'leased', 'dispatched')
+            ORDER BY message.sequence, delivery.recipient_id
+            """,
+            (
+                attempt["id"],
+                attempt["worker_id"],
+                attempt["runtime_session_id"],
+            ),
+        ).fetchall()
+        for delivery in superseded_deliveries:
+            updated_delivery = connection.execute(
+                """
+            UPDATE message_deliveries
+            SET state = 'dead', next_attempt_at = ?,
+                lease_until = NULL, owner_token = '',
+                last_error = ?, updated_at = ?
+            WHERE message_id = ? AND recipient_id = ?
+              AND runtime_session_id = ? AND generation = ?
+              AND state = ?
+                """,
+                (
+                    now,
+                    (
+                        "runtime_reconciliation_superseded"
+                        if runtime_reconciliation
+                        else "runtime_recovery_superseded"
+                    ),
+                    now,
+                    delivery["message_id"],
+                    delivery["recipient_id"],
+                    delivery["runtime_session_id"],
+                    delivery["generation"],
+                    delivery["state"],
+                ),
+            ).rowcount
+            if updated_delivery != 1:
+                raise ConflictError(
+                    "managed runtime recovery delivery changed",
+                    reason_code="worker_instruction_outcome_unknown",
+                    recovery_state="system_reconciliation_required",
+                    retryable=False,
+                )
+            prior_error = str(delivery["last_error"] or "")
+            self._event(
+                connection,
+                "message.delivery_superseded",
+                "message",
+                str(delivery["message_id"]),
+                actor_id,
+                {
+                    "reason_code": (
+                        "runtime_reconciliation_superseded"
+                        if runtime_reconciliation
+                        else "runtime_recovery_superseded"
+                    ),
+                    "prior_state": str(delivery["state"]),
+                    **({"provider_failure_code": prior_error} if prior_error else {}),
+                },
+                causation_id=str(boundary["id"]),
+            )
+
     def _runtime_recovery_retry_target_tx(
         self,
         connection: sqlite3.Connection,
@@ -22886,6 +23555,14 @@ class ControlPlane:
                 recovery_state="system_reconciliation_required",
                 retryable=False,
             )
+
+        requester_continuation = work["state"] == WorkState.USER_NEEDED.value
+        if requester_continuation:
+            current_wait = self._current_user_needed_boundary_tx(
+                connection, actor_id=str(work["supervisor_id"]), work=work, source_attempt=attempt,
+            )
+            if current_wait is None or current_wait["id"] != boundary["id"]:
+                outcome_unknown("requester continuation does not own this recovery boundary")
 
         metadata = _load(boundary["metadata_json"], {})
         reason = str(metadata.get("reason", ""))
@@ -22947,7 +23624,7 @@ class ControlPlane:
                    attempt.worker_id, attempt.runtime_session_id,
                    attempt.state AS attempt_state,
                    work.goal_version, work.state AS work_state,
-                   work.attention_owner,
+                   work.attention_owner, work.user_needed_boundary_id,
                    work.generation AS work_generation,
                    work.managed_worker_thread_id,
                    work.managed_worker_thread_generation
@@ -22970,6 +23647,7 @@ class ControlPlane:
                     connection,
                     proof,
                     reason=reason,
+                    requester_continuation=requester_continuation,
                 )
             ):
                 outcome_unknown("post-MCP reconciliation proof no longer matches")
@@ -22980,6 +23658,7 @@ class ControlPlane:
                 connection,
                 proof,
                 reason=reason,
+                requester_continuation=requester_continuation,
             )
         ):
             outcome_unknown("same-thread recovery proof no longer matches")
@@ -23632,6 +24311,7 @@ class ControlPlane:
         value.pop("user_needed_boundary_id", None)
         value["metadata"] = _load(value.pop("metadata_json"), {})
         value["supervision_pause"] = pause_view_tx(connection, work)
+        value["requester_escalation"] = requester_escalation_tx(connection, work)
         revisions = connection.execute(
             "SELECT * FROM goal_revisions WHERE work_item_id = ? ORDER BY version",
             (work_id,),
@@ -23649,6 +24329,10 @@ class ControlPlane:
             revision.pop("acceptance_json", None)
             revision.pop("non_goals_json", None)
             revision.pop("packet_json", None)
+            if revision["packet"].get("worker_purpose") != work_purpose_tx(
+                connection, work_id, int(revision["version"])
+            ):
+                raise RuntimeError("work item business purpose binding is invalid")
             if goal_packet_digest(revision["packet"]) != revision["packet_digest"]:
                 raise RuntimeError("work item goal packet digest is invalid")
         value["goal_revisions"] = list(value["goal_history"])
@@ -23663,6 +24347,19 @@ class ControlPlane:
         if current_goal is None:
             raise RuntimeError("work item current goal pointer is invalid")
         value["objective"] = current_goal["objective"]
+        value["instruction"] = current_goal["objective"]
+        value["worker_purpose"] = worker_purpose_tx(
+            connection, str(work["managed_worker_thread_id"] or "")
+        )
+        value["assignment_purpose"] = work_purpose_tx(
+            connection, work_id, int(work["goal_version"])
+        )
+        value["purpose_changed_since_assignment"] = (
+            value["worker_purpose"] != value["assignment_purpose"]
+        )
+        value["purpose_alignment"] = purpose_alignment(value["worker_purpose"], value["assignment_purpose"])
+        value["review_criteria"] = task_review_criteria(current_goal)
+        value["supervision_guidance"] = PURPOSE_GUIDANCE
         value["maturity"] = current_goal["maturity"]
         value["acceptance"] = list(current_goal["acceptance"])
         value["non_goals"] = list(current_goal["non_goals"])
@@ -23691,6 +24388,9 @@ class ControlPlane:
                 (work_id,),
             ).fetchall()
         ]
+        value["current_worker_outputs"] = current_output_views_tx(
+            connection, work_id, str(attempts[-1]["id"]) if attempts else ""
+        )
         value["delivery_state"] = self._completion_delivery_state_tx(
             connection,
             contract=completion_contract,
@@ -24061,6 +24761,10 @@ class ControlPlane:
                 "response_due_at": response_due_at,
                 "responded_at": (str(response["created_at"]) if response is not None else ""),
             }
+        execution_start = connection.execute(
+            "SELECT created_at, data_json FROM events WHERE event_type = 'attempt.execution_started' "
+            "AND aggregate_id = ? ORDER BY sequence LIMIT 1", (attempt["id"],),
+        ).fetchone()
         return {
             "runtime_heartbeat_at": (
                 str(runtime["heartbeat_at"] or "") if runtime is not None else ""
@@ -24070,6 +24774,11 @@ class ControlPlane:
             ),
             "last_artifact_at": (str(artifact["created_at"]) if artifact is not None else ""),
             "status_request": status_request,
+            "execution_start": ({
+                "reported_at": str(execution_start["created_at"]),
+                "message_id": _load(execution_start["data_json"], {}).get("message_id"),
+                "source": "worker_report",
+            } if execution_start is not None else None),
         }
 
     @staticmethod
@@ -24753,8 +25462,8 @@ class ControlPlane:
         )
         if not recipients:
             raise ValidationError("message requires at least one recipient")
-        if not create_delivery and kind != MessageKind.ARTIFACT:
-            raise ValidationError("only an artifact-only Worker report may omit delivery")
+        if not create_delivery and kind not in {MessageKind.ARTIFACT, MessageKind.PROGRESS}:
+            raise ValidationError("only an informational Worker report may omit delivery")
         goal_digest_value = ""
         task_digest_value = ""
         bound_runtime_session_id = runtime_session_id
@@ -24774,7 +25483,7 @@ class ControlPlane:
             goal_digest_value = str(goal["packet_digest"])
             work_binding = connection.execute(
                 "SELECT COALESCE(supervisor_id, created_by) AS supervisor_id, "
-                "supervisor_attachment_id FROM work_items WHERE id = ?",
+                "supervisor_attachment_id, managed_worker_thread_id FROM work_items WHERE id = ?",
                 (work_item_id,),
             ).fetchone()
             if work_binding is None:
@@ -24812,6 +25521,16 @@ class ControlPlane:
                     raise ConflictError(f"message {field} does not match the durable packet")
                 if expected:
                     payload[field] = expected
+        if kind == MessageKind.ASSIGNMENT and work_item_id and goal_version is not None:
+            purpose = worker_purpose_tx(
+                connection, str(work_binding["managed_worker_thread_id"] or "")
+            )
+            if purpose is not None:
+                if "worker_purpose" in payload and payload["worker_purpose"] != purpose:
+                    raise ConflictError(
+                        "Assignment business purpose does not match the current Worker"
+                    )
+                payload = {**payload, "worker_purpose": purpose}
         payload_digest = _digest(payload)
         message_digest = _digest(
             {

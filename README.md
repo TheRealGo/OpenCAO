@@ -75,6 +75,9 @@ truth.
 - bounded concurrent runtime dispatch with leases, safe pre-dispatch retries, outcome-unknown fencing, and dead-delivery visibility
 - managed Codex App Server and Claude Code Workers with scoped MCP enrollment
 - separate exact/standing effect grants with unresolved-outcome protection
+- versioned Worker business purposes and fixed acceptance evidence across task revisions
+- queued task revision, durable notification reconciliation and bounded state reads
+- owner-local preference capture tools with private feedback receipts
 
 ## Install on macOS with Codex Desktop
 
@@ -151,9 +154,15 @@ In your existing Codex conversation, ask CAO to use this sequence:
 2. Use `cao_new_worker_thread` with the existing project directory you selected.
    The default runner is Codex. Private placement configuration is generated
    locally on first use; no author's workspace registry is needed.
-3. Give that exact `worker_thread_id` a bounded objective using
-   `cao_instruct_worker_thread`. Provide acceptance conditions and scope limits.
-4. Read the full Worker result, perform CAO review, and record your acceptance
+3. Define the Worker's business purpose with `cao_set_worker_purpose`, including
+   its target outcome, acceptance evidence, scope, completion condition, authority
+   and action when outcomes remain unmet (`contract.unmet_action`).
+   Use `expected_purpose_version=0` for a new Worker.
+4. Give that exact `worker_thread_id` a bounded instruction using
+   `cao_instruct_worker_thread` and the current `expected_purpose_version`.
+   Provide acceptance conditions and scope limits. To revise an unclaimed queued
+   task, use `cao_revise_task`; this preserves executing Work and its evidence.
+5. Read the full Worker result, perform CAO review, and record your acceptance
    separately. Finish or delete the exact disposable Worker when appropriate.
 
 For a first check, use an empty directory and ask a Worker to reply with one

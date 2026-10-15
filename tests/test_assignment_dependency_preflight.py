@@ -107,6 +107,14 @@ class _CAOWakeAdapter:
         # a semantic-recovery wake for an intentionally incomplete fake turn.
         self.service.acknowledge(actor, AckInput(message_ids=[str(message["id"])]))
         work = self.service.get_work(str(message["work_item_id"]))
+        if message["payload"].get("action") == "requester_escalation":
+            self.service.mark_message_handled(
+                actor, str(message["id"]), evidence="Simulated requester presentation completed.",
+            )
+            return RuntimeDispatchResult(
+                success=True, native_session_id=str(runtime["native_session_id"]),
+                state=RuntimeState.READY, output="fake attached CAO presented consultation",
+            )
         boundary_id = str(message["payload"]["boundary_id"])
         turn = self.service.acquire_reasoner_turn(
             actor,
@@ -122,7 +130,9 @@ class _CAOWakeAdapter:
                 turn_id=turn["id"],
                 lease_token=turn["lease_token"],
                 expected_generation=int(work["generation"]),
-                kind=BoundaryDispositionKind.FAIL,
+                kind=BoundaryDispositionKind.WAIT_USER,
+                instruction="Advise how to resolve the unavailable prerequisite.",
+                resume_condition="The prerequisite is available and continuation is safe.",
                 reason="The fake CAO turn recorded the unavailable prerequisite.",
             ),
         )
@@ -263,6 +273,13 @@ def test_failed_dependency_is_unstarted_one_shot_and_wakes_exact_cao(system, out
         == 1
     )
     assert build_projection(service.db).healthy is True
+    assert asyncio.run(dispatcher.run_once()) == 1
+    assert len(cao_adapter.calls) == 2
+    assert cao_adapter.calls[1]["message"]["payload"]["action"] == "requester_escalation"
+    escalated = service.get_work(work["id"])
+    assert escalated["state"] == "user_needed"
+    assert escalated["requester_escalation"]["notification_state"] == "handled"
+    assert calls == ["docker_api_ping"] and adapter.deliveries == []
     assert not _sink_contains(service, "owner-private-locator-sentinel")
     assert not _sink_contains(service, "HTTP 000")
 

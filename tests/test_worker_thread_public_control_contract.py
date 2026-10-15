@@ -15,6 +15,7 @@ from cao_control_plane.models import (
     ResumeWorkerThreadInput,
 )
 from cao_control_plane.service import ControlPlane
+from cao_control_plane.worker_purpose import PURPOSE_GUIDANCE
 
 PROTOCOLS = Path(__file__).resolve().parents[1] / "docs" / "protocols.md"
 
@@ -177,9 +178,12 @@ def test_models_keep_three_goal_maturities_and_resume_has_no_task_shape() -> Non
         )
 
 
-def test_new_instruction_resume_and_list_projections_are_privacy_safe() -> None:
+def test_new_instruction_resume_and_list_projections_are_privacy_safe(monkeypatch: pytest.MonkeyPatch) -> None:
     service = WorkerControlContractService()
     server = MCPServer(service)  # type: ignore[arg-type]
+    # This service double isolates DTO projection; durable read admission is
+    # exercised against a real ControlPlane in its behavior regressions.
+    monkeypatch.setattr(server._state_reads, "reserve", lambda *args: None)
 
     created = server.call_tool(
         _actor(),
@@ -261,6 +265,8 @@ def test_new_instruction_resume_and_list_projections_are_privacy_safe() -> None:
                 "reasoning_effort": "high",
                 "state": "active",
                 "worker_thread_id": "wth_public",
+                "worker_purpose": None,
+                "supervision_guidance": PURPOSE_GUIDANCE,
                 "generation": 1,
                 "assignment_readiness": "not_connected",
                 "connection_state": "disconnected",

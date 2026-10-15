@@ -79,6 +79,7 @@
     "user-action-required": "依頼者の対応が必要",
     "cao-action-required": "CAOの対応が必要",
     "cao-processing": "CAOが自動処理中",
+    "cao-connection-required": "CAOの接続更新待ち",
     "external-action-required": "外部対応待ち",
     "progress-at-risk": "進捗に注意が必要",
     "awaiting-explicit-close": "完了確認・終了処理待ち",
@@ -137,6 +138,7 @@
     scheduled: "CAO自動処理を予約済み",
     active: "CAO処理中",
     unscheduled: "自動処理が未起動（異常）",
+    connection_required: "CAOの接続更新待ち",
   }[value] || null);
 
   function reportMeta(item) {
@@ -206,6 +208,7 @@
     if (item.state === "suspended") return "中断中";
     if (item.state === "canceled") return "終了済み · 記録を保持";
     if (item.state === "failed") return "失敗した作業の記録";
+    if (item.cao_supervision_state === "connection_required") return "CAOの接続更新待ち";
     if (item.cao_supervision_state === "active") return "CAOが確認・判断中";
     if (item.cao_supervision_state === "scheduled") return "CAOの自動処理待ち";
     return { user: "あなたの回答・判断が必要", cao: "CAOの確認・判断が必要",
@@ -225,7 +228,11 @@
       ? ["CAOレビュー済み", localTimestamp(item.completed_at)].filter(Boolean).join(" · ")
       : (actionLabel(item) || "作業の記録");
     work.append(status);
-    appendReadable(work, "目的", item.objective_text || item.objective_summary, `${key}:objective`);
+    if (item.purpose_text) {
+      appendReadable(work, "指示時の業務目的", item.purpose_text, `${key}:purpose`);
+    }
+    appendReadable(work, "今回の指示", item.instruction_text || item.instruction_summary
+      || item.objective_text || item.objective_summary, `${key}:instruction`);
     appendReadable(work, "最新のWorker報告", item.latest_report_text || item.latest_report_summary,
       `${key}:report`, reportMeta(item));
     if (!item.latest_report_text && !item.latest_report_summary && item.latest_reported_at) {
@@ -244,6 +251,12 @@
       if (item.supervision_pause) {
         appendKnown(current, "中断の理由", item.supervision_pause.reason);
         appendKnown(current, "再開の条件", item.supervision_pause.resume_condition);
+      }
+      if (item.requester_escalation) {
+        appendKnown(current, "指示者への相談", item.requester_escalation.decision);
+        appendKnown(current, "進められない理由", item.requester_escalation.reason);
+        appendKnown(current, "続行に必要なこと", item.requester_escalation.resume_condition);
+        appendKnown(current, "相談通知の配送", recoveryNotificationLabel(item.requester_escalation.notification_state));
       }
     }
     if (["ready", "delivery_missing"].includes(item.delivery_state)) {
@@ -306,6 +319,9 @@
     row.className = "worker-card";
     heading.textContent = text(item.worker_label, "Worker");
     row.append(heading);
+    appendReadable(row, "業務の目的", item.purpose_text || (item.purpose_status === "invalid"
+      ? "業務の目的の記録を確認できません。" : "業務の目的は未登録です。"),
+      `worker:${item.worker_label}:purpose`);
     const attentionText = attentionReasonLabel(item.attention_reason);
     if (attentionText) {
       const attention = document.createElement("p");
@@ -433,7 +449,7 @@
   }
 
   const exchangeLabel = (kind) => ({
-    goal: "CAO · 目的", instruction: "CAO · 指示", review: "CAO · レビュー",
+    goal: "CAO · 今回の指示", instruction: "CAO · 指示", review: "CAO · レビュー",
     requester_decision: "依頼者 · 判断", decision: "CAO · 判断",
     progress: "Worker · 進捗報告", question: "Worker · 質問", blocker: "Worker · 停止要因",
     artifact: "Worker · 成果物報告", completion_claim: "Worker · 完了申告",

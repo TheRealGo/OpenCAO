@@ -143,6 +143,20 @@ def test_older_nonadjacent_memory_is_recalled_amid_unrelated_later_entries(memor
     assert [row["memory_id"] for row in result["memories"]] == [original["memory_id"]]
 
 
+def test_japanese_recall_matches_abstraction_across_sentence_boundaries(memory_case) -> None:
+    case = memory_case
+    memory = _remember(
+        case,
+        primary_abstraction="訂正と不満をその場で保存する",
+        cue_anchors=["明示された好みや訂正を受けたとき"],
+        value="原本を確認するという規則。この詳細固有語は検索に使わない。",
+    )
+    result = _search(case, "不満を示したら訂正を保存して")
+    assert [row["memory_id"] for row in result["memories"]] == [memory["memory_id"]]
+    assert _search(case, "詳細固有語")["memories"] == []
+    assert _search(case, "実行したら報告して")["memories"] == []
+
+
 def test_full_unicode_value_is_paginated_without_display_truncation_or_output_read(
     memory_case,
 ) -> None:
