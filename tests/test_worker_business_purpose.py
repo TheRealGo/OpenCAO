@@ -36,6 +36,7 @@ from cao_control_plane.models import (
 from cao_control_plane.projection import build_projection
 from cao_control_plane.runtime import render_message
 from cao_control_plane.service import ControlPlane
+from cao_control_plane.worker_purpose import ALLOCATION_GUIDANCE, PURPOSE_AUTHORING_GUIDANCE
 
 PURPOSE = "利用状況や要件の変化を通じて、サービスの信頼性を保つ。"
 
@@ -168,7 +169,7 @@ def test_purpose_definition_requires_current_cao_authority_and_safe_business_tex
         with pytest.raises(AuthorizationError):
             _purpose(service, unauthorized, ids)
     with pytest.raises((AuthorizationError, ValidationError)):
-        _purpose(service, cao, ids, text="Read /Users/example/credentials.txt")
+        _purpose(service, cao, ids, text="Read /Users/owner/credentials.txt")
     assert service.db.fetchone("SELECT COUNT(*) AS n FROM worker_purpose_revisions")["n"] == 0
     _purpose(service, cao, ids)
     service.close_cao_conversation(
@@ -228,6 +229,28 @@ def _disposition(work, turn, *, version=1, kind="accept"):
     )
 
 
+def test_allocation_judgment_reaches_worker_work_and_next_decision_context(system):
+    service, cao, ids, _, work = _reported(system)
+    server = MCPServer(service)
+    worker = next(
+        item for item in server.call_tool(cao, "cao_list_managed_workers", {})["workers"]
+        if item["worker_thread_id"] == ids["thread_id"]
+    )
+    current = server.call_tool(cao, "cao_get_work", {"work_item_id": work["id"]})
+    turn = server.call_tool(cao, "cao_acquire_reasoner_turn", {
+        "work_item_id": work["id"],
+        "boundary_id": work["open_boundaries"][0]["id"],
+        "expected_generation": work["generation"],
+        "idempotency_key": "allocation-context-next-decision",
+    })
+    for context in (worker, current, turn):
+        assert ALLOCATION_GUIDANCE in context["supervision_guidance"]
+        assert PURPOSE_AUTHORING_GUIDANCE in context["supervision_guidance"]
+        assert "compares native requester direction" not in context["supervision_guidance"]
+        assert "CAO-only next decisions do not invoke another AI" in context["supervision_guidance"]
+        assert context["worker_purpose"] == work["worker_purpose"]
+
+
 def test_completion_reviews_current_purpose_but_never_completes_or_replaces_it(system):
     service, cao, ids, worker, work = _reported(system)
     purpose = work["worker_purpose"]
@@ -260,7 +283,14 @@ def test_completion_reviews_current_purpose_but_never_completes_or_replaces_it(s
         service.review(cao, review)
     assert raised.value.details["reason_code"] == "worker_purpose_version_conflict"
     assert service.db.fetchone("SELECT COUNT(*) AS n FROM reviews")["n"] == 0
-    result = service.review(cao, review.model_copy(update={"expected_purpose_version": 2}))
+    successor = _instruction(service, cao, ids, "Investigate the next reliability risk.", version=2)
+    from cao_control_plane.models import CheckpointNextInput
+    result = service.review(cao, review.model_copy(update={
+        "expected_purpose_version": 2,
+        "next_action": CheckpointNextInput(kind="continue", reason="The enduring purpose continues.",
+            evidence="The completed measurement informs the next reliability investigation.",
+            next_work_item_id=successor["id"]),
+    }))
     current = service.get_work(work["id"], cao)
     decision = RequesterDecisionInput(
         review_id=current["reviews"][-1]["id"],
@@ -276,9 +306,7 @@ def test_completion_reviews_current_purpose_but_never_completes_or_replaces_it(s
     assert final["worker_purpose"] == revised
     assert final["assignment_purpose"] == purpose
     assert (
-        _instruction(service, cao, ids, "Investigate the next reliability risk.", version=2)[
-            "worker_purpose"
-        ]
+        successor["worker_purpose"]
         == revised
     )
     checks = service.db.fetchall(
@@ -414,7 +442,8 @@ def test_schema46_upgrade_does_not_invent_a_purpose_or_change_legacy_packet_dige
 def test_legacy_progress_handling_still_confirms_purpose(system, legacy_progress_wakes):
     service, cao, ids, _worker_actor, _work = _reported(system, kind="progress")
     message = next(m for m in service.get_inbox(cao)["items"] if m["kind"] == "progress")
-    prompt = render_message(message)
+    [exact] = service.get_inbox(cao, message_id=message["id"])["items"]
+    prompt = exact["processing_instructions"]
     assert "cao_get_work.worker_purpose" in prompt
     service.acknowledge(cao, AckInput(message_ids=[message["id"]]))
     _purpose(service, cao, ids, text="Preserve service reliability during growth.", version=1)

@@ -8,14 +8,18 @@ after restart; no second queue or synthetic supervision receipt is necessary.
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 from typing import TYPE_CHECKING, Any
 
+from . import purpose_continuation
 from .database import utc_now
 from .delivery_lane import (
     cao_informational_wake_sql,
     cao_superseding_boundary_sql,
     codex_delivery_client_id,
 )
+from .errors import NotFoundError
 
 QUEUE_FAILURE_CODES = frozenset({
     "provider_timeout", "provider_authorization_failed", "queue_runtime_unavailable",
@@ -26,12 +30,35 @@ if TYPE_CHECKING:
     from .service import ControlPlane
 
 
+def _purpose_wake_decided_tx(connection: sqlite3.Connection, message: dict[str, Any]) -> bool:
+    if message["kind"] != "system":
+        return False
+    try:
+        payload = json.loads(message["payload_json"])
+        if payload.get("action") != "purpose_continuation":
+            return False
+        current = purpose_continuation.get_tx(connection, payload["purpose_continuation_id"])
+        return (
+            current["attachment_id"] == message["attachment_id"]
+            and current["worker_thread_id"] == payload["worker_thread_id"]
+            and current["purpose_version"] == payload["purpose_version"]
+            and (
+                current["generation"] > payload["continuation_generation"]
+                or current["state"] in {
+                    "assigned", "waiting", "user_needed", "achieved", "paused", "superseded"
+                }
+            )
+        )
+    except (KeyError, TypeError, ValueError, NotFoundError):
+        return False
+
+
 def obsolete_queue_notifications(service: ControlPlane) -> dict[str, list[dict[str, Any]]]:
     """Select only exact, confirmed native queue admissions safe to retract.
 
     A delivered informational wake remains untouched here. Only a successful
     provider deletion may supersede it; absence is never consumption evidence.
-    Unknown dispatches, unclaimed inputs and decision notifications remain fenced.
+    Unknown dispatches, unclaimed inputs and pending decisions remain fenced.
     """
     if not service.db.is_canonical_authority():
         return {}
@@ -69,6 +96,9 @@ def obsolete_queue_notifications(service: ControlPlane) -> dict[str, list[dict[s
                 OR (d.state IN ('delivered', 'acknowledged')
                     AND {cao_informational_wake_sql("m")}
                     AND ({cao_superseding_boundary_sql("m", "d")}) IS NOT NULL)
+                OR (d.state IN ('delivered', 'acknowledged')
+                    AND m.kind = 'system' AND json_valid(m.payload_json)
+                    AND json_extract(m.payload_json, '$.action') = 'purpose_continuation')
               )
             ORDER BY m.sequence
             """
@@ -76,6 +106,12 @@ def obsolete_queue_notifications(service: ControlPlane) -> dict[str, list[dict[s
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             value = dict(row)
+            if (
+                value["delivery_state"] in {"delivered", "acknowledged"}
+                and value["superseding_id"] is None
+                and not _purpose_wake_decided_tx(connection, value)
+            ):
+                continue
             value["message"] = service._message_view(row, connection=connection)
             value["client_user_message_id"] = codex_delivery_client_id(str(row["id"]))
             grouped.setdefault(str(row["attachment_id"]), []).append(value)
@@ -165,13 +201,14 @@ def record_queue_removal(
                 causation_id=str(candidate["id"]),
             )
             return
+        purpose_decided = _purpose_wake_decided_tx(connection, candidate)
         # Handled/dead state is already terminal. Preserve every timestamp,
         # generation, error, ACK, Review and disposition in those records.
         changed = connection.execute(
             f"""UPDATE message_deliveries AS d
                 SET state = 'dead', reactivation_policy = 'terminal', owner_token = '',
                     lease_until = NULL, updated_at = ?,
-                    last_error = 'cao_progress_wake_superseded_by_boundary'
+                    last_error = ?
                 WHERE d.message_id = ? AND d.recipient_id = ? AND d.generation = ?
                   AND d.recipient_attachment_id = ?
                   AND EXISTS (SELECT 1 FROM cao_session_attachments AS attachment
@@ -180,16 +217,19 @@ def record_queue_removal(
                       AND attachment.generation = ?)
                   AND d.state IN ('delivered', 'acknowledged')
                   AND EXISTS (SELECT 1 FROM messages AS m WHERE m.id = d.message_id
-                    AND {cao_informational_wake_sql("m")}
-                    AND ({cao_superseding_boundary_sql("m", "d")}) IS NOT NULL)
+                    AND (({cao_informational_wake_sql("m")}
+                          AND ({cao_superseding_boundary_sql("m", "d")}) IS NOT NULL)
+                         OR ?))
             """,
             (
                 now,
+                "cao_purpose_wake_decided" if purpose_decided else "cao_progress_wake_superseded_by_boundary",
                 candidate["id"],
                 candidate["recipient_id"],
                 candidate["delivery_generation"],
                 candidate["attachment_id"],
                 candidate["attachment_generation"],
+                purpose_decided,
             ),
         ).rowcount
         service._event(
@@ -206,7 +246,7 @@ def record_queue_removal(
                 "reason_code": (
                     "terminal_delivery"
                     if candidate["delivery_state"] in {"handled", "dead"}
-                    else "superseded_information"
+                    else "purpose_decided" if purpose_decided else "superseded_information"
                 ),
                 "delivery_superseded": bool(changed),
                 "superseding_message_id": candidate.get("superseding_id"),

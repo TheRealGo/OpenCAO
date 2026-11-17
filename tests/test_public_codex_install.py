@@ -65,7 +65,16 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
     workspace.mkdir()
     setup_local(config_path=config, state_dir=state, port=cp_port, dashboard_port=edge_port)
     settings = Settings.load(config)
-    native_thread = asyncio.run(_create_persisted_native_cao_thread(cwd=workspace))
+    native_thread = asyncio.run(_create_persisted_native_cao_thread(
+        cwd=workspace,
+        requester_prompt=(
+            "This is a disposable installation check. Authorize one Worker to reply exactly "
+            "PUBLIC_CODEX_INSTALL_OK without reading or writing files, running commands, or "
+            "accessing external services. Its purpose is to establish that the installation "
+            "delivers and preserves the exact response. Accept only that complete response. "
+            "Do not perform the check in this turn; reply exactly READY."
+        ),
+    ))
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -148,11 +157,35 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
                     },
                 )
                 worker_id = created["worker_thread_id"]
+                call(
+                    "cao_set_worker_purpose",
+                    {
+                        "worker_thread_id": worker_id,
+                        "purpose": "Establish that this disposable installation delivers and preserves the exact requested response.",
+                        "contract": {
+                            "outcome": "The complete requested response is available for independent review.",
+                            "scope": "One disposable no-effect installation check.",
+                            "criteria": [{
+                                "id": "exact_response",
+                                "condition": "The entire final answer is PUBLIC_CODEX_INSTALL_OK.",
+                                "evidence": "Digest-verified captured provider output.",
+                            }],
+                            "completion": "Independent readback matches the exact requested response.",
+                            "authority": "Only return the marker; no files, commands or external services.",
+                            "unmet_action": "Report the concrete failure without broadening scope.",
+                        },
+                        "expected_purpose_version": 0,
+                        "reason": "The fixture requester authorized this installation check.",
+                        "idempotency_key": "public-live-purpose",
+                    },
+                )
+                call("cao_list_managed_workers", {})
                 assigned = call(
                     "cao_instruct_worker_thread",
                     {
                         "worker_thread_id": worker_id,
-                        "objective": "Reply with exactly PUBLIC_CODEX_INSTALL_OK. Do not read or write files, run commands, or access external services.",
+                        "expected_purpose_version": 1,
+                        "instruction": "Reply with exactly PUBLIC_CODEX_INSTALL_OK. Do not read or write files, run commands, or access external services.",
                         "acceptance": ["The entire final answer is PUBLIC_CODEX_INSTALL_OK."],
                         "completion_contract": "no_artifact_expected",
                         "idempotency_key": "public-live-instruct",
@@ -200,6 +233,7 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
                     {
                         "attempt_id": work["current_attempt"]["id"],
                         "verdict": "ok",
+                        "expected_purpose_version": 1,
                         "summary": "The complete real Worker output matches the exact fixture marker.",
                         "evidence": [{"check": "real_codex_output", "result": "pass"}],
                         "idempotency_key": "public-live-review",
@@ -227,6 +261,7 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
                         "lease_token": turn["lease_token"],
                         "expected_generation": work["generation"],
                         "kind": "accept",
+                        "expected_purpose_version": 1,
                         "reason": "Exact fixture marker independently read and verified.",
                     },
                 )

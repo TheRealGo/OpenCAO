@@ -85,8 +85,11 @@ def test_output_notification_targets_exact_final_and_current_projection_retains_
     assert public_notice["payload"]["output_id"] == first_end["id"]
     assert first_end["digest"] == ""
     wake = render_message({**dict(notice), "payload": payload})
-    assert first["id"] in wake and first["digest"] in wake
-    assert "never submit an empty" in wake
+    assert first["id"] not in wake and first["digest"] not in wake
+    [exact] = MCPServer(service).call_tool(actor, "cao_get_inbox", {"message_id": notice["id"]})["items"]
+    instructions = exact["processing_instructions"]
+    assert first["id"] in instructions and first["digest"] in instructions
+    assert "never submit an empty" in instructions
     service.read_worker_output(actor, _read_request(work, first))
     _review(service, actor, work, verdict="needs_work")
     _dispose(service, actor, work, kind="correct")

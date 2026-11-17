@@ -7,7 +7,12 @@ from threading import Barrier
 from typing import Any
 
 import pytest
-from conftest import attach_cao_session_with_peer, current_cao_session_attachment
+from conftest import (
+    attach_cao_session_with_peer,
+    current_cao_session_attachment,
+    seed_pre_checkpoint_review,
+    seed_pre_review_worker_message,
+)
 from test_multi_connection_backend import (
     _CATALOG_A,
     _RELEASE_A,
@@ -200,6 +205,33 @@ def _completed_accepted_work(
             idempotency_key=f"{key}:decision",
         ),
     )
+
+
+def test_conversation_close_preserves_accepted_work_without_cleanup_receipt(system) -> None:
+    from cao_control_plane.models import CloseCAOConversationInput
+
+    service = system["service"]
+    attachment = attach_cao_session_with_peer(service, current_cao_session_attachment(
+        native_thread_id="conversation-work-close-independent", project_digest="a" * 64,
+    ))
+    actor = service.authenticate(attachment["context_token"])
+    ids = _seed_managed_thread(system, actor, ordinal=847)
+    work = _completed_accepted_work(system, actor, "conversation-work-independent")
+    assert work["state"] == "completed"
+    before = dict(service.db.fetchone("SELECT * FROM work_items WHERE id=?", (work["id"],)))
+    attempt = dict(service.db.fetchone("SELECT * FROM attempts WHERE id=?", (work["current_attempt"]["id"],)))
+    worker = dict(service.db.fetchone("SELECT * FROM managed_worker_threads WHERE id=?", (ids["thread_id"],)))
+    assert service.db.fetchone("SELECT COUNT(*) FROM work_close_receipts")[0] == 0
+
+    result = service.close_cao_conversation(actor, CloseCAOConversationInput(idempotency_key="conversation-independent-close"))
+
+    assert result["status"] == "closed"
+    assert result["work_items_canceled"] == result["managed_workers_stopped"] == 0
+    assert dict(service.db.fetchone("SELECT * FROM work_items WHERE id=?", (work["id"],))) == before
+    assert dict(service.db.fetchone("SELECT * FROM attempts WHERE id=?", (attempt["id"],))) == attempt
+    assert dict(service.db.fetchone("SELECT * FROM managed_worker_threads WHERE id=?", (worker["id"],))) == worker
+    assert service.db.fetchone("SELECT COUNT(*) FROM work_close_receipts")[0] == 0
+    assert service.db.fetchone("SELECT state FROM cao_session_attachments WHERE id=?", (attachment["id"],))[0] == "revoked"
 
 
 def test_generic_runtime_stop_rejects_every_conversation_bearer_before_target_read(
@@ -653,17 +685,21 @@ def test_finish_one_public_call_archives_working_thread_and_preserves_unknown_ev
                 assignment["recipient_id"],
             ),
         )
-        queued = service._message(
-            connection,
-            sender_id=str(actor_one["id"]),
-            recipient_id=ids["principal_id"],
-            kind=MessageKind.INSTRUCTION,
-            payload={"instruction": "unclaimed instruction before Close"},
-            work_item_id=work["id"],
-            attempt_id=attempt_id,
-            goal_version=work["goal_version"],
-            idempotency_key="finish-unclaimed-instruction",
-        )
+        # Model a retained message from before independent review existed.
+        # This fixture-only bypass must not weaken the normal domain send gate.
+        with monkeypatch.context() as legacy_seed:
+            legacy_seed.setattr("cao_control_plane.service.review_worker_message_tx", lambda *_args, **_kwargs: None)
+            queued = service._message(
+                connection,
+                sender_id=str(actor_one["id"]),
+                recipient_id=ids["principal_id"],
+                kind=MessageKind.INSTRUCTION,
+                payload={"instruction": "unclaimed instruction before Close"},
+                work_item_id=work["id"],
+                attempt_id=attempt_id,
+                goal_version=work["goal_version"],
+                idempotency_key="finish-unclaimed-instruction",
+            )
         connection.execute(
             """
             INSERT INTO artifacts(
@@ -1111,7 +1147,7 @@ def test_instruct_accepts_distinct_work_after_completed_waiting_user_history(
             "updated_at = ? WHERE id = ?",
             (now, prior["id"]),
         )
-        status = service._message(
+        status = seed_pre_review_worker_message(service,
             connection,
             sender_id=str(actor["id"]),
             recipient_id=ids["principal_id"],
@@ -1577,8 +1613,8 @@ def test_finish_is_the_only_public_close_step_for_active_and_waiting_user_worker
             reason="The result is ready for exact CAO review.",
         ),
     )
-    waiting_user = service.review(
-        actor,
+    waiting_user = seed_pre_checkpoint_review(
+        service, actor,
         ReviewInput(
             attempt_id=waiting_attempt["id"],
             verdict=ReviewVerdict.OK,

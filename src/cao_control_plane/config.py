@@ -220,6 +220,8 @@ class Settings:
     dashboard_access_timeout_seconds: float = 10.0
     max_request_bytes: int = 2 * 1024 * 1024
     max_runtime_output_bytes: int = 256 * 1024
+    # Owner-local publication constraints; never copied into task packets.
+    worker_publication_forbidden_terms: tuple[str, ...] = ()
     callback_timeout_seconds: float = 10.0
     # Startup is a short protocol boundary.  Once a managed Worker has
     # authenticated and begun its turn, liveness is governed by ordered MCP
@@ -315,6 +317,11 @@ class Settings:
         return None
 
     def validate(self) -> None:
+        if not isinstance(self.worker_publication_forbidden_terms, tuple) or any(
+            not isinstance(term, str) or not term.strip() or any(ord(c) < 32 for c in term)
+            for term in self.worker_publication_forbidden_terms
+        ):
+            raise ValueError("worker_publication_forbidden_terms must contain nonempty terms")
         if not (1 <= int(self.port) <= 65535):
             raise ValueError("port must be between 1 and 65535")
         if int(self.max_request_bytes) < 1024:
@@ -462,7 +469,7 @@ class Settings:
                 resolved.chmod(0o700)
 
     @classmethod
-    def load(cls, path: Path | None = None) -> Settings:
+    def load(cls, path: Path | None = None, *, prepare_directories: bool = True) -> Settings:
         config_path = (
             path
             or Path(
@@ -637,6 +644,11 @@ class Settings:
 
         if "state_dir" in values:
             values["state_dir"] = Path(values["state_dir"]).expanduser()
+        if "worker_publication_forbidden_terms" in values:
+            raw_terms = values["worker_publication_forbidden_terms"]
+            if not isinstance(raw_terms, list) or not all(isinstance(v, str) for v in raw_terms):
+                raise ValueError("worker_publication_forbidden_terms must be an array of strings")
+            values["worker_publication_forbidden_terms"] = tuple(raw_terms)
         if "runtime_launch_dir" in values:
             values["runtime_launch_dir"] = Path(values["runtime_launch_dir"]).expanduser()
         if "owner_private_policy_file" in values:
@@ -655,5 +667,6 @@ class Settings:
                 values[list_name] = tuple(str(value) for value in values[list_name])
 
         settings = replace(cls(), **values)
-        settings.ensure_directories()
+        if prepare_directories:
+            settings.ensure_directories()
         return settings

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
@@ -51,6 +53,32 @@ def test_health_agent_card_and_docs_default(settings):
         card = client.get("/.well-known/agent-card.json").json()
         assert {item["protocolVersion"] for item in card["supportedInterfaces"]} == {"1.0"}
         assert client.get("/docs").status_code == 404
+
+
+@pytest.mark.parametrize("path", ["/api/v1/me", "/a2a/http/tasks"])
+def test_waiting_authentication_does_not_block_independent_health(settings, monkeypatch, path):
+    app = create_app(settings)
+    service = app.state.service
+    token = app.state.bootstrap["tokens"]["cao"]["token"]
+    entered, release = threading.Event(), threading.Event()
+    authenticate = service.authenticate
+
+    def waiting_authentication(value):
+        entered.set()
+        assert release.wait(5), "test authentication was not released"
+        return authenticate(value)
+
+    monkeypatch.setattr(service, "authenticate", waiting_authentication)
+    with _client(app) as client, ThreadPoolExecutor(max_workers=2) as executor:
+        authenticated = executor.submit(client.get, path, headers={"Authorization": f"Bearer {token}", "A2A-Version": "1.0"})
+        assert entered.wait(2)
+        try:
+            health = executor.submit(client.get, "/health")
+            assert health.result(timeout=1).status_code == 200
+            assert not authenticated.done()
+        finally:
+            release.set()
+        assert authenticated.result(timeout=2).status_code == 200
 
 
 def test_authority_schema_is_canonical_only_and_ready(settings):

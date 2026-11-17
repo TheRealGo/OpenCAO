@@ -52,6 +52,7 @@ dev = [
 cao-a2a = "cao_control_plane.cli:main"
 cao-dashboard = "cao_control_plane.dashboard_cli:main"
 cao-adaptation = "cao_control_plane.adaptation:main"
+cao-capture = "cao_control_plane.execution_capture:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -83,4 +84,4 @@ warn_unused_ignores = true
 packages = ["cao_control_plane"]
 
 [tool.setuptools.package-data]
-cao_control_plane = ["py.typed", "static/*.css", "static/*.html", "static/*.js"]
+cao_control_plane = ["py.typed", "static/*.css", "static/*.html", "static/*.js", "runtime_hooks/*/*"]

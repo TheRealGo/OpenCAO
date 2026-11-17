@@ -31,6 +31,9 @@ def test_loopback_callback_policy():
         "Authorization: Bearer " + "B" * 40,
         "-----BEGIN PRIVATE KEY-----",
         "https://alice:s3cretpassword123@example.com/data",
+        "proxy_token=" + "P" * 32,
+        "PROXY-TOKEN: " + "P" * 32,
+        "https://example.invalid/api?service-runtime-proxy-token=" + "P" * 32,
     ),
 )
 def test_generic_credential_text_detector_rejects_concrete_values(
@@ -45,6 +48,9 @@ def test_generic_credential_text_detector_rejects_concrete_values(
         "Document the credential rotation policy and token scope.",
         "Describe the password length and private key format.",
         "Explain the Authorization bearer scheme without including a value.",
+        "Describe the runtime proxy-token rotation policy.",
+        "https://example.invalid/api?proxy-token=&page=2",
+        "https://example.invalid/api?proxy-token-name=runtime",
     ),
 )
 def test_generic_credential_text_detector_allows_descriptive_words(
@@ -61,7 +67,7 @@ def test_exact_one_time_effect_authority(system):
         EffectGrantInput(
             principal_id=system["worker"]["id"],
             kind="external",
-            target_pattern="github:example-owner/example-project",
+            target_pattern="github:example/project",
             action_pattern="push",
             content_digest=digest,
             standing=False,
@@ -70,7 +76,7 @@ def test_exact_one_time_effect_authority(system):
     request = EffectCheckInput(
         principal_id=system["worker"]["id"],
         kind="external",
-        target="github:example-owner/example-project",
+        target="github:example/project",
         action="push",
         content_digest=digest,
     )
@@ -102,7 +108,7 @@ def test_effect_does_not_match_different_content(system):
         EffectCheckInput(
             principal_id=system["worker"]["id"],
             kind="external",
-            target="github:example-owner/example-project",
+            target="github:example/project",
             action="push",
             content_digest=sha256_json("different"),
         )
@@ -143,7 +149,7 @@ def test_standing_effect_cannot_be_reserved_twice_while_unresolved(system):
     request = EffectCheckInput(
         principal_id=system["worker"]["id"],
         kind="external",
-        target="github:example-owner/example-project",
+        target="github:example/project",
         action="push",
         content_digest=sha256_json({"commit": "abc"}),
     )

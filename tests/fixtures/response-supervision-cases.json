@@ -1,0 +1,30 @@
+[
+  {
+    "id": "acknowledgment_without_execution", "expected": "diagnose_execution",
+    "purpose": "Implement and verify the bounded local change. Keep ordinary method decisions with the Worker.",
+    "task": "Produce the implemented change and its verification. No external effects or new authority are needed.",
+    "observations": {"earlier_attempt_execution_started": true, "current_input": "Repeat the unmet implementation and verification conditions.", "previous_answer": "I will implement it.", "current_answer": "I will continue.", "final_text": "", "new_worker_reports": 0, "new_artifacts": 0, "provider_turn": "completed"},
+    "response_evidence": {"record_availability": "recorded", "final_output_state": "empty", "acknowledgment_observed": true, "execution_start_report_observed": false, "worker_reports": {"progress": 0, "completion_claim": 0}, "new_artifact_records_since_previous_response": 0, "business_progress": "not_judged"}
+  },
+  {
+    "id": "irrecoverable_execution_record", "expected": "preserve_gap_and_change_plan",
+    "purpose": "Run bounded comparisons with original execution evidence. Preserve unknown effects and fixed criteria.",
+    "task": "Complete the comparison, retain the actual command stdout and report the result. Do not rerun it just to recreate logs.",
+    "observations": {"current_answer": "The comparison ran and the raw result survives. Its required original stdout was never saved and cannot be recovered. A later run would be new evidence, not the missing original.", "prior_corrections": "The last instruction already requested the same missing stdout.", "provider_turn": "completed"},
+    "response_evidence": {"record_availability": "recorded", "final_output_state": "available", "worker_reports": {"completion_claim": 0, "blocker": 1}, "new_artifact_records_since_previous_response": 0, "business_progress": "not_judged"}
+  },
+  {
+    "id": "sufficient_no_artifact_result", "expected": "accept",
+    "purpose": "Return the exact bounded value in the assigned checkpoint. No command execution or artifacts are required.",
+    "task": "Return exactly 42. Completion contract: no_artifact_expected.",
+    "observations": {"current_answer": "42", "verified_report_read": true, "provider_turn": "completed"},
+    "response_evidence": {"record_availability": "recorded", "final_output_state": "available", "worker_reports": {"completion_claim": 0}, "new_artifact_records_since_previous_response": 0, "business_progress": "not_judged"}
+  },
+  {
+    "id": "verified_incremental_change", "expected": "continue_execution",
+    "purpose": "Implement and verify the bounded local change, permitting necessary intermediate steps.",
+    "task": "Fix the parser and verify the full pipeline within existing authority.",
+    "observations": {"current_answer": "The parser change and its representative failing-input test now pass. The pipeline run remains. The next operation uses the corrected parser.", "verified_artifact": "The new patch and test result are bound to this response.", "provider_turn": "completed"},
+    "response_evidence": {"record_availability": "recorded", "final_output_state": "available", "worker_reports": {"progress": 1}, "new_artifact_records_since_previous_response": 1, "business_progress": "not_judged"}
+  }
+]

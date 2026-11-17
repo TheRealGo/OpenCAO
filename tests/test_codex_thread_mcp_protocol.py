@@ -33,6 +33,7 @@ from cao_control_plane.runtime import (
     _enrollment_mcp_config,
     _JsonRpcProcess,
     _managed_codex_mcp_server_name,
+    _terminate_runtime_process,
 )
 from cao_control_plane.runtime_enrollment import EnrollmentCapabilityBroker
 
@@ -42,6 +43,47 @@ _DASHBOARD_SERVER_NAME = "cao_dashboard_native_snapshot"
 _MACOS_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
 _OWNER_UV = Path.home() / ".nix-profile/bin/uv"
 _AMBIENT_MCP_SERVER_NAMES = ("colab", "memory", "github")
+
+
+def test_real_managed_mcp_uses_the_adapter_budget_instead_of_a_shorter_configured_default(tmp_path: Path) -> None:
+    codex = _installed_codex()
+    if codex is None:
+        pytest.skip("installed Codex app-server is unavailable")
+    home = tmp_path / "provider-home"
+    home.mkdir(mode=0o700)
+    server = tmp_path / "slow-discovery.py"
+    record = tmp_path / "methods.json"
+    server.write_text(f"import os\nos.environ[{_PROBE_ENV!r}] = {str(record)!r}\n" + _PROBE_SERVER_PROGRAM.replace(
+        'elif method == "tools/list":', 'elif method == "tools/list":\n        import time\n        time.sleep(0.3)'),
+        encoding="utf-8")
+    (home / "config.toml").write_text(
+        f"[mcp_servers.{_PROBE_SERVER_NAME}]\nstartup_timeout_sec = 0.1\n", encoding="utf-8")
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CODEX_THREAD_ID"}}
+    environment.update(CODEX_HOME=str(home), **{_PROBE_ENV: str(record)})
+
+    async def exercise() -> None:
+        process = await asyncio.create_subprocess_exec(
+            codex, "app-server", "--stdio", cwd=tmp_path, env=environment,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        rpc = _RecordingJsonRpcProcess(process)
+        try:
+            await rpc.request("initialize", {"clientInfo": {"name": "managed-startup-budget", "version": "1"},
+                                            "capabilities": {"experimentalApi": True}})
+            await rpc.send({"method": "initialized", "params": {}})
+            config = _codex_thread_mcp_config({"mcpServers": {"cao_control_plane": {
+                "command": sys.executable, "args": [str(server)],
+            }}}, server_name=_PROBE_SERVER_NAME, startup_timeout_seconds=2)
+            _, result = await rpc.request("thread/start", {
+                "cwd": str(tmp_path), "approvalPolicy": "never", "sandbox": "read-only", "config": config,
+            })
+            await rpc.wait_for_mcp_server_ready(_PROBE_SERVER_NAME, 2, thread_id=result["thread"]["id"])
+        finally:
+            await _terminate_runtime_process(process)
+
+    asyncio.run(exercise())
+    assert json.loads(record.read_text(encoding="utf-8")).count("tools/list") == 1
 
 
 def _sse(*events: dict[str, Any]) -> bytes:
@@ -1086,10 +1128,10 @@ def test_fresh_real_app_server_model_turns_keep_full_cao_catalog_after_start(
     assert repeated_content["attachment"] == attached_content["attachment"]
     listed_content = listed.get("structuredContent")
     assert isinstance(listed_content, dict)
-    # The model already listed this resource. Readiness probes keep attachment
-    # verified, but they do not grant another untriggered model state read.
-    assert listed_content["error"]["details"]["reason_code"] == "cao_state_polling_prohibited"
-    assert listed_content["error"]["details"]["retryable"] is False
+    # Attachment readiness and scoped model reads remain available when this
+    # isolated host cannot observe inputs through the shared native endpoint.
+    assert "error" not in listed_content
+    assert listed_content["workers"] == []
     assert "cao_list_managed_workers" in initial_catalog_tools
     assert "cao_delete_worker_thread" in initial_catalog_tools
     assert set(catalog_tools) == set(initial_catalog_tools)

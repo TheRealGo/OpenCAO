@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
 from urllib.parse import unquote, unquote_to_bytes, urlsplit
 
+from . import purpose_continuation
 from .artifact_content_contract import (
     ArtifactContentTypeError,
     canonical_utf8_text_media_type,
@@ -57,6 +58,7 @@ from .connection_contract import (
 from .database import (
     Database,
     _backfill_managed_worker_recovery_actions,
+    _cold_native_handle_replacement_is_proven,
     _exact_assignment_not_submitted_is_proven,
     _safe_json_document_sql,
     _same_thread_reconciliation_is_executable,
@@ -65,6 +67,7 @@ from .database import (
     utc_after,
     utc_now,
 )
+from .decision_reports import review_basis_tx, validate_report_tx
 from .delivery_lane import (
     cao_informational_wake_sql,
     cao_notification_inbox_visible_sql,
@@ -87,6 +90,14 @@ from .goal_packets import (
     build_task_packet,
     goal_packet_digest,
     task_packet_digest,
+)
+from .instruction_review import (
+    CodexInstructionReviewer,
+    read_requester_context,
+    require_review_tx,
+    retained_requester_context,
+    review_worker_message_tx,
+    reviewed_command,
 )
 from .models import (
     AckInput,
@@ -126,6 +137,7 @@ from .models import (
     PrincipalCreate,
     PrincipalRole,
     ProvisionManagedWorkerInput,
+    PurposeNextActionInput,
     QueryInput,
     ReasonerTurnState,
     ReportInput,
@@ -157,7 +169,13 @@ from .private_policy import (
     PrivatePolicyError,
     ensure_default_dynamic_workspace_policy,
 )
-from .requester_escalation import requester_escalation_delivery_tx, requester_escalation_tx
+from .requester_escalation import (
+    requester_escalation_delivery_tx,
+    requester_escalation_tx,
+    system_recovery_boundary_tx,
+    system_recovery_tx,
+)
+from .response_evidence import response_evidence_tx
 from .runtime_enrollment import (
     EnrollmentCapabilityError,
     ProcessIdentity,
@@ -541,7 +559,7 @@ _TASK_POSIX_PRIVATE_LOCATOR = re.compile(
 )
 _TASK_HTTP_URL = re.compile(r"\bhttps?://[^\s<>\"']+", re.IGNORECASE)
 _TASK_HTTP_ROUTE = re.compile(
-    r"\b(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT|TRACE)\s+"
+    r"(?<![A-Za-z0-9_])(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT|TRACE)\s+"
     r"/(?!/)[^\s,;\"')>\]}]+",
     re.IGNORECASE,
 )
@@ -938,6 +956,12 @@ class ControlPlane:
     def __init__(self, database: Database, settings: Settings) -> None:
         self.db = database
         self.settings = settings
+        self.instruction_reviewer = CodexInstructionReviewer(settings)
+        from .release_identity import package_content_digest
+
+        self._purpose_recovery_release_id = package_content_digest()
+        self._requester_source_cache: dict[str, list[dict[str, Any]]] = {}
+        self.instruction_review_source = self._read_instruction_source
         self.callback_key_path = settings.callback_key_path
         self.close_inventory_key_path = settings.state_dir / "close-inventory-hmac.key"
         self.owner_private_close_inventory = OwnerPrivateCloseInventory(
@@ -948,6 +972,51 @@ class ControlPlane:
             settings.state_dir
         )
         self._schedule_executable_recovery_notifications()
+
+    def notification_source_identities(self, native_thread_id: str) -> tuple[dict[str, str], dict[str, str]]:
+        """Bind native input origins to this conversation's sealed Messages."""
+        from .runtime import render_message
+
+        notifications = self.db.fetchall(
+            "SELECT DISTINCT message.* FROM messages AS message "
+            "JOIN message_deliveries AS delivery ON delivery.message_id=message.id "
+            "JOIN cao_session_attachments AS attachment ON attachment.id=delivery.recipient_attachment_id "
+            "WHERE attachment.native_thread_id=?",
+            (native_thread_id,),
+        )
+        client_ids = {codex_delivery_client_id(row["id"]): str(row["id"]) for row in notifications}
+        frames = {hashlib.sha256(render_message({
+            **dict(row), "payload": json.loads(row["payload_json"]),
+        }).strip().encode()).hexdigest(): str(row["id"]) for row in notifications}
+        return client_ids, frames
+
+    def _read_instruction_source(self, native_thread_id: str) -> list[dict[str, Any]]:
+        checkpoint = self._requester_source_cache.get(native_thread_id)
+        if checkpoint is None:
+            checkpoint = retained_requester_context(self, native_thread_id)
+        client_ids, frames = self.notification_source_identities(native_thread_id)
+        source = read_requester_context(
+            self.settings, native_thread_id, checkpoint=checkpoint,
+            notification_client_ids=frozenset(client_ids), notification_text_digests=frozenset(frames),
+        )
+        from .instruction_review import requester_condition_digest
+        observed = {"source_condition_digest": requester_condition_digest(source),
+                    "source_status": "available" if source else "unavailable"}
+        with self.db.transaction() as connection:
+            for attachment in connection.execute(
+                "SELECT id FROM cao_session_attachments WHERE native_thread_id=? AND state='active'",
+                (native_thread_id,),
+            ).fetchall():
+                prior = connection.execute(
+                    "SELECT data_json FROM events WHERE event_type='cao.requester_source_observed' "
+                    "AND aggregate_id=? ORDER BY sequence DESC LIMIT 1", (attachment["id"],),
+                ).fetchone()
+                if prior is None or json.loads(prior["data_json"]) != observed:
+                    self._event(connection, "cao.requester_source_observed", "cao_attachment", attachment["id"], "", observed)
+        self._requester_source_cache[native_thread_id] = source
+        if len(self._requester_source_cache) > 64:
+            self._requester_source_cache.pop(next(iter(self._requester_source_cache)))
+        return source
 
     def _schedule_executable_recovery_notifications(self) -> None:
         """Wake CAO once when an upgrade makes a preserved Boundary executable."""
@@ -1330,7 +1399,6 @@ class ControlPlane:
                     "created_at": str(row["principal_created_at"]),
                     "updated_at": str(row["principal_updated_at"]),
                     "_cao_conversation_credential_id": str(row["id"]),
-                    "_cao_readiness_proof_key": hashlib.sha256(token.encode()).hexdigest(),
                     "_cao_attachment_id": str(row["attachment_id"]),
                     "_cao_attachment_generation": int(row["attachment_generation"]),
                     "_cao_connection_id": str(row["connection_id"]),
@@ -3262,6 +3330,7 @@ class ControlPlane:
         principal_id: str,
         normalize_actor_id: str | None = None,
         work_item_id: str | None = None,
+        deciding_boundary_id: str | None = None,
     ) -> str:
         """Return the first durable blocker to one new logical instruction."""
 
@@ -3285,12 +3354,14 @@ class ControlPlane:
                 "WHERE work.managed_worker_thread_id = ? "
                 "AND work.assigned_worker_id = ? "
                 "AND (? IS NULL OR work.id = ?) "
+                "AND (? IS NULL OR boundary.id <> ?) "
                 "AND boundary.recovery_action IN ("
                 "'dispose_continue_or_correct', 'reconcile_continue_same_thread', "
                 "'system_reconciliation') "
                 "AND disposition.id IS NULL "
                 "AND supersession.boundary_id IS NULL LIMIT 1",
-                (thread_id, principal_id, work_item_id, work_item_id),
+                (thread_id, principal_id, work_item_id, work_item_id,
+                 deciding_boundary_id, deciding_boundary_id),
             ),
             (
                 "runtime_busy",
@@ -3317,15 +3388,16 @@ class ControlPlane:
                 "JOIN messages AS message ON message.id = delivery.message_id "
                 "LEFT JOIN attempts AS attempt ON attempt.id = message.attempt_id "
                 "WHERE delivery.recipient_id = ? "
-                # Retired transport evidence belongs to its original Work. It
-                # is not replayed, settled, or allowed to veto a distinct Work.
+                # Retired transport evidence from a non-executing Attempt
+                # belongs to its original Work, including a held recovery.
+                # It is not replayed, settled, or allowed to veto distinct Work.
                 # Current routes and unbound evidence still fence the lane.
                 "AND (? IS NULL OR message.work_item_id = ? OR NOT EXISTS ("
                 "SELECT 1 FROM managed_worker_thread_epochs AS old_epoch "
                 "WHERE old_epoch.thread_id = ? "
                 "AND old_epoch.runtime_session_id = delivery.runtime_session_id "
                 "AND old_epoch.retired_at IS NOT NULL "
-                "AND attempt.state IN ('completed', 'canceled', 'failed') "
+                "AND attempt.state IN ('waiting_supervisor', 'completed', 'canceled', 'failed') "
                 "AND NOT EXISTS (SELECT 1 FROM managed_worker_thread_epochs AS live_epoch "
                 "WHERE live_epoch.thread_id = old_epoch.thread_id "
                 "AND live_epoch.runtime_session_id = old_epoch.runtime_session_id "
@@ -3360,6 +3432,7 @@ class ControlPlane:
         *,
         actor_id: str,
         work: sqlite3.Row,
+        deciding_boundary_id: str | None = None,
     ) -> None:
         """Fail known logical-lane conflicts without advancing an execution route."""
 
@@ -3426,6 +3499,7 @@ class ControlPlane:
             thread_id=thread_id,
             principal_id=str(work["assigned_worker_id"]),
             work_item_id=str(work["id"]),
+            deciding_boundary_id=deciding_boundary_id,
         )
         if blocker:
             raise ConflictError(
@@ -3745,6 +3819,7 @@ class ControlPlane:
             value["worker_purpose"], value["purpose_status"] = readable_worker_purpose_tx(
                 connection, str(thread["id"])
             )
+            value["purpose_supervision"] = purpose_continuation.worker_summary_tx(connection, str(thread["id"]))
             value["thread_state"] = str(thread["state"])
             value["thread_generation"] = int(thread["generation"])
             value["connection_generation"] = int(thread["connection_generation"] or 0)
@@ -3987,6 +4062,9 @@ class ControlPlane:
             )
         now = utc_now()
         next_connection_generation = int(row["connection_generation"]) + 1
+        replace_cold_handle = _cold_native_handle_replacement_is_proven(
+            connection, worker_id=str(row["principal_id"]), runtime_id=str(row["epoch_runtime_session_id"]),
+        )
         retired = connection.execute(
             """
             UPDATE managed_worker_thread_epochs
@@ -4042,7 +4120,7 @@ class ControlPlane:
                 row["principal_id"],
                 row["adapter"],
                 row["runtime_endpoint"],
-                row["runtime_native_session_id"],
+                "" if replace_cold_handle else row["runtime_native_session_id"],
                 utc_after(86400),
                 now,
                 row["runtime_metadata_json"],
@@ -4117,6 +4195,7 @@ class ControlPlane:
             {
                 "thread_generation": int(row["thread_generation"]),
                 "connection_generation": next_connection_generation,
+                **({"unstarted_native_handle_replaced": True} if replace_cold_handle else {}),
             },
         )
         refreshed = self._managed_worker_thread_tx(
@@ -4128,6 +4207,7 @@ class ControlPlane:
         )
         return refreshed
 
+    @reviewed_command
     def set_worker_purpose(
         self, actor: dict[str, Any], request: SetWorkerPurposeInput
     ) -> dict[str, Any]:
@@ -4169,6 +4249,9 @@ class ControlPlane:
                     reason_code="worker_purpose_version_conflict",
                     current_purpose_version=version,
                 )
+            continuing = purpose_continuation.pending_for_worker_tx(
+                connection, request.worker_thread_id, attachment_id
+            )
             packet = purpose_packet(
                 worker_thread_id=request.worker_thread_id,
                 version=version + 1,
@@ -4178,6 +4261,15 @@ class ControlPlane:
                 project_digest=str(actor["_cao_project_digest"]),
                 reason=request.reason,
                 contract=request.contract.model_dump(mode="json"),
+            )
+            require_review_tx(
+                self, connection, attachment_id=attachment_id,
+                worker_thread_id=request.worker_thread_id,
+                candidate={"kind": "purpose", "previous_purpose": previous,
+                           "purpose": request.purpose, "contract": request.contract.model_dump(mode="json"),
+                           "reason": request.reason},
+                purpose={"version": version + 1, "text": request.purpose,
+                         "contract": request.contract.model_dump(mode="json")},
             )
             digest = canonical_sha256(packet)
             connection.execute(
@@ -4208,6 +4300,16 @@ class ControlPlane:
                 {"purpose_version": version + 1, "purpose_digest": digest},
                 operator_scope=str(thread["operator_scope"]),
             )
+            purpose_continuation.retire_worker_wakes_tx(connection, request.worker_thread_id)
+            for retained in continuing:
+                retained_work = connection.execute(
+                    "SELECT * FROM work_items WHERE id=?", (retained["source_work_item_id"],)
+                ).fetchone()
+                if retained_work is not None:
+                    purpose_continuation.require_tx(
+                        self, connection, retained_work, review_id=retained["source_review_id"],
+                        cause_id=f"purpose-revision:{request.worker_thread_id}:{version + 1}:{retained['id']}",
+                    )
             result = {
                 "worker_thread_id": request.worker_thread_id,
                 "worker_purpose": worker_purpose_tx(connection, request.worker_thread_id),
@@ -4243,11 +4345,96 @@ class ControlPlane:
                 operator_scope=str(work["operator_scope"]),
             )
 
+    def _accept_checkpoint_next_tx(
+        self, connection: sqlite3.Connection, actor: dict[str, Any], work: sqlite3.Row,
+        *, review_id: str, next_action: Any,
+    ) -> None:
+        purpose = worker_purpose_tx(connection, str(work["managed_worker_thread_id"] or ""))
+        if not purpose or not work["supervisor_attachment_id"]:
+            if next_action is not None:
+                raise ValidationError("A next purpose action requires a registered Worker purpose")
+            return
+        if next_action is None:
+            raise ConflictError(
+                "Accept the checkpoint together with its next purpose action",
+                reason_code="checkpoint_next_action_required",
+                allowed_actions=["continue", "achieved", "wait_until", "wait_user", "pause"],
+            )
+        value = purpose_continuation.require_tx(self, connection, work, review_id=review_id, wake=False)
+        assert value is not None
+        successor = next_action.next_work_item_id
+        if next_action.next_instruction is not None:
+            instruction = next_action.next_instruction
+            if instruction.purpose_continuation_id is not None:
+                raise ValidationError("The checkpoint binds its own continuation")
+            result = self._instruct_worker_thread_tx(connection, actor, instruction)
+            successor = result["task"]["work_item_id"]
+        request = PurposeNextActionInput(
+            continuation_id=value["id"], expected_generation=value["generation"],
+            expected_purpose_version=purpose["version"],
+            **next_action.model_dump(exclude={"next_instruction", "next_work_item_id"}),
+            next_work_item_id=successor, idempotency_key=f"checkpoint:{review_id}",
+        )
+        value, data = purpose_continuation.prepare_tx(self, connection, actor, request)
+        if request.kind != "continue":
+            require_review_tx(
+                self, connection, attachment_id=value["attachment_id"],
+                worker_thread_id=value["worker_thread_id"], work_id=value["source_work_item_id"],
+                purpose=purpose,
+                candidate={"kind": "instruction", "purpose_action": request.kind, "reason": request.reason,
+                           "evidence": request.evidence, "resume_at": request.resume_at,
+                           "resume_condition": request.resume_condition,
+                           "requester_input_kind": request.requester_input_kind,
+                           "criterion_assessments": [item.model_dump(mode="json") for item in request.criterion_assessments]},
+            )
+        purpose_continuation.apply_tx(self, connection, actor, value, data)
+
+    @reviewed_command
+    def record_purpose_next_action(
+        self, actor: dict[str, Any], request: PurposeNextActionInput
+    ) -> dict[str, Any]:
+        self._require_role(actor, PrincipalRole.CAO)
+        _require_worker_safe_task_payload(request.model_dump(mode="json"))
+        request_digest = canonical_sha256(request.model_dump(mode="json"))
+        with self.db.transaction() as connection:
+            self._require_current_cao_attachment_actor_tx(connection, actor)
+            value = purpose_continuation.get_tx(connection, request.continuation_id)
+            self._require_authorized_work_tx(connection, actor, value["source_work_item_id"])
+            if str(actor.get("_cao_attachment_id") or "") != value["attachment_id"]:
+                raise AuthorizationError("purpose continuation belongs to its originating CAO conversation")
+            cached = self._idempotent_get_tx(connection, str(actor["id"]),
+                                             "purpose_next_action", request.idempotency_key, request_digest)
+            if cached is not None:
+                return cached
+            value, decision_data = purpose_continuation.prepare_tx(self, connection, actor, request)
+            if request.kind != "continue":
+                require_review_tx(
+                    self, connection, attachment_id=value["attachment_id"],
+                    worker_thread_id=value["worker_thread_id"], work_id=value["source_work_item_id"],
+                    purpose=worker_purpose_tx(connection, value["worker_thread_id"]),
+                    candidate={"kind": "instruction", "purpose_action": request.kind, "reason": request.reason,
+                               "evidence": request.evidence,
+                               "resume_at": request.resume_at, "resume_condition": request.resume_condition,
+                               "requester_input_kind": request.requester_input_kind,
+                               "criterion_assessments": [item.model_dump(mode="json") for item in request.criterion_assessments]},
+                )
+            result = purpose_continuation.apply_tx(self, connection, actor, value, decision_data)
+            self._idempotent_put(connection, str(actor["id"]), "purpose_next_action",
+                                request.idempotency_key, request_digest, result)
+            return result
+
+    @reviewed_command
     def instruct_worker_thread(
         self, actor: dict[str, Any], request: InstructWorkerThreadInput
     ) -> dict[str, Any]:
         """Commit one runtime-pinned v1 instruction to an exact logical Worker."""
 
+        with self.db.transaction() as connection:
+            return self._instruct_worker_thread_tx(connection, actor, request)
+
+    def _instruct_worker_thread_tx(
+        self, connection: sqlite3.Connection, actor: dict[str, Any], request: InstructWorkerThreadInput,
+    ) -> dict[str, Any]:
         attachment_id, attachment_generation = self._worker_thread_command_attachment(
             actor, operation="instruction"
         )
@@ -4272,7 +4459,7 @@ class ControlPlane:
             }
         )
         operation = "instruct_worker_thread"
-        with self.db.transaction() as connection:
+        with nullcontext(connection) as connection:
             self._require_current_cao_attachment_actor_tx(
                 connection, actor, allow_runtime_credential=False
             )
@@ -4293,6 +4480,17 @@ class ControlPlane:
             if cached is not None:
                 return cached
             self._require_worker_thread_generation(row, request.expected_generation)
+            purpose_continuation.require_assignable_tx(connection, request.worker_thread_id)
+            if bool(request.purpose_continuation_id) != bool(request.expected_continuation_generation):
+                raise ValidationError("purpose continuation identity and generation must be supplied together")
+            if request.purpose_continuation_id is not None:
+                assert request.expected_continuation_generation is not None
+                continuation = purpose_continuation.require_current_tx(
+                    self, connection, actor, request.purpose_continuation_id,
+                    request.expected_continuation_generation, request.expected_purpose_version,
+                )
+                if continuation["worker_thread_id"] != request.worker_thread_id:
+                    raise AuthorizationError("purpose continuation belongs to a different Worker")
             if (
                 str(row["thread_state"]) != WorkerThreadState.ACTIVE.value
                 or str(row["spec_state"]) != "enabled"
@@ -4390,6 +4588,17 @@ class ControlPlane:
                 expected_goal_version=1,
                 materialized=True,
             )
+            if request.purpose_continuation_id is not None:
+                assert request.expected_continuation_generation is not None
+                purpose_continuation.resolve_tx(self, connection, actor, PurposeNextActionInput(
+                    continuation_id=request.purpose_continuation_id,
+                    expected_generation=request.expected_continuation_generation,
+                    expected_purpose_version=request.expected_purpose_version,
+                    kind="continue", next_work_item_id=str(work["id"]),
+                    reason="A distinct next outcome was delegated within the current purpose.",
+                    evidence=f"Sealed Work {work['id']} and its Assignment committed atomically.",
+                    idempotency_key=request.idempotency_key,
+                ))
             disposition_request = IntentDisposition(
                 kind=IntentKind.TASK,
                 relation=IntentRelation.INDEPENDENT,
@@ -5234,7 +5443,14 @@ class ControlPlane:
         cancel_attempts_by_work: dict[str, list[sqlite3.Row]] = {}
         for work in unsettled_work:
             attempts = connection.execute(
-                "SELECT * FROM attempts WHERE work_item_id = ? ORDER BY attempt_number, id",
+                """
+                SELECT attempt.*, goal.packet_digest AS recorded_goal_packet_digest
+                FROM attempts AS attempt
+                LEFT JOIN goal_revisions AS goal
+                  ON goal.work_item_id = attempt.work_item_id
+                 AND goal.version = attempt.goal_version
+                WHERE attempt.work_item_id = ? ORDER BY attempt.attempt_number, attempt.id
+                """,
                 (work["id"],),
             ).fetchall()
             if not attempts:
@@ -5266,8 +5482,9 @@ class ControlPlane:
                 if (
                     str(attempt["worker_id"]) != principal_id
                     or str(attempt["runtime_session_id"] or "") not in epoch_runtime_ids
-                    or int(attempt["goal_version"]) != int(work["goal_version"])
-                    or str(attempt["goal_packet_digest"]) != str(work["goal_packet_digest"])
+                    or attempt["recorded_goal_packet_digest"] is None
+                    or str(attempt["goal_packet_digest"])
+                    != str(attempt["recorded_goal_packet_digest"])
                     or re.fullmatch(r"[0-9a-f]{64}", str(attempt["task_packet_digest"])) is None
                 ):
                     retain_anomaly("attempt_metadata")
@@ -5402,6 +5619,7 @@ class ControlPlane:
             runtime_placeholders = ",".join("?" for _ in epoch_runtime_ids)
             related_clauses.append(f"delivery.runtime_session_id IN ({runtime_placeholders})")
             related_parameters.extend(sorted(epoch_runtime_ids))
+        delivery_payload = _safe_json_document_sql("message.payload_json")
         delivery_rows = connection.execute(
             f"""
             SELECT delivery.*, message.work_item_id AS message_work_item_id,
@@ -5411,10 +5629,13 @@ class ControlPlane:
             FROM message_deliveries AS delivery
             JOIN messages AS message ON message.id = delivery.message_id
             LEFT JOIN attempts AS attempt ON attempt.id = message.attempt_id
-            WHERE {" OR ".join(related_clauses)}
+            WHERE ({" OR ".join(related_clauses)})
+              AND NOT (message.kind = 'system'
+                       AND COALESCE(json_extract({delivery_payload}, '$.action'), '') = 'purpose_continuation'
+                       AND delivery.recipient_id <> ?)
             ORDER BY delivery.message_id, delivery.recipient_id
             """,
-            tuple(related_parameters),
+            (*related_parameters, principal_id),
         ).fetchall()
         dead_letter_rows = [
             delivery
@@ -8005,13 +8226,13 @@ class ControlPlane:
             JOIN runtime_sessions AS runtime
               ON runtime.id = attachment.runtime_session_id
             WHERE attachment.id = ? AND attachment.state = 'active'
-              AND attachment.lease_expires_at > ?
             """,
-            (attachment_id, now),
+            (attachment_id,),
         ).fetchone()
         if attachment is None:
             return "", False, 0
         runtime_id = str(attachment["runtime_session_id"])
+        attachment_lease = str(attachment["lease_expires_at"])
         if (
             str(attachment["runtime_principal_id"]) != str(attachment["principal_id"])
             or str(attachment["runtime_adapter"]) != "codex-app-server"
@@ -8020,6 +8241,24 @@ class ControlPlane:
             # Identity corruption is not a liveness problem.  Do not derive a
             # replacement route from an ambiguous tuple.
             return runtime_id, False, 0
+
+        if attachment_lease <= now:
+            if not cao_automatic_wake_ready_tx(connection, attachment_id):
+                return runtime_id, False, 0
+            # Pending supervision survives a credential lease. Renew only its
+            # reservation; the awakened conversation must reacquire expired
+            # connection credentials through ordinary authenticated bootstrap.
+            attachment_lease = utc_after(86400)
+            connection.execute(
+                "UPDATE cao_session_attachments SET lease_expires_at = ?, updated_at = ? "
+                "WHERE id = ? AND state = 'active' AND generation = ?",
+                (attachment_lease, now, attachment_id, attachment["generation"]),
+            )
+            self._event(
+                connection, "cao.session_attachment_renewed", "cao_session_attachment",
+                attachment_id, "", {"generation": int(attachment["generation"]),
+                                    "reason": "pending_supervision"},
+            )
 
         route_available = (
             str(attachment["runtime_state"])
@@ -8052,7 +8291,7 @@ class ControlPlane:
                     attachment["principal_id"],
                     f"{self.settings.public_base_url.rstrip('/')}/mcp",
                     attachment["native_thread_id"],
-                    attachment["lease_expires_at"],
+                    attachment_lease,
                     now,
                     _json({"managed_cao": True}),
                     now,
@@ -8307,7 +8546,9 @@ class ControlPlane:
                 causation_id=str(candidate["message_id"]),
             )
             reactivated += 1
-        return reactivated
+        return reactivated + purpose_continuation.reactivate_tx(
+            self, connection, attachment_id=attachment_id, runtime_id=runtime_id
+        )
 
     def cao_supervision_activation_scan_high_water(self) -> int:
         """Snapshot the immutable message sequence ceiling for one activation round."""
@@ -8540,8 +8781,10 @@ class ControlPlane:
                 (message_id, attachment_id, delivery_generation, now, now),
             ).fetchone()
             escalation = None
+            purpose_notification = None
             if row is None:
-                escalation = requester_escalation_delivery_tx(connection, message_id)
+                purpose_notification = purpose_continuation.notification_tx(connection, message_id)
+                escalation = purpose_notification or requester_escalation_delivery_tx(connection, message_id)
                 if (
                     escalation is None
                     or escalation["recipient_attachment_id"] != attachment_id
@@ -8600,17 +8843,22 @@ class ControlPlane:
                     str(row["recipient_id"]),
                     {
                         "attachment_id": attachment_id,
-                        "boundary_id": str(row["boundary_id"]),
+                        "boundary_id": str(row["boundary_id"] or ""),
                         "delivery_generation": delivery_generation,
                         "provider_turn_proof": provider_proof,
                     },
                     causation_id=message_id,
                 )
-                return "observed"
-            if prior_proof != provider_proof:
+            if prior_has_chronology and prior_proof != provider_proof:
                 # An old host generation, changed provider turn, or changed
                 # terminal outcome cannot corroborate the first observation.
                 return "not_required"
+            if purpose_notification is not None:
+                return cast(_ProviderTurnReconciliationOutcome,
+                            purpose_continuation.recover_notification_tx(
+                                self, connection, message_id=message_id,
+                                delivery_generation=delivery_generation,
+                            ))
             if escalation is not None:
                 return self._recover_incomplete_requester_escalation_tx(
                     connection, message_id=message_id,
@@ -8634,12 +8882,13 @@ class ControlPlane:
             attachments = connection.execute(
                 """
                 SELECT attachment.id FROM cao_session_attachments AS attachment
-                WHERE attachment.state = 'active' AND attachment.lease_expires_at > ?
+                WHERE attachment.state = 'active'
                   AND (
                     EXISTS (
                       SELECT 1 FROM message_deliveries AS delivery
                       WHERE delivery.recipient_attachment_id = attachment.id
-                        AND delivery.state = 'queued'
+                        AND (delivery.state IN ('queued', 'leased', 'dispatched', 'delivered', 'acknowledged')
+                             OR (delivery.state = 'dead' AND delivery.reactivation_policy = 'retryable'))
                     )
                     OR EXISTS (
                       SELECT 1 FROM work_items AS work
@@ -8649,7 +8898,6 @@ class ControlPlane:
                   )
                 ORDER BY attachment.created_at, attachment.id
                 """,
-                (now,),
             ).fetchall()
             for attachment in attachments:
                 _, replaced, _ = self._reconcile_cao_wake_route_tx(
@@ -8686,6 +8934,9 @@ class ControlPlane:
             DeliveryState.ACKNOWLEDGED.value,
         }
         with self.db.transaction() as connection:
+            rearmed += purpose_continuation.reconcile_tx(self, connection, limit=limit)
+            rearmed += purpose_continuation.recover_missing_checkpoints_tx(self, connection)
+            rearmed += self._reconcile_system_recovery_holds_tx(connection, limit=limit)
             boundaries = connection.execute(
                 f"""
                 SELECT boundary.*, work.supervisor_id,
@@ -9309,6 +9560,20 @@ class ControlPlane:
                 "close_request_digest": close_request_digest,
             }
             decision_digest = _digest(decision)
+            input_digest = _digest({
+                "boundary_id": boundary["id"],
+                "boundary_input_digest": boundary["input_digest"],
+                "goal_packet_digest": boundary["goal_packet_digest"],
+                "task_packet_digest": boundary["task_packet_digest"],
+                "generation": boundary["generation"],
+            })
+            result_digest = _digest({
+                "boundary_id": boundary["id"],
+                "disposition_id": disposition_id,
+                "request_digest": decision_digest,
+                "goal_packet_digest": boundary["goal_packet_digest"],
+                "task_packet_digest": boundary["task_packet_digest"],
+            })
             connection.execute(
                 """
                 INSERT INTO reasoner_turns(
@@ -9328,8 +9593,8 @@ class ControlPlane:
                     boundary["goal_version"],
                     boundary["goal_packet_digest"],
                     boundary["task_packet_digest"],
-                    boundary["input_digest"],
-                    decision_digest,
+                    input_digest,
+                    result_digest,
                     ReasonerTurnState.COMPLETED.value,
                     _digest(f"conversation-close:{turn_id}"),
                     now,
@@ -9385,8 +9650,8 @@ class ControlPlane:
         This is deliberately not a Control Plane or Dashboard shutdown.  The
         authenticated CSC selects the only attachment that can be closed.  A
         close may cancel its own Work but never changes project-local Worker
-        lifecycle. It fails before every mutation when one of this
-        conversation's Delivery outcomes or external effects is still uncertain.
+        lifecycle. Current ambiguous Deliveries and unresolved external effects
+        block closure; non-executing retired Worker history remains preserved.
         """
 
         self._require_role(actor, PrincipalRole.CAO)
@@ -9499,30 +9764,8 @@ class ControlPlane:
                 )
 
             blockers: dict[str, int] = {}
-            completed_without_close = connection.execute(
-                """
-                SELECT COUNT(*) AS count FROM work_items AS work
-                WHERE work.supervisor_attachment_id = ? AND work.state = 'completed'
-                  AND NOT EXISTS (
-                      SELECT 1 FROM work_close_receipts AS receipt
-                      WHERE receipt.work_item_id = work.id
-                  )
-                """,
-                (attachment_id,),
-            ).fetchone()
-            if completed_without_close is not None and int(completed_without_close["count"]):
-                blockers["work_cleanup_incomplete"] = int(completed_without_close["count"])
-            leased_turns = connection.execute(
-                """
-                SELECT COUNT(*) AS count FROM reasoner_turns AS turn
-                JOIN work_items AS work ON work.id = turn.work_item_id
-                WHERE work.supervisor_attachment_id = ?
-                  AND turn.state = 'leased' AND turn.lease_expires_at > ?
-                """,
-                (attachment_id, utc_now()),
-            ).fetchone()
-            if leased_turns is not None and int(leased_turns["count"]):
-                blockers["cao_turn_in_flight"] = int(leased_turns["count"])
+            # Canceling this attachment's Work already fences its decision
+            # leases atomically. Its own lease cannot veto an explicit close.
             active_cao_runtime = connection.execute(
                 """
                 SELECT (
@@ -9542,9 +9785,7 @@ class ControlPlane:
             if str(attachment["runtime_state"]) == RuntimeState.BUSY.value:
                 active_cao_count = max(active_cao_count, 1)
             if active_cao_count:
-                blockers["cao_turn_in_flight"] = (
-                    blockers.get("cao_turn_in_flight", 0) + active_cao_count
-                )
+                blockers["cao_turn_in_flight"] = active_cao_count
             interrupt_chain = connection.execute(
                 """
                 SELECT COUNT(*) AS count FROM work_items AS work
@@ -9565,6 +9806,7 @@ class ControlPlane:
                 FROM message_deliveries AS delivery
                 JOIN messages AS message ON message.id = delivery.message_id
                 LEFT JOIN attempts AS attempt ON attempt.id = message.attempt_id
+                LEFT JOIN work_items AS delivery_work ON delivery_work.id = message.work_item_id
                 WHERE delivery.state = 'dispatched' AND (
                     message.work_item_id IN (
                         SELECT id FROM work_items
@@ -9572,6 +9814,19 @@ class ControlPlane:
                     )
                     OR delivery.runtime_session_id = ?
                 )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM managed_worker_thread_epochs AS retired_epoch
+                    WHERE retired_epoch.thread_id = delivery_work.managed_worker_thread_id
+                      AND retired_epoch.runtime_session_id = delivery.runtime_session_id
+                      AND retired_epoch.retired_at IS NOT NULL
+                      AND attempt.state IN ('waiting_supervisor', 'completed', 'canceled', 'failed')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM managed_worker_thread_epochs AS live_epoch
+                        WHERE live_epoch.thread_id = retired_epoch.thread_id
+                          AND live_epoch.runtime_session_id = retired_epoch.runtime_session_id
+                          AND live_epoch.retired_at IS NULL
+                      )
+                  )
                 """,
                 (
                     attachment_id,
@@ -10296,21 +10551,19 @@ class ControlPlane:
                     or event_data.get("result") != last_dispatch
                 ):
                     continue
-                if self._advance_completed_worker_delivery_lane_tx(
+                lane_advanced = self._advance_completed_worker_delivery_lane_tx(
                     connection,
                     runtime_id=str(row["runtime_id"]),
                     attempt_id=str(row["attempt_id"]),
                     delivery_message_id=delivery_message_id,
-                ):
-                    reconciled += 1
-                    continue
+                )
                 boundary = self._reconcile_completed_worker_turn_tx(
                     connection,
                     runtime_id=str(row["runtime_id"]),
                     attempt_id=str(row["attempt_id"]),
                     delivery_message_id=delivery_message_id,
                 )
-                if boundary is not None:
+                if lane_advanced or boundary is not None:
                     reconciled += 1
         return reconciled
 
@@ -10322,7 +10575,7 @@ class ControlPlane:
         attempt_id: str,
         delivery_message_id: str,
     ) -> bool:
-        """Terminalize one completed provider turn before its queued successor.
+        """Settle a completed provider input and receipts consumed within its turn.
 
         A provider-native turn is the execution boundary for exactly one
         Control Plane Delivery.  Once that turn authoritatively completed, an
@@ -10330,40 +10583,64 @@ class ControlPlane:
         preserved as terminal unknown evidence; neither may permanently hide
         an independently committed successor command.  This transition never
         retries the completed command and never changes Work or Attempt state.
+        A later inbox ACK belongs to this ended turn only when its durable ACK
+        event precedes the exact provider-completion event. Queued inputs and
+        receipts after that event retain their own execution authority.
         """
 
-        row = connection.execute(
+        rows = connection.execute(
             """
             SELECT message.id AS message_id, message.sequence,
                    delivery.recipient_id, delivery.runtime_session_id,
                    delivery.generation, delivery.state,
-                   successor.id AS successor_message_id
-            FROM messages AS message
-            JOIN message_deliveries AS delivery
-              ON delivery.message_id = message.id
-            JOIN attempts AS attempt ON attempt.id = message.attempt_id
+                   (SELECT successor.id
+                    FROM messages AS successor
+                    JOIN message_deliveries AS successor_delivery
+                      ON successor_delivery.message_id = successor.id
+                     AND successor_delivery.recipient_id = delivery.recipient_id
+                     AND successor_delivery.runtime_session_id = runtime.id
+                    WHERE successor.attempt_id = attempt.id
+                      AND successor.work_item_id = work.id
+                      AND successor.sequence > message.sequence
+                      AND successor_delivery.state IN (
+                          'queued', 'leased', 'dispatched', 'delivered', 'acknowledged'
+                      )
+                    ORDER BY successor.sequence LIMIT 1) AS successor_message_id
+            FROM messages AS source
+            JOIN attempts AS attempt ON attempt.id = source.attempt_id
             JOIN work_items AS work ON work.id = attempt.work_item_id
             JOIN runtime_sessions AS runtime
-              ON runtime.id = delivery.runtime_session_id
-             AND runtime.id = attempt.runtime_session_id
-             AND runtime.principal_id = delivery.recipient_id
+              ON runtime.id = attempt.runtime_session_id
+             AND runtime.principal_id = attempt.worker_id
             JOIN worker_enrollments AS enrollment
               ON enrollment.runtime_session_id = runtime.id
-             AND enrollment.principal_id = delivery.recipient_id
+             AND enrollment.principal_id = attempt.worker_id
              AND enrollment.managed = 1
-            JOIN messages AS successor
-              ON successor.attempt_id = attempt.id
-             AND successor.work_item_id = work.id
-             AND successor.sequence > message.sequence
-            JOIN message_deliveries AS successor_delivery
-              ON successor_delivery.message_id = successor.id
-             AND successor_delivery.recipient_id = delivery.recipient_id
-             AND successor_delivery.runtime_session_id = runtime.id
-            WHERE message.id = ? AND attempt.id = ? AND runtime.id = ?
-              AND delivery.state IN ('delivered', 'acknowledged', 'handled')
-              AND successor_delivery.state IN (
-                  'queued', 'leased', 'dispatched', 'delivered', 'acknowledged'
-              )
+            JOIN events AS completed_event
+              ON completed_event.event_type = 'runtime.message_delivered'
+             AND completed_event.aggregate_type = 'runtime'
+             AND completed_event.aggregate_id = runtime.id
+             AND completed_event.causation_id = source.id
+            JOIN messages AS message
+              ON message.attempt_id = attempt.id
+             AND message.work_item_id = work.id
+             AND message.sequence >= source.sequence
+            JOIN message_deliveries AS delivery
+              ON delivery.message_id = message.id
+             AND delivery.recipient_id = attempt.worker_id
+             AND delivery.runtime_session_id = runtime.id
+            WHERE source.id = ? AND attempt.id = ? AND runtime.id = ?
+              AND delivery.state IN ('delivered', 'acknowledged')
+              AND (message.id = source.id OR (
+                  delivery.state = 'acknowledged' AND EXISTS (
+                      SELECT 1 FROM events AS receipt
+                      WHERE receipt.event_type = 'message.acknowledged'
+                        AND receipt.aggregate_type = 'message'
+                        AND receipt.aggregate_id = message.id
+                        AND receipt.actor_id = attempt.worker_id
+                        AND receipt.sequence < completed_event.sequence
+                  )
+              ))
               AND attempt.attempt_number = (
                   SELECT MAX(latest.attempt_number)
                   FROM attempts AS latest
@@ -10388,92 +10665,68 @@ class ControlPlane:
                     AND disposition.id IS NULL
                     AND supersession.boundary_id IS NULL
               )
-              AND EXISTS (
-                  SELECT 1 FROM events AS delivered_event
-                  WHERE delivered_event.event_type = 'runtime.message_delivered'
-                    AND delivered_event.aggregate_type = 'runtime'
-                    AND delivered_event.aggregate_id = runtime.id
-                    AND delivered_event.causation_id = message.id
-              )
-            ORDER BY successor.sequence
-            LIMIT 1
+            ORDER BY message.sequence
             """,
             (delivery_message_id, attempt_id, runtime_id),
-        ).fetchone()
-        if row is None:
-            return False
-        state = str(row["state"])
-        if state == DeliveryState.HANDLED.value:
-            # The lane already advanced in an earlier reconciliation pass.
-            # Returning False keeps the public reconciled count tied to an
-            # actual transition; the ordinary completed-turn reconciler also
-            # observes the durable successor and leaves the Work untouched.
-            return False
-
-        now = utc_now()
-        if state == DeliveryState.ACKNOWLEDGED.value:
-            updated = connection.execute(
-                """
-                UPDATE message_deliveries
-                SET state = 'handled', handled_at = COALESCE(handled_at, ?),
-                    lease_until = NULL, owner_token = '',
-                    reactivation_policy = 'terminal', updated_at = ?
-                WHERE message_id = ? AND recipient_id = ?
-                  AND runtime_session_id = ? AND generation = ?
-                  AND state = 'acknowledged'
-                """,
-                (
-                    now,
-                    now,
-                    row["message_id"],
-                    row["recipient_id"],
-                    row["runtime_session_id"],
-                    row["generation"],
-                ),
-            ).rowcount
-            event_type = "message.handled"
-            event_data = {
-                "reason_code": "provider_turn_completed_before_successor",
-                "successor_message_id": str(row["successor_message_id"]),
-            }
-        else:
-            updated = connection.execute(
-                """
-                UPDATE message_deliveries
-                SET state = 'dead', next_attempt_at = ?, lease_until = NULL,
-                    owner_token = '',
-                    last_error = 'provider_turn_completed_without_instruction_ack',
-                    reactivation_policy = 'terminal', updated_at = ?
-                WHERE message_id = ? AND recipient_id = ?
-                  AND runtime_session_id = ? AND generation = ?
-                  AND state = 'delivered'
-                """,
-                (
-                    now,
-                    now,
-                    row["message_id"],
-                    row["recipient_id"],
-                    row["runtime_session_id"],
-                    row["generation"],
-                ),
-            ).rowcount
-            event_type = "message.delivery_superseded"
-            event_data = {
-                "reason_code": "provider_turn_completed_without_instruction_ack",
-                "successor_message_id": str(row["successor_message_id"]),
-            }
-        if updated != 1:
-            return False
-        self._event(
-            connection,
-            event_type,
-            "message",
-            str(row["message_id"]),
-            "",
-            event_data,
-            causation_id=str(row["successor_message_id"]),
-        )
-        return True
+        ).fetchall()
+        advanced = False
+        for row in rows:
+            if row["message_id"] == delivery_message_id and not row["successor_message_id"]:
+                continue
+            state = str(row["state"])
+            now = utc_now()
+            if state == DeliveryState.ACKNOWLEDGED.value:
+                updated = connection.execute(
+                    """
+                    UPDATE message_deliveries
+                    SET state = 'handled', handled_at = COALESCE(handled_at, ?),
+                        lease_until = NULL, owner_token = '',
+                        reactivation_policy = 'terminal', updated_at = ?
+                    WHERE message_id = ? AND recipient_id = ?
+                      AND runtime_session_id = ? AND generation = ?
+                      AND state = 'acknowledged'
+                    """,
+                    (
+                        now, now, row["message_id"], row["recipient_id"],
+                        row["runtime_session_id"], row["generation"],
+                    ),
+                ).rowcount
+                event_type = "message.handled"
+                reason = (
+                    "provider_turn_completed_before_successor"
+                    if row["message_id"] == delivery_message_id
+                    else "provider_turn_completed_after_inbox_ack"
+                )
+            else:
+                updated = connection.execute(
+                    """
+                    UPDATE message_deliveries
+                    SET state = 'dead', next_attempt_at = ?, lease_until = NULL,
+                        owner_token = '',
+                        last_error = 'provider_turn_completed_without_instruction_ack',
+                        reactivation_policy = 'terminal', updated_at = ?
+                    WHERE message_id = ? AND recipient_id = ?
+                      AND runtime_session_id = ? AND generation = ?
+                      AND state = 'delivered'
+                    """,
+                    (
+                        now, now, row["message_id"], row["recipient_id"],
+                        row["runtime_session_id"], row["generation"],
+                    ),
+                ).rowcount
+                event_type = "message.delivery_superseded"
+                reason = "provider_turn_completed_without_instruction_ack"
+            if updated != 1:
+                continue
+            event_data = {"reason_code": reason, "source_message_id": delivery_message_id}
+            if row["successor_message_id"]:
+                event_data["successor_message_id"] = str(row["successor_message_id"])
+            self._event(
+                connection, event_type, "message", str(row["message_id"]), "", event_data,
+                causation_id=delivery_message_id,
+            )
+            advanced = True
+        return advanced
 
     def _reconcile_completed_worker_turn_tx(
         self,
@@ -11327,12 +11580,24 @@ class ControlPlane:
                 }
             ]
             if execution_owned_rows:
+                submitted_rows = []
+                for item in execution_owned_rows:
+                    owning_work = connection.execute(
+                        "SELECT * FROM work_items WHERE id = ?", (item["work_item_id"],),
+                    ).fetchone()
+                    assert owning_work is not None
+                    # Reuse the exact unclaimed-Assignment proof. A queued
+                    # followup with no claim, ticket, output or effect cannot
+                    # own the failed provider turn. Uncertain handoffs remain
+                    # owners; only a proven untouched queue entry is excluded.
+                    if not self._task_is_unclaimed_queued_tx(connection, owning_work, item):
+                        submitted_rows.append(item)
                 # A managed runtime is intentionally reusable across a
                 # logical Worker's sequential Work.  Terminal and
                 # supervisor/user-owned historical Attempts are evidence,
                 # never present-tense runtime owners.  Counting them here used
                 # to manufacture ambiguous ownership for every reused Worker.
-                recovery_rows = execution_owned_rows
+                recovery_rows = submitted_rows or execution_owned_rows
             fail_closed_rows = len(recovery_rows) > 1 or any(
                 item["managed_spec_id"] is None for item in recovery_rows
             )
@@ -14013,6 +14278,37 @@ class ControlPlane:
                 cleanup_errors=cleanup_errors,
             )
 
+    def _retire_worker_connections_after_shared_stop(self, *, restart_plan_digest: str) -> int:
+        """Retire transport authority after the controlled lifecycle's proven stop.
+
+        This is owner-local lifecycle plumbing, never an MCP operation or a
+        conclusion about a native task, remote job, Delivery or business result.
+        The caller must have fenced the exact old services and saved the offline
+        rollback copy. Normal startup and conversation close cannot call it.
+        """
+        if not re.fullmatch(r"[a-f0-9]{64}", restart_plan_digest):
+            raise ValidationError("invalid shared restart plan digest")
+        with self.db.transaction() as connection:
+            rows = connection.execute(
+                """SELECT runtime.id FROM runtime_sessions runtime
+                   JOIN worker_enrollments enrollment ON enrollment.runtime_session_id=runtime.id
+                   WHERE enrollment.managed=1 AND enrollment.state NOT IN ('failed','revoked')
+                     AND runtime.state IN ('starting','ready','waiting','busy')""",
+            ).fetchall()
+            for row in rows:
+                runtime_id = str(row["id"])
+                self.fail_runtime_enrollment(
+                    runtime_id, reason="controlled_shared_restart", _connection=connection,
+                )
+                self._mark_provider_runtime_probe_unknown_tx(connection, runtime_id)
+                self.recover_terminal_worker_attempt(
+                    runtime_id, reason="runtime_unavailable", _connection=connection,
+                )
+                self._event(connection, "runtime.connection_retired_for_restart", "runtime",
+                            runtime_id, "", {"restart_plan_digest": restart_plan_digest})
+        self.reconcile_abandoned_worker_output_captures()
+        return len(rows)
+
     def expire_runtime_leases(self) -> int:
         now = utc_now()
         with self.db.transaction() as connection:
@@ -14707,29 +15003,29 @@ class ControlPlane:
             (boundary_id,),
         ).fetchone() is not None
 
-    def _escalate_supervision_tx(
+    def _hold_system_recovery_tx(
         self, connection: sqlite3.Connection, *, boundary: sqlite3.Row,
         work: sqlite3.Row, reason_code: str, reason: str,
         turn: sqlite3.Row | None = None, request_digest: str = "",
     ) -> dict[str, Any]:
-        """Persist a system-owned inability to supervise, never task acceptance.
+        """Retain a technical blocker under CAO ownership, never requester approval.
 
         Call only after proving exact current Boundary authority and either a
         non-retryable command denial or an observed failed recovery. The
         synthetic completed turn is audit provenance, not an LLM judgment or
-        confirmation of purpose. The same Work can resume through WAIT_USER.
+        confirmation of purpose. Unknown Deliveries and effects remain unchanged.
         """
         now = utc_now()
         turn_id = str(turn["id"]) if turn is not None else _id("turn")
         disposition_id = _id("bdisp")
         instruction = (
-            "The objective remains unmet. Explain the supervision failure to the requester "
-            "and obtain guidance or a safe recovery decision; do not repeat the blocked operation."
+            "CAO owns diagnosis and safe recovery of this technical blocker. Report its impact "
+            "without requesting permission for routine recovery. Preserve unknown outcomes."
         )
-        resume_condition = "Requester guidance or verified recovery permits safe continuation."
+        resume_condition = "Authoritative execution evidence admits a safe same-Worker continuation."
         decision_digest = request_digest or _digest({
             "boundary_id": boundary["id"], "reason_code": reason_code,
-            "kind": "wait_user", "origin": "system_supervision_recovery",
+            "kind": "wait_system", "origin": "system_supervision_recovery",
         })
         result_digest = _digest({
             "boundary_id": boundary["id"], "disposition_id": disposition_id,
@@ -14767,19 +15063,11 @@ class ControlPlane:
             """INSERT INTO boundary_dispositions(
                 id, boundary_id, reasoner_turn_id, decided_by, generation, kind,
                 reason, instruction, resume_condition, request_digest, created_at
-            ) VALUES(?, ?, ?, ?, ?, 'wait_user', ?, ?, ?, ?, ?)""",
+            ) VALUES(?, ?, ?, ?, ?, 'wait_system', ?, ?, ?, ?, ?)""",
             (disposition_id, boundary["id"], turn_id, work["supervisor_id"],
              boundary["generation"], reason, instruction, resume_condition, decision_digest, now),
         )
-        connection.execute(
-            "UPDATE attempts SET state = 'input_required', updated_at = ? WHERE id = ?",
-            (now, boundary["attempt_id"]),
-        )
-        connection.execute(
-            "UPDATE work_items SET state = 'user_needed', attention_owner = 'user', "
-            "user_needed_boundary_id = ?, updated_at = ? WHERE id = ?",
-            (boundary["id"], now, work["id"]),
-        )
+        self._record_system_recovery_hold_tx(connection, work=work, boundary=boundary)
         self._supersede_boundary_deliveries_tx(
             connection, boundary_id=str(boundary["id"]),
             recipient_id=str(work["supervisor_id"]), reason=f"system-escalation:{disposition_id}",
@@ -14788,7 +15076,7 @@ class ControlPlane:
             connection, sender_id=str(work["supervisor_id"]),
             recipient_id=str(work["supervisor_id"]), kind=MessageKind.SYSTEM,
             payload={"action": "requester_escalation", "source_boundary_id": boundary["id"],
-                     "disposition_id": disposition_id, "disposition": "wait_user",
+                     "disposition_id": disposition_id, "disposition": "wait_system",
                      "reason": reason, "decision": instruction, "resume_condition": resume_condition,
                      "origin": "system_supervision_recovery", "reason_code": reason_code},
             work_item_id=str(work["id"]), attempt_id=str(boundary["attempt_id"]),
@@ -14799,7 +15087,7 @@ class ControlPlane:
             connection, "boundary.disposed", "work_item", str(work["id"]),
             str(work["supervisor_id"]),
             {"boundary_id": str(boundary["id"]), "disposition_id": disposition_id,
-             "generation": int(boundary["generation"]), "kind": "wait_user",
+             "generation": int(boundary["generation"]), "kind": "wait_system",
              "reason_code": reason_code, "origin": "system_supervision_recovery"},
         )
         result = connection.execute(
@@ -14808,11 +15096,197 @@ class ControlPlane:
         assert result is not None
         return dict(result)
 
+    def _system_recovery_blocker_tx(
+        self, connection: sqlite3.Connection, work: sqlite3.Row,
+    ) -> str:
+        try:
+            self._preflight_managed_worker_command_tx(
+                connection, actor_id=str(work["supervisor_id"]), work=work,
+            )
+        except ConflictError as error:
+            code = str((error.details or {}).get("reason_code") or "")
+            if code in {
+                "worker_command_outcome_unsettled", "worker_command_binding_ambiguous",
+                "worker_command_binding_conflict",
+            }:
+                return code
+            raise
+        return ""
+
+    def _record_system_recovery_hold_tx(
+        self, connection: sqlite3.Connection, *, work: sqlite3.Row, boundary: sqlite3.Row,
+    ) -> None:
+        # Capture the actual failed admission before changing attention/state.
+        # Only its subsequent transition to admissible may re-arm supervision;
+        # an unchanged timeout or failure never creates a model loop.
+        blocker = self._system_recovery_blocker_tx(connection, work)
+        observed = connection.execute(
+            "SELECT e.data_json FROM events e JOIN boundaries b ON b.id=json_extract(e.data_json,'$.boundary_id') "
+            "WHERE e.event_type = 'system_recovery.observed' AND e.aggregate_id = ? "
+            "AND b.work_item_id = ? AND b.attempt_id = ? ORDER BY e.sequence DESC LIMIT 1",
+            (work["managed_worker_thread_id"], work["id"], boundary["attempt_id"]),
+        ).fetchone()
+        probe_digest = str(_load(observed["data_json"], {}).get("fingerprint", "")) if observed else ""
+        now = utc_now()
+        connection.execute(
+            "UPDATE boundary_dispositions SET recovery_blocker = ?, recovery_probe_digest = ? WHERE boundary_id = ?",
+            (blocker, probe_digest, boundary["id"]),
+        )
+        connection.execute(
+            "UPDATE attempts SET state = 'waiting_supervisor', stage = 'system_recovery', "
+            "next_boundary = 'system_recovery', updated_at = ? WHERE id = ?",
+            (now, boundary["attempt_id"]),
+        )
+        connection.execute(
+            "UPDATE work_items SET state = 'waiting_supervisor', attention_owner = 'cao', "
+            "updated_at = ? WHERE id = ?",
+            (now, work["id"]),
+        )
+
+    def _reconcile_system_recovery_holds_tx(
+        self, connection: sqlite3.Connection, *, limit: int,
+    ) -> int:
+        candidates = connection.execute(
+            f"""
+            SELECT DISTINCT work.* FROM work_items work
+            JOIN cao_session_attachments attachment ON attachment.id = work.supervisor_attachment_id
+            JOIN boundaries b ON b.work_item_id = work.id AND b.generation = work.generation
+            JOIN boundary_dispositions d ON d.boundary_id = b.id
+              AND d.kind = 'wait_system' AND d.recovery_blocker <> ''
+            WHERE work.state = 'waiting_supervisor' AND work.attention_owner = 'cao'
+              AND {cao_automatic_wake_ready_sql()}
+            ORDER BY work.created_at, work.id LIMIT ?
+            """, (limit,),
+        ).fetchall()
+        rearmed = 0
+        for work in candidates:
+            held = system_recovery_boundary_tx(connection, work)
+            if held is None or self._system_recovery_blocker_tx(connection, work):
+                continue
+            self._rearm_system_recovery_hold_tx(connection, work=work, held=held)
+            rearmed += 1
+        return rearmed
+
+    @staticmethod
+    def _system_recovery_origin_metadata_tx(
+        connection: sqlite3.Connection, *, work: sqlite3.Row, held: sqlite3.Row,
+    ) -> dict[str, Any] | None:
+        """Retain the original recovery class through genuine diagnostic re-arms.
+
+        Source metadata alone is not lineage authority. Each older-format link
+        needs the exact server event, supervisor, packet and wait-system decision.
+        The existing runtime proof still decides whether the next route executes.
+        """
+        current = held
+        seen: set[str] = set()
+        while str(current["id"]) not in seen:
+            seen.add(str(current["id"]))
+            metadata = _load(current["metadata_json"], {})
+            if not isinstance(metadata, dict):
+                return None
+            if metadata.get("runtime_recovery") is True or (
+                metadata.get("system_recovery") is True
+                and metadata.get("reason") == "worker_turn_completed_without_terminal_report"
+            ):
+                return metadata if current["source_principal_id"] in {
+                    work["supervisor_id"], work["assigned_worker_id"],
+                } else None
+            if current["source_principal_id"] != work["supervisor_id"]:
+                return None
+            source_id = metadata.get("source_boundary_id")
+            if (not isinstance(source_id, str) or not source_id
+                    or current["source_event_id"] != f"system-recovery-ready:{source_id}"):
+                return None
+            source = connection.execute(
+                "SELECT b.* FROM boundaries b JOIN boundary_dispositions d "
+                "ON d.boundary_id=b.id AND d.kind='wait_system' WHERE b.id=?",
+                (source_id,),
+            ).fetchone()
+            if (source is None or int(source["generation"]) >= int(current["generation"])
+                    or any(source[key] != current[key] for key in (
+                        "work_item_id", "attempt_id", "goal_version",
+                        "goal_packet_digest", "task_packet_digest",
+                    ))):
+                return None
+            event = connection.execute(
+                "SELECT 1 FROM events WHERE event_type='cao.system_recovery_ready' "
+                "AND aggregate_type='work_item' AND aggregate_id=? AND actor_id=? "
+                "AND json_valid(data_json) AND json_extract(data_json,'$.boundary_id')=? "
+                "AND json_extract(data_json,'$.source_boundary_id')=? "
+                "AND json_extract(data_json,'$.generation')=? LIMIT 1",
+                (work["id"], work["supervisor_id"], current["id"], source_id, current["generation"]),
+            ).fetchone()
+            if event is None:
+                return None
+            current = source
+        return None
+
+    def _rearm_system_recovery_hold_tx(
+        self, connection: sqlite3.Connection, *, work: sqlite3.Row, held: sqlite3.Row,
+        diagnostic_changed: bool = False,
+        diagnostic_code: str = "",
+    ) -> dict[str, Any]:
+        current = system_recovery_boundary_tx(connection, work)
+        if current is None or current["id"] != held["id"]:
+            raise ConflictError("The exact system recovery is no longer current")
+        self._preflight_managed_worker_command_tx(
+            connection, actor_id=str(work["supervisor_id"]), work=work,
+        )
+        metadata = self._system_recovery_origin_metadata_tx(connection, work=work, held=held)
+        watch_reason = ("system_recovery_diagnostic_changed" if diagnostic_changed
+                        else "system_recovery_route_available")
+        metadata = dict(metadata) if metadata is not None else {"system_recovery": True, "reason": watch_reason}
+        metadata.update(source_boundary_id=str(held["id"]), recovery_watch_reason=watch_reason)
+        generation = int(work["generation"]) + 1
+        now = utc_now()
+        connection.execute(
+            "UPDATE work_items SET generation = ?, updated_at = ? WHERE id = ? AND generation = ?",
+            (generation, now, work["id"], work["generation"]),
+        )
+        connection.execute(
+            "UPDATE attempts SET state = 'waiting_supervisor', stage = 'system_reconciliation', "
+            "next_boundary = 'cao_disposition', updated_at = ? WHERE id = ?",
+            (now, held["attempt_id"]),
+        )
+        boundary = self._record_boundary_tx(
+            connection, actor={"id": str(work["supervisor_id"]), "role": "cao"},
+            request=BoundaryInput(
+                source_event_id=f"system-recovery-ready:{held['id']}",
+                work_item_id=str(work["id"]), attempt_id=str(held["attempt_id"]),
+                expected_goal_version=int(held["goal_version"]),
+                expected_goal_packet_digest=str(held["goal_packet_digest"]),
+                expected_task_packet_digest=str(held["task_packet_digest"]),
+                expected_generation=generation, kind=BoundaryKind.FAILURE,
+                summary=(f"Runtime diagnosis changed ({diagnostic_code}); CAO owns the next safe recovery decision."
+                         if diagnostic_changed else "The prior system blocker cleared; CAO can decide safe continuation."),
+                runtime_state=RuntimeState.WAITING,
+                metadata=metadata,
+            ),
+        )
+        self._message(
+            connection, sender_id=str(work["supervisor_id"]),
+            recipient_id=str(work["supervisor_id"]), kind=MessageKind.SYSTEM,
+            payload=_system_reconciliation_notification_payload(
+                action=_SystemReconciliationNotificationAction.REVIEW_RUNTIME_BOUNDARY,
+                boundary_id=str(boundary["id"]), boundary_kind="failure", generation=generation,
+            ),
+            work_item_id=str(work["id"]), attempt_id=str(held["attempt_id"]),
+            goal_version=int(held["goal_version"]),
+            idempotency_key=f"system-recovery-ready:{held['id']}",
+        )
+        self._event(
+            connection, "cao.system_recovery_ready", "work_item", str(work["id"]),
+            str(work["supervisor_id"]),
+            {"source_boundary_id": str(held["id"]), "boundary_id": str(boundary["id"]),
+             "generation": generation},
+        )
+        return boundary
+
     def recover_expired_reasoner_turns(self) -> int:
         """Advance unresolved Boundaries whose CAO decision lease expired.
 
         The first observed interruption admits one repair wake. Interruption
-        of that recovery becomes durable requester consultation on the same
+        of that recovery becomes a durable CAO-owned system hold on the same
         Work, never a repeated wake loop or an unowned terminal failure. A stale
         turn cannot commit a decision after either transition.
         """
@@ -14870,10 +15344,10 @@ class ControlPlane:
                         "SELECT * FROM work_items WHERE id = ?", (turn["work_item_id"],),
                     ).fetchone()
                     assert boundary is not None and work is not None
-                    self._escalate_supervision_tx(
+                    self._hold_system_recovery_tx(
                         connection, boundary=boundary, work=work,
                         reason_code="supervision_recovery_incomplete",
-                        reason="Supervision recovery ended without a decision; requester guidance is required.",
+                        reason="Supervision recovery ended without a decision; CAO retains recovery responsibility.",
                     )
                     recovered += 1
                     continue
@@ -15112,10 +15586,10 @@ class ControlPlane:
                 "SELECT * FROM work_items WHERE id = ?", (boundary["work_item_id"],),
             ).fetchone()
             assert work is not None
-            self._escalate_supervision_tx(
+            self._hold_system_recovery_tx(
                 connection, boundary=boundary, work=work,
                 reason_code="supervision_recovery_incomplete",
-                reason="Supervision recovery ended without a decision; requester guidance is required.",
+                reason="Supervision recovery ended without a decision; CAO retains recovery responsibility.",
             )
             return "scheduled"
         self._supersede_boundary_deliveries_tx(
@@ -15336,6 +15810,7 @@ class ControlPlane:
             causation_id=str(boundary["id"]),
         )
 
+    @reviewed_command
     def resume_work(
         self, actor: dict[str, Any], work_id: str, request: WorkResumeInput
     ) -> dict[str, Any]:
@@ -15446,6 +15921,7 @@ class ControlPlane:
             )
             return result
 
+    @reviewed_command
     def dispose_boundary(
         self,
         actor: dict[str, Any],
@@ -15480,6 +15956,8 @@ class ControlPlane:
 
         self._require_role(actor, PrincipalRole.CAO)
         request_fields = request.model_dump(mode="json")
+        if request.requester_input_kind is None:
+            request_fields.pop("requester_input_kind", None)
         request_digest = _digest(request_fields)
         compatible_request_digests: tuple[str, ...] = ()
         if (
@@ -15584,6 +16062,8 @@ class ControlPlane:
                 raise ConflictError("reasoner turn lease expired")
             if not secrets.compare_digest(turn["lease_token_digest"], _digest(request.lease_token)):
                 raise AuthorizationError("invalid reasoner turn lease token")
+            from .instruction_review import bind_review_lease
+            bind_review_lease(self, turn)
             boundary_metadata = _load(boundary["metadata_json"], {})
             system_recovery_owned = bool(
                 boundary["kind"] == BoundaryKind.FAILURE.value
@@ -15610,6 +16090,19 @@ class ControlPlane:
                 (system_recovery_owned or runtime_recovery_owned)
                 and recovery_action == "system_reconciliation"
             )
+            if (
+                (system_recovery_owned or runtime_recovery_owned)
+                and request.kind == BoundaryDispositionKind.WAIT_USER
+                and request.requester_input_kind is None
+            ):
+                # Technical uncertainty is never new requester authority.
+                # Return the committed kind so older catalogs cannot silently
+                # turn an internal recovery into another approval request.
+                request = request.model_copy(update={
+                    "kind": BoundaryDispositionKind.WAIT_SYSTEM,
+                    "instruction": "CAO owns diagnosis and safe recovery; no recovery approval is required.",
+                    "resume_condition": "Authoritative evidence admits a safe same-Worker continuation.",
+                })
             if system_recovery_owned or runtime_recovery_owned:
                 allowed_recovery_dispositions = (
                     {
@@ -15617,18 +16110,22 @@ class ControlPlane:
                         BoundaryDispositionKind.CORRECT,
                         BoundaryDispositionKind.PAUSE,
                         BoundaryDispositionKind.WAIT_USER,
+                        BoundaryDispositionKind.WAIT_SYSTEM,
                     }
                     if managed_recovery_executable
                     else (
-                        {BoundaryDispositionKind.WAIT_USER}
+                        {
+                            BoundaryDispositionKind.CONTINUE, BoundaryDispositionKind.CORRECT,
+                            BoundaryDispositionKind.WAIT_USER, BoundaryDispositionKind.WAIT_SYSTEM,
+                        }
                         if system_reconciliation_required
                         else set()
                     )
                 )
                 if request.kind not in allowed_recovery_dispositions:
                     # Executable recovery continues the exact logical Worker.
-                    # A non-executable recovery requires requester guidance.
-                    # Escalation preserves the unmet Work and the unknown-effect
+                    # Technical recovery remains CAO-owned. Holding it preserves
+                    # the unmet Work and the unknown-effect
                     # fence; it grants no authority to retry an execution.
                     raise ConflictError(
                         "system recovery boundary requires its recovery workflow",
@@ -15672,7 +16169,7 @@ class ControlPlane:
                     raise ConflictError(
                         "automatic Worker output requires an OK CAO review before accept"
                     )
-                if boundary_review is not None:
+                if boundary_review is not None and request.kind != BoundaryDispositionKind.CANCEL:
                     if (
                         boundary_review["verdict"] == ReviewVerdict.OK.value
                         and request.kind != BoundaryDispositionKind.ACCEPT
@@ -15688,12 +16185,16 @@ class ControlPlane:
                         BoundaryDispositionKind.RETRY,
                         BoundaryDispositionKind.PAUSE,
                         BoundaryDispositionKind.WAIT_USER,
+                        BoundaryDispositionKind.WAIT_SYSTEM,
                     }:
                         raise ConflictError(
                             "a needs-work completion review requires a corrective disposition",
                             review_id=boundary_review["id"],
                         )
-            if request.kind in {BoundaryDispositionKind.PAUSE, BoundaryDispositionKind.WAIT_USER}:
+            if request.kind in {
+                BoundaryDispositionKind.PAUSE, BoundaryDispositionKind.WAIT_USER,
+                BoundaryDispositionKind.WAIT_SYSTEM,
+            }:
                 _require_worker_safe_task_payload(
                     {
                         "reason": request.reason,
@@ -15709,6 +16210,7 @@ class ControlPlane:
                 try:
                     self._preflight_managed_worker_command_tx(
                         connection, actor_id=str(actor["id"]), work=work,
+                        deciding_boundary_id=boundary_id,
                     )
                 except ConflictError as error:
                     if (error.details or {}).get("reason_code") != "worker_command_outcome_unsettled":
@@ -15716,20 +16218,50 @@ class ControlPlane:
                     # The verified command could not execute. Commit a distinct,
                     # visible consultation outcome instead of leaving its lease
                     # to trigger an identical model invocation indefinitely.
-                    return self._escalate_supervision_tx(
+                    return self._hold_system_recovery_tx(
                         connection, boundary=boundary, work=work,
                         reason_code="worker_command_outcome_unsettled",
                         reason="The requested continuation is blocked by an unsettled execution outcome.",
                         turn=turn, request_digest=request_digest,
                     )
+            if request.kind == BoundaryDispositionKind.WAIT_SYSTEM:
+                blocker = self._system_recovery_blocker_tx(connection, work)
+                managed_diagnostic_boundary = (
+                    bool(work["managed_worker_thread_id"] and work["supervisor_attachment_id"])
+                    and boundary["kind"] in {
+                        BoundaryKind.BLOCKER.value, BoundaryKind.WORKER_OUTPUT.value,
+                        BoundaryKind.FAILURE.value,
+                    }
+                )
+                if not (system_recovery_owned or runtime_recovery_owned or blocker or managed_diagnostic_boundary):
+                    raise ConflictError(
+                        "wait_system requires a technical recovery blocker",
+                        reason_code="system_recovery_blocker_required", retryable=False,
+                    )
+                # This records diagnosis ownership and an optional recovery
+                # plan; it sends no Worker command. Review and exact-lane
+                # admission remain at the actual continuation/correction.
+            effective_instruction = request.instruction
+            if system_reconciliation_required and request.kind in {
+                BoundaryDispositionKind.CONTINUE, BoundaryDispositionKind.CORRECT,
+            }:
+                effective_instruction = (
+                    "First inspect the current task and evidence already supplied or available "
+                    "within its sealed authority. Do not read files, run commands or use services "
+                    "unless the task authorizes those operations. "
+                    "Report completion if acceptance is already met. Continue only proven unmet "
+                    "conditions within existing authority; never repeat a dispatched or unknown "
+                    "operation. Report unresolved evidence back to me.\n" + effective_instruction
+                )
             disposition_id = _id("bdisp")
             now = utc_now()
             connection.execute(
                 """
                 INSERT INTO boundary_dispositions(
                     id, boundary_id, reasoner_turn_id, decided_by, generation,
-                    kind, reason, instruction, resume_condition, request_digest, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    kind, reason, instruction, resume_condition, request_digest, created_at,
+                    requester_input_kind
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     disposition_id,
@@ -15739,10 +16271,11 @@ class ControlPlane:
                     request.expected_generation,
                     request.kind.value,
                     request.reason,
-                    request.instruction,
+                    effective_instruction,
                     request.resume_condition,
                     request_digest,
                     now,
+                    request.requester_input_kind or "",
                 ),
             )
             terminal = False
@@ -15791,7 +16324,7 @@ class ControlPlane:
                     if isinstance(boundary_metadata, Mapping)
                     else ""
                 )
-                instruction = request.instruction
+                instruction = effective_instruction
                 if runtime_recovery:
                     pass
                 else:
@@ -15908,6 +16441,8 @@ class ControlPlane:
                         work["id"],
                     ),
                 )
+            elif request.kind == BoundaryDispositionKind.WAIT_SYSTEM:
+                self._record_system_recovery_hold_tx(connection, work=work, boundary=boundary)
             elif request.kind == BoundaryDispositionKind.ACCEPT:
                 if boundary_review is not None:
                     self._require_completion_delivery_ready_tx(connection, work, attempt)
@@ -15930,6 +16465,9 @@ class ControlPlane:
                             now,
                             work["id"],
                         ),
+                    )
+                    self._accept_checkpoint_next_tx(
+                        connection, actor, work, review_id=str(boundary_review["id"]), next_action=request.next_action,
                     )
                 else:
                     connection.execute(
@@ -16000,7 +16538,10 @@ class ControlPlane:
                 recipient_id=actor["id"],
                 evidence=f"boundary-disposition:{disposition_id}",
             )
-            if request.kind in {BoundaryDispositionKind.WAIT_USER, BoundaryDispositionKind.PAUSE}:
+            if request.kind in {
+                BoundaryDispositionKind.WAIT_USER, BoundaryDispositionKind.PAUSE,
+                BoundaryDispositionKind.WAIT_SYSTEM,
+            }:
                 # Persist the requester-facing handoff in the same transaction
                 # as the decision. Handling the old Boundary cannot consume this
                 # independent notification or stand in for requester guidance.
@@ -16015,7 +16556,7 @@ class ControlPlane:
                         "disposition_id": disposition_id,
                         "disposition": request.kind.value,
                         "reason": request.reason,
-                        "decision": request.instruction,
+                        "decision": effective_instruction,
                         "resume_condition": request.resume_condition,
                     },
                     work_item_id=str(work["id"]),
@@ -16049,6 +16590,7 @@ class ControlPlane:
     # ------------------------------------------------------------------
     # Work and attempts
     # ------------------------------------------------------------------
+    @reviewed_command
     def assign_work(self, actor: dict[str, Any], request: WorkAssignment) -> dict[str, Any]:
         """Compatibility facade for an independent submitted task.
 
@@ -16188,6 +16730,7 @@ class ControlPlane:
             )
         return work
 
+    @reviewed_command
     def revise_goal(
         self,
         actor: dict[str, Any],
@@ -16671,6 +17214,7 @@ class ControlPlane:
                 transition_incomplete()
         return self._work_bundle_tx(connection, str(work["id"]))
 
+    @reviewed_command
     def create_attempt(
         self,
         actor: dict[str, Any],
@@ -17657,15 +18201,10 @@ class ControlPlane:
         else:
             safe_attempt = work["current_attempt"]
         inbox = self.get_inbox(actor, after=0, limit=100, attempt_id=row["id"])
-        inbox_items = (
-            [self._worker_context_message_view(item) for item in inbox["items"]]
-            if actor["role"] == PrincipalRole.WORKER.value
-            else inbox["items"]
-        )
         return {
             "work": work,
             "attempt": safe_attempt,
-            "inbox": inbox_items,
+            "inbox": inbox["items"],
             "continuation": continuation,
         }
 
@@ -17694,6 +18233,7 @@ class ControlPlane:
             "purpose_changed_since_assignment": work["purpose_changed_since_assignment"],
             "maturity": str(work["maturity"]),
             "acceptance": list(work["acceptance"]),
+            "review_criteria": task_review_criteria(goal),
             "non_goals": list(work["non_goals"]),
             "completion_contract": str(work["completion_contract"]),
             "dependencies": dependencies,
@@ -17720,7 +18260,7 @@ class ControlPlane:
         return safe_work, safe_attempt
 
     @staticmethod
-    def _worker_context_message_view(message: Mapping[str, Any]) -> dict[str, Any]:
+    def _worker_message_view(message: Mapping[str, Any]) -> dict[str, Any]:
         """Keep acknowledgement identity plus sealed task semantics only."""
 
         payload = message.get("payload")
@@ -18072,24 +18612,30 @@ class ControlPlane:
         limit: int = 100,
         attempt_id: str | None = None,
         include_acknowledged: bool = False,
+        message_id: str | None = None,
     ) -> dict[str, Any]:
         if actor.get("_cao_conversation_credential_id"):
             self._require_role(actor, PrincipalRole.CAO)
         clauses = ["d.recipient_id = ?", "m.sequence > ?"]
         params: list[Any] = [actor["id"], after]
+        if message_id:
+            self._require_role(actor, PrincipalRole.CAO)
+            clauses = ["d.recipient_id = ?", "m.id = ?"]
+            params = [actor["id"], message_id]
         scoped_attachment_id = str(actor.get("_cao_attachment_id") or "")
         if scoped_attachment_id:
             clauses.append("d.recipient_attachment_id = ?")
             params.append(scoped_attachment_id)
-            clauses.append(
-                cao_notification_inbox_visible_sql(
-                    include_acknowledged=include_acknowledged,
+            if not message_id:
+                clauses.append(
+                    cao_notification_inbox_visible_sql(
+                        include_acknowledged=include_acknowledged,
+                    )
                 )
-            )
         if attempt_id:
             clauses.append("m.attempt_id = ?")
             params.append(attempt_id)
-        if not scoped_attachment_id:
+        if not scoped_attachment_id and not message_id:
             if not include_acknowledged:
                 clauses.append("d.state NOT IN (?, ?)")
                 params.extend([DeliveryState.ACKNOWLEDGED.value, DeliveryState.HANDLED.value])
@@ -18118,6 +18664,14 @@ class ControlPlane:
             has_more = len(rows) > effective_limit
             rows = rows[:effective_limit]
             items = [self._message_view(row, connection=connection) for row in rows]
+            if actor.get("role") == PrincipalRole.WORKER.value:
+                items = [self._worker_message_view(item) for item in items]
+            if message_id:
+                if not items:
+                    raise NotFoundError("message", message_id)
+                from .runtime import render_message_details
+
+                items[0]["processing_instructions"] = render_message_details(items[0])
         return {
             "items": items,
             "next_cursor": items[-1]["sequence"] if has_more and items else None,
@@ -18690,6 +19244,14 @@ class ControlPlane:
                     state=delivery["state"],
                 )
             payload = _load(message["payload_json"], {})
+            if isinstance(payload, Mapping) and payload.get("action") == "purpose_continuation":
+                continuation = purpose_continuation.get_tx(
+                    connection, str(payload.get("purpose_continuation_id") or "")
+                )
+                if (continuation["state"] == "pending"
+                        and continuation["generation"] == payload.get("continuation_generation")):
+                    raise ConflictError("record the next purpose action before handling its notification",
+                                        reason_code="purpose_next_action_required")
             boundary_id = (
                 str(payload.get("boundary_id") or "") if isinstance(payload, Mapping) else ""
             )
@@ -18818,6 +19380,27 @@ class ControlPlane:
                 idempotency_key=idempotency_key,
             )
 
+    @staticmethod
+    def _worker_report_receipt(
+        *, work_item_id: str, attempt_id: str, kind: str, message_id: str,
+        payload: Mapping[str, Any], completion_claim: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        artifacts = [
+            {"id": artifact["id"], "name": artifact["name"], "digest": artifact["digest"],
+             "verified": bool(re.fullmatch(r"[0-9a-f]{64}", str(artifact["digest"]))
+                              and artifact["uri"] == f"owner-private-artifact:{artifact['digest']}")}
+            for artifact in payload.get("artifacts", [])
+        ]
+        return {
+            "work_item_id": work_item_id, "attempt_id": attempt_id,
+            "message_id": message_id, "kind": kind,
+            "artifact_ids": [artifact["id"] for artifact in artifacts],
+            "artifacts": artifacts,
+            "completion_manifest_state": "finalized" if kind == "completion_claim" else "not_finalized",
+            **({"completion_artifact_ids": [artifact["id"] for artifact in completion_claim.get("artifacts", [])]}
+               if kind == "completion_claim" else {}),
+        }
+
     def report(
         self,
         actor: dict[str, Any],
@@ -18894,6 +19477,21 @@ class ControlPlane:
                 compatible_request_digests=compatible_request_digests,
             )
             if cached is not None:
+                if "report_receipt" not in cached:
+                    # Recover the exact old report's receipt without replaying
+                    # registration or guessing from the Work's artifact history.
+                    prior = connection.execute(
+                        "SELECT id, payload_json FROM messages WHERE attempt_id=? "
+                        "AND sender_id=? AND kind=? AND idempotency_key=?",
+                        (attempt_id, actor["id"], request.kind.value, f"report:{request.idempotency_key}"),
+                    ).fetchone()
+                    if prior is not None:
+                        cached["report_receipt"] = self._worker_report_receipt(
+                            work_item_id=str(work["id"]), attempt_id=attempt_id,
+                            kind=request.kind.value, message_id=str(prior["id"]),
+                            payload=_load(prior["payload_json"], {}),
+                            completion_claim=cached.get("current_attempt", {}).get("completion_claim") or {},
+                        )
                 return cached
             if work["goal_version"] != request.expected_goal_version:
                 raise StaleGoalError(request.expected_goal_version, work["goal_version"])
@@ -19009,6 +19607,15 @@ class ControlPlane:
                         artifact=artifact,
                     )
                 )
+            report_fields: dict[str, Any] = {}
+            if request.decision_report is not None:
+                report_fields = {
+                    "decision_report": request.decision_report.model_dump(mode="json"),
+                    "report_checks": validate_report_tx(
+                        connection, report=request.decision_report, kind=request.kind,
+                        goal=self._current_goal_tx(connection, work), attempt_id=attempt_id,
+                    ),
+                }
             if request.kind == ReportKind.COMPLETION_CLAIM:
                 claimed_artifacts = artifact_views
                 if not claimed_artifacts:
@@ -19023,6 +19630,7 @@ class ControlPlane:
                     ]
                 completion_claim = {
                     "summary": request.summary,
+                    **report_fields,
                     "evidence": request.evidence,
                     "artifacts": claimed_artifacts,
                     "artifact_manifest_scope": "verified_attempt_artifacts_v2",
@@ -19087,6 +19695,7 @@ class ControlPlane:
                         runtime_state=RuntimeState.WAITING,
                         metadata={
                             "report_kind": request.kind.value,
+                            **report_fields,
                             "trajectory": trajectory,
                             "stage": request.stage,
                             "next_boundary": request.next_boundary,
@@ -19102,6 +19711,7 @@ class ControlPlane:
             ).fetchone() is None
             payload = {
                 "summary": request.summary,
+                **report_fields,
                 "trajectory": trajectory,
                 "stage": request.stage,
                 "next_boundary": request.next_boundary,
@@ -19126,7 +19736,7 @@ class ControlPlane:
                 # Keep routine progress/artifacts in history without invoking
                 # CAO. An explicit status ask still receives one solicited reply;
                 # only decision boundaries transfer Work attention to CAO.
-                create_delivery=needs_disposition or answered_status_request or first_execution_start,
+                create_delivery=needs_disposition or answered_status_request,
             )
             if first_execution_start:
                 self._event(
@@ -19160,6 +19770,10 @@ class ControlPlane:
                 actor_id=str(actor["id"]),
             )
             result = self._work_bundle_tx(connection, work["id"])
+            result["report_receipt"] = self._worker_report_receipt(
+                work_item_id=str(work["id"]), attempt_id=attempt_id, kind=request.kind.value,
+                message_id=str(message["id"]), payload=payload, completion_claim=completion_claim,
+            )
             self._idempotent_put(
                 connection,
                 actor["id"],
@@ -19207,7 +19821,11 @@ class ControlPlane:
         if (
             delivery is None
             or str(delivery["runtime_session_id"] or "") != expected_runtime_id
-            or str(delivery["state"]) != DeliveryState.ACKNOWLEDGED.value
+            or str(delivery["state"]) not in {
+                DeliveryState.ACKNOWLEDGED.value, DeliveryState.HANDLED.value,
+            }
+            or (delivery["state"] == DeliveryState.HANDLED.value
+                and not delivery["acknowledged_at"])
         ):
             raise ConflictError(
                 "incorporated instruction must be acknowledged on this runtime lane"
@@ -19228,6 +19846,8 @@ class ControlPlane:
     ) -> None:
         """Settle one explicitly incorporated instruction with exact evidence."""
 
+        if delivery["state"] == DeliveryState.HANDLED.value:
+            return
         updated = connection.execute(
             """
             UPDATE message_deliveries
@@ -19389,6 +20009,7 @@ class ControlPlane:
                 )
         return bool(rows)
 
+    @reviewed_command
     def request_status(
         self,
         actor: dict[str, Any],
@@ -20047,6 +20668,7 @@ class ControlPlane:
         )
         return self._work_bundle_tx(connection, str(work["id"]))
 
+    @reviewed_command
     def reply(
         self,
         actor: dict[str, Any],
@@ -20100,6 +20722,16 @@ class ControlPlane:
                 return cached
             confirm_work_purpose_tx(connection, work, expected_purpose_version)
             require_not_paused(work)
+            held = system_recovery_boundary_tx(connection, work)
+            if held is not None:
+                if in_reply_to is not None:
+                    raise ConflictError(
+                        "A system recovery reply targets the current Work, not an older Message",
+                        reason_code="worker_command_generation_conflict", retryable=False,
+                    )
+                self._rearm_system_recovery_hold_tx(connection, work=work, held=held)
+                work = connection.execute("SELECT * FROM work_items WHERE id = ?", (work_id,)).fetchone()
+                assert work is not None
             attempt = self._latest_attempt_tx(connection, work_id)
             if attempt is None:
                 raise ConflictError("work item has no attempt")
@@ -20232,6 +20864,7 @@ class ControlPlane:
             expected_purpose_version=expected_purpose_version,
         )
 
+    @reviewed_command
     def review(self, actor: dict[str, Any], request: ReviewInput) -> dict[str, Any]:
         self._require_role(actor, PrincipalRole.CAO)
 
@@ -20335,6 +20968,8 @@ class ControlPlane:
                                     reason_code="review_criteria_verdict_conflict")
             if any(item.get("kind") == "criterion_assessment" for item in request.evidence):
                 raise ValidationError("Use criterion_assessments for criterion evidence")
+            if any(item.get("kind") == "review_basis" for item in request.evidence):
+                raise ValidationError("Review basis is derived by the Control Plane")
             review_evidence = [*request.evidence, *({
                 "kind": "criterion_assessment", **item.model_dump(mode="json"),
                 "goal_version": int(work["goal_version"]),
@@ -20375,7 +21010,12 @@ class ControlPlane:
                     ).fetchone()
                     assert attempt is not None
                 self._require_completion_delivery_ready_tx(connection, work, attempt)
+            review_evidence.insert(len(request.evidence), review_basis_tx(
+                self, connection, actor=actor, work=work, attempt=attempt, request=request,
+            ))
             if reviews_open_boundary:
+                if request.next_action is not None:
+                    raise ValidationError("Supply next_action on cao_dispose_boundary(kind=accept) for this completion Boundary")
                 assert open_completion_boundary is not None
                 prior_boundary_review = connection.execute(
                     "SELECT id, verdict FROM reviews WHERE boundary_id = ?",
@@ -20470,6 +21110,7 @@ class ControlPlane:
                         work["id"],
                     ),
                 )
+                self._accept_checkpoint_next_tx(connection, actor, work, review_id=review_id, next_action=request.next_action)
                 recipient_id = (
                     work["supervisor_id"]
                     if work["supervisor_attachment_id"]
@@ -21855,7 +22496,10 @@ class ControlPlane:
         if existing is not None:
             if existing["input_digest"] != input_digest:
                 raise ConflictError("boundary source identity was reused with different data")
-            if request.metadata.get("runtime_recovery") is True:
+            if (
+                request.metadata.get("runtime_recovery") is True
+                or request.metadata.get("system_recovery") is True
+            ):
                 _backfill_managed_worker_recovery_actions(connection, self.settings)
                 existing = connection.execute(
                     "SELECT * FROM boundaries WHERE id = ?", (existing["id"],)
@@ -21932,7 +22576,10 @@ class ControlPlane:
                 "generation": request.expected_generation,
             },
         )
-        if request.metadata.get("runtime_recovery") is True:
+        if (
+            request.metadata.get("runtime_recovery") is True
+            or request.metadata.get("system_recovery") is True
+        ):
             _backfill_managed_worker_recovery_actions(connection, self.settings)
         row = connection.execute("SELECT * FROM boundaries WHERE id = ?", (boundary_id,)).fetchone()
         assert row is not None
@@ -22835,6 +23482,8 @@ class ControlPlane:
             request.expected_purpose_version,
             required=admission is not None,
         )
+        if admission is not None:
+            purpose_continuation.require_assignable_tx(connection, admission.worker_thread_id)
         runtime_session_id = (
             admission.runtime_session_id
             if admission is not None
@@ -23349,9 +23998,9 @@ class ControlPlane:
             else:
                 # Cancellation is authoritative even when the Worker has
                 # already stopped.  Do not resurrect it merely to deliver an
-                # informational cancel packet; terminalize any unresolved
-                # delivery for this Attempt with a fixed, non-conversational
-                # outcome instead.
+                # informational cancel packet. Conversation close preserves
+                # unknown dispatched history; its caller separately settles
+                # only proven pre-MCP deliveries.
                 connection.execute(
                     """
                     UPDATE message_deliveries
@@ -23360,6 +24009,7 @@ class ControlPlane:
                     WHERE message_id IN (
                         SELECT id FROM messages WHERE attempt_id = ?
                     ) AND state IN (?, ?, ?, ?, ?)
+                      AND (state <> 'dispatched' OR ? = '')
                     """,
                     (
                         DeliveryState.DEAD.value,
@@ -23372,6 +24022,7 @@ class ControlPlane:
                         DeliveryState.DISPATCHED.value,
                         DeliveryState.DELIVERED.value,
                         DeliveryState.ACKNOWLEDGED.value,
+                        close_request_digest,
                     ),
                 )
                 self._event(
@@ -23841,6 +24492,9 @@ class ControlPlane:
                 recovery_state="system_unavailable",
             )
 
+        replace_cold_handle = assignment_not_submitted and _cold_native_handle_replacement_is_proven(
+            connection, worker_id=str(attempt["worker_id"]), runtime_id=str(attempt["runtime_session_id"]),
+        )
         now = utc_now()
         if reason == "worker_turn_completed_without_terminal_report":
             # The provider turn ended authoritatively, but the task outcome did
@@ -23909,7 +24563,7 @@ class ControlPlane:
                 source["runtime_endpoint"],
                 (
                     source["runtime_native_session_id"]
-                    if pre_dispatch_timeout or assignment_not_submitted or reconcile_unknown
+                    if not replace_cold_handle and (pre_dispatch_timeout or assignment_not_submitted or reconcile_unknown)
                     else ""
                 ),
                 utc_after(86400),
@@ -24312,6 +24966,7 @@ class ControlPlane:
         value["metadata"] = _load(value.pop("metadata_json"), {})
         value["supervision_pause"] = pause_view_tx(connection, work)
         value["requester_escalation"] = requester_escalation_tx(connection, work)
+        value["system_recovery"] = system_recovery_tx(connection, work)
         revisions = connection.execute(
             "SELECT * FROM goal_revisions WHERE work_item_id = ? ORDER BY version",
             (work_id,),
@@ -24360,6 +25015,17 @@ class ControlPlane:
         value["purpose_alignment"] = purpose_alignment(value["worker_purpose"], value["assignment_purpose"])
         value["review_criteria"] = task_review_criteria(current_goal)
         value["supervision_guidance"] = PURPOSE_GUIDANCE
+        value["purpose_continuations"] = purpose_continuation.for_work_tx(connection, work_id)
+        instruction_review = connection.execute(
+            "SELECT id,verdict,result_json,model,elapsed_ms,message_id FROM instruction_reviews "
+            "WHERE work_item_id=? ORDER BY rowid DESC LIMIT 1", (work_id,),
+        ).fetchone()
+        value["latest_instruction_review"] = ({
+            "id": instruction_review["id"], "verdict": instruction_review["verdict"],
+            "assessment": _load(instruction_review["result_json"], {}),
+            "requested_model": instruction_review["model"], "elapsed_ms": instruction_review["elapsed_ms"],
+            "message_id": instruction_review["message_id"],
+        } if instruction_review is not None else None)
         value["maturity"] = current_goal["maturity"]
         value["acceptance"] = list(current_goal["acceptance"])
         value["non_goals"] = list(current_goal["non_goals"])
@@ -24389,6 +25055,9 @@ class ControlPlane:
             ).fetchall()
         ]
         value["current_worker_outputs"] = current_output_views_tx(
+            connection, work_id, str(attempts[-1]["id"]) if attempts else ""
+        )
+        value["provider_response"] = response_evidence_tx(
             connection, work_id, str(attempts[-1]["id"]) if attempts else ""
         )
         value["delivery_state"] = self._completion_delivery_state_tx(
@@ -24594,6 +25263,8 @@ class ControlPlane:
             if isinstance(loaded_runtime_metadata, Mapping):
                 runtime_metadata = loaded_runtime_metadata
         assignment_acceptance = "not_observed"
+        failure_code = None
+        startup_diagnostics: dict[str, str] = {}
         if delivery is not None and str(
             runtime_metadata.get("last_dispatch_message_id") or ""
         ) == str(delivery["message_id"]):
@@ -24601,6 +25272,25 @@ class ControlPlane:
             diagnostics = (
                 last_dispatch.get("diagnostics") if isinstance(last_dispatch, Mapping) else None
             )
+            from .worker_dispatch import RUNTIME_REPAIR_FAILURE_CODES
+            selected_code = diagnostics.get("failure_code") if isinstance(diagnostics, Mapping) else None
+            if isinstance(selected_code, str) and selected_code in RUNTIME_REPAIR_FAILURE_CODES:
+                failure_code = selected_code
+            if failure_code in {"mcp_startup_timeout", "mcp_startup_failed"} and isinstance(diagnostics, Mapping):
+                startup_status = diagnostics.get("mcp_startup_status")
+                if startup_status in {"unobserved", "starting", "ready", "failed", "cancelled"}:
+                    startup_diagnostics["mcp_startup_status"] = str(startup_status)
+                if diagnostics.get("mcp_startup_failure_reason") == "reauthentication_required":
+                    startup_diagnostics["mcp_startup_failure_reason"] = "reauthentication_required"
+                probe_status = diagnostics.get("mcp_startup_probe_status")
+                if isinstance(probe_status, str) and probe_status in {
+                    "notStarted", "starting", "connected", "authenticationRequired",
+                    "failed", "cancelled", "disabled", "unavailable", "invalid",
+                }:
+                    startup_diagnostics["mcp_startup_probe_status"] = probe_status
+                probe_catalog = diagnostics.get("mcp_startup_probe_catalog")
+                if isinstance(probe_catalog, str) and probe_catalog in {"available", "unavailable"}:
+                    startup_diagnostics["mcp_startup_probe_catalog"] = str(probe_catalog)
             observed_acceptance = (
                 diagnostics.get("delivery_acceptance") if isinstance(diagnostics, Mapping) else None
             )
@@ -24673,6 +25363,8 @@ class ControlPlane:
             "heartbeat_observed": heartbeat_observed,
             "worker_report_observed": worker_report_observed,
             "assignment_delivery_boundary": assignment_acceptance,
+            "failure_code": failure_code,
+            **startup_diagnostics,
             "safe_to_redeliver": safe_to_redeliver,
             "safe_to_reconcile": safe_to_reconcile,
             "recovery_action": recovery_action or None,
@@ -24765,7 +25457,38 @@ class ControlPlane:
             "SELECT created_at, data_json FROM events WHERE event_type = 'attempt.execution_started' "
             "AND aggregate_id = ? ORDER BY sequence LIMIT 1", (attempt["id"],),
         ).fetchone()
+        provider_activity = {}
+        for field, event_type in (("provider_queue_acceptance", "attempt.provider_queue_accepted"),
+                                  ("provider_turn_start", "attempt.provider_turn_started"),
+                                  ("provider_start_watch", "attempt.provider_start_unconfirmed")):
+            observation = connection.execute(
+                "SELECT created_at, data_json FROM events WHERE event_type = ? "
+                "AND aggregate_id = ? ORDER BY sequence LIMIT 1", (event_type, attempt["id"]),
+            ).fetchone()
+            provider_activity[field] = ({
+                "observed_at": str(observation["created_at"]),
+                "message_id": _load(observation["data_json"], {}).get("message_id"),
+                "source": "system_watch" if field == "provider_start_watch" else "provider_transport",
+            } if observation else None)
+            activity_entry = provider_activity[field]
+            if observation and field == "provider_turn_start" and isinstance(activity_entry, dict):
+                activation_source = _load(observation["data_json"], {}).get("activation_source")
+                if activation_source in {"turn_start_reply", "user_message_event"}:
+                    activity_entry["activation_source"] = activation_source
+        diagnosis = connection.execute(
+            "SELECT created_at, data_json FROM events WHERE event_type = 'attempt.provider_start_diagnosed' "
+            "AND aggregate_id = ? ORDER BY sequence DESC LIMIT 1", (attempt["id"],),
+        ).fetchone()
+        diagnosis_data = _load(diagnosis["data_json"], {}) if diagnosis else {}
+        provider_activity["provider_start_diagnosis"] = ({
+            "observed_at": str(diagnosis["created_at"]), "source": "provider_read_only",
+            **{key: diagnosis_data.get(key) for key in
+               ("message_id", "state", "reason_code", "input_state", "other_pending_input", "history_complete", "probe_stage")},
+            "watch_active": bool(attempt["state"] == "assigned" or
+                                 (attempt["state"] == "waiting_supervisor" and attempt["stage"] == "system_recovery")),
+        } if diagnosis else None)
         return {
+            **provider_activity,
             "runtime_heartbeat_at": (
                 str(runtime["heartbeat_at"] or "") if runtime is not None else ""
             ),
@@ -25434,6 +26157,36 @@ class ControlPlane:
                 causation_id=boundary_id,
             )
 
+    def record_disconnected_command_result(
+        self, actor: dict[str, Any], *, operation: str, arguments: Mapping[str, Any], succeeded: bool,
+    ) -> None:
+        """A lost response cannot erase a completed, already-authorized command."""
+        if actor.get("role") != PrincipalRole.CAO.value:
+            self._require_role(actor, PrincipalRole.CAO)
+        attachment_id = actor.get("_cao_attachment_id")
+        if not attachment_id:
+            return
+        # Transport nonces are not a changed command or a new notification.
+        semantic = {key: value for key, value in arguments.items()
+                    if key not in {"lease_token", "turn_id", "idempotency_key"}}
+        digest = canonical_sha256({"operation": operation, "arguments": semantic, "succeeded": succeeded})
+        with self.db.transaction() as connection:
+            attachment = connection.execute(
+                "SELECT state,generation FROM cao_session_attachments WHERE id=? AND principal_id=?",
+                (attachment_id, actor["id"]),
+            ).fetchone()
+            if (attachment is None or attachment["state"] != "active"
+                    or attachment["generation"] != actor.get("_cao_attachment_generation")):
+                return
+            self._require_role(actor, PrincipalRole.CAO)
+            self._message(
+                connection, sender_id=actor["id"], recipient_id=actor["id"], kind=MessageKind.SYSTEM,
+                recipient_cao_attachment_id=str(attachment_id),
+                payload={"action": "cao_command_result_available", "operation": operation,
+                         "outcome": "returned_success" if succeeded else "returned_error", "command_digest": digest},
+                idempotency_key=f"lost-command-result:{attachment_id}:{digest}",
+            )
+
     def _message(
         self,
         connection: sqlite3.Connection,
@@ -25450,6 +26203,7 @@ class ControlPlane:
         idempotency_key: str = "",
         goal_version: int | None = None,
         runtime_session_id: str | None = None,
+        recipient_cao_attachment_id: str | None = None,
         create_delivery: bool = True,
     ) -> dict[str, Any]:
         recipients = list(
@@ -25531,6 +26285,22 @@ class ControlPlane:
                         "Assignment business purpose does not match the current Worker"
                     )
                 payload = {**payload, "worker_purpose": purpose}
+        existing = connection.execute(
+            "SELECT * FROM messages WHERE sender_id = ? AND idempotency_key = ?",
+            (sender_id, idempotency_key),
+        ).fetchone() if idempotency_key else None
+        from .notifications import is_supervisor_notification, presentation_tx
+
+        if create_delivery and is_supervisor_notification(kind.value, payload):
+            payload = {key: value for key, value in payload.items() if key != "notification_presentation"}
+            if existing is not None:
+                saved_presentation = _load(existing["payload_json"], {}).get("notification_presentation")
+            else:
+                saved_presentation = presentation_tx(
+                    connection, work_id=work_item_id, goal_version=goal_version,
+                )
+            if saved_presentation is not None:
+                payload["notification_presentation"] = saved_presentation
         payload_digest = _digest(payload)
         message_digest = _digest(
             {
@@ -25546,18 +26316,28 @@ class ControlPlane:
                 "goal_packet_digest": goal_digest_value,
                 "task_packet_digest": task_digest_value,
                 "runtime_session_id": bound_runtime_session_id,
+                **({"recipient_cao_attachment_id": recipient_cao_attachment_id} if recipient_cao_attachment_id else {}),
             }
         )
-        if idempotency_key:
-            existing = connection.execute(
-                "SELECT * FROM messages WHERE sender_id = ? AND idempotency_key = ?",
-                (sender_id, idempotency_key),
-            ).fetchone()
-            if existing:
-                if existing["message_digest"] and existing["message_digest"] != message_digest:
-                    raise ConflictError("message idempotency key was reused with different content")
-                return self._message_bundle_tx(connection, str(existing["id"]))
+        if existing is not None:
+            if existing["message_digest"] and existing["message_digest"] != message_digest:
+                raise ConflictError("message idempotency key was reused with different content")
+            return self._message_bundle_tx(connection, str(existing["id"]))
+        instruction_review_id = None
+        if (kind in {MessageKind.ASSIGNMENT, MessageKind.INSTRUCTION, MessageKind.STATUS_REQUEST}
+                and work_item_id and goal_version is not None
+                and work_supervisor_attachment_id and work_binding["managed_worker_thread_id"]
+                and sender_id == work_supervisor_id):
+            instruction_review_id = review_worker_message_tx(
+                self, connection, attachment_id=work_supervisor_attachment_id,
+                worker_thread_id=str(work_binding["managed_worker_thread_id"]),
+                work_id=work_item_id, goal_version=goal_version,
+                kind=kind.value, payload=payload,
+            )
         message_id = _id("msg")
+        if instruction_review_id:
+            connection.execute("UPDATE instruction_reviews SET work_item_id=?, message_id=? WHERE id=?",
+                               (work_item_id, message_id, instruction_review_id))
         now = utc_now()
         correlation = correlation_id or message_id
         connection.execute(
@@ -25614,7 +26394,17 @@ class ControlPlane:
                     raise AuthorizationError(
                         "Work-bound CAO delivery must target its exact supervisor"
                     )
-                recipient_attachment_id = work_supervisor_attachment_id
+                if (recipient_cao_attachment_id and work_supervisor_attachment_id
+                        and recipient_cao_attachment_id != work_supervisor_attachment_id):
+                    raise AuthorizationError("CAO message attachment does not own this Work")
+                recipient_attachment_id = recipient_cao_attachment_id or work_supervisor_attachment_id
+                if recipient_attachment_id:
+                    target = connection.execute(
+                        "SELECT id FROM cao_session_attachments WHERE id=? AND principal_id=? AND state='active'",
+                        (recipient_attachment_id, recipient),
+                    ).fetchone()
+                    if target is None:
+                        raise AuthorizationError("CAO message attachment is not active for its recipient")
             if recipient == attempt_worker_id:
                 if recipient_runtime_id is not None and recipient_runtime_id != attempt_runtime_id:
                     raise ConflictError("message runtime does not match the durable task packet")
@@ -25658,23 +26448,13 @@ class ControlPlane:
                     (recipient, now, now, now),
                 ).fetchone()
             elif principal["role"] == PrincipalRole.CAO.value:
-                # A Work-bound CAO delivery is pinned to the immutable
-                # attachment chosen at delegation.  Do not infer a thread from
-                # activity, timestamps, or a legacy runtime: that would allow
-                # Work from thread A to wake thread B.
+                # The exact originating attachment is authority; no activity,
+                # process identity or recent conversation can select a recipient.
                 runtime = connection.execute(
-                    """
-                    SELECT r.*
-                    FROM work_items AS w
-                    JOIN cao_session_attachments AS a
-                      ON a.id = w.supervisor_attachment_id
-                    JOIN runtime_sessions AS r ON r.id = a.runtime_session_id
-                    WHERE w.id = ? AND w.supervisor_id = ?
-                      AND a.principal_id = ? AND a.state = 'active'
-                      AND a.lease_expires_at > ? AND r.lease_expires_at > ?
-                      AND r.state IN ('ready', 'waiting', 'busy')
-                    """,
-                    (work_item_id, recipient, recipient, now, now),
+                    "SELECT r.* FROM cao_session_attachments AS a JOIN runtime_sessions AS r ON r.id=a.runtime_session_id "
+                    "WHERE a.id=? AND a.principal_id=? AND a.state='active' AND a.lease_expires_at>? "
+                    "AND r.lease_expires_at>? AND r.state IN ('ready','waiting','busy')",
+                    (recipient_attachment_id, recipient, now, now),
                 ).fetchone()
             else:
                 runtime = connection.execute(

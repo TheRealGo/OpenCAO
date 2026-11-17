@@ -6,7 +6,7 @@ import json
 import os
 import stat
 import sys
-from datetime import UTC, datetime
+from contextlib import closing
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,7 +17,7 @@ from .api import create_app
 from .attachment_issuer import attachment_issuer_path
 from .config import Settings
 from .dashboard_access import DashboardAccessCoordinator
-from .database import Database, backup_sqlite_database
+from .database import Database, backup_sqlite_database, read_only_sqlite_connection
 from .effects import EffectExecutor, effect_argv_digest, effect_workdir_digest
 from .mcp import serve_stdio
 from .models import (
@@ -368,6 +368,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _settings(args: argparse.Namespace) -> Settings:
+    if args.command == "doctor":
+        return Settings.load(args.config, prepare_directories=False)
     return Settings.load(args.config)
 
 
@@ -386,9 +388,31 @@ def _dashboard_access_coordinator(
     )
 
 
-def _doctor(service: ControlPlane, settings: Settings) -> dict[str, Any]:
-    integrity = service.db.integrity_check()
-    service.expire_runtime_leases()
+def _doctor(settings: Settings) -> dict[str, Any]:
+    # Diagnostics observe one committed snapshot. Constructing Database or
+    # ControlPlane would migrate state and schedule recovery before diagnosis;
+    # expiring leases would also require the writer we may need to diagnose.
+    with closing(read_only_sqlite_connection(settings.database_path.absolute())) as connection:
+        connection.execute("BEGIN")
+        integrity_rows = [row[0] for row in connection.execute("PRAGMA integrity_check")]
+        foreign_keys = [dict(row) for row in connection.execute("PRAGMA foreign_key_check")]
+        integrity = {
+            "ok": integrity_rows == ["ok"] and not foreign_keys,
+            "integrity": integrity_rows,
+            "foreign_key_errors": foreign_keys,
+        }
+        counts = {
+            key: int(connection.execute(query).fetchone()[0])
+            for key, query in {
+                "started_effects": "SELECT COUNT(*) FROM effect_operations WHERE status='started'",
+                "unknown_effects": "SELECT COUNT(*) FROM effect_operations WHERE status='unknown'",
+                "unknown_deliveries": "SELECT COUNT(*) FROM message_deliveries WHERE state='dispatched'",
+                "dead_deliveries": "SELECT COUNT(*) FROM message_deliveries WHERE state='dead'",
+                "dead_pushes": "SELECT COUNT(*) FROM a2a_push_deliveries WHERE state='dead'",
+                "principals": "SELECT COUNT(*) FROM principals",
+                "runtimes": "SELECT COUNT(*) FROM runtime_sessions",
+            }.items()
+        }
     permissions: dict[str, Any] = {}
     for path in [settings.state_dir, settings.database_path, settings.token_export_path]:
         if path.exists():
@@ -399,26 +423,11 @@ def _doctor(service: ControlPlane, settings: Settings) -> dict[str, Any]:
                 "expected": oct(expected),
                 "ok": mode == expected,
             }
-    started_effects = service.db.fetchone(
-        "SELECT COUNT(*) AS count FROM effect_operations WHERE status = 'started'"
-    )
-    unknown_effects = service.db.fetchone(
-        "SELECT COUNT(*) AS count FROM effect_operations WHERE status = 'unknown'"
-    )
-    unknown_deliveries = service.db.fetchone(
-        "SELECT COUNT(*) AS count FROM message_deliveries WHERE state = 'dispatched'"
-    )
-    dead_deliveries = service.db.fetchone(
-        "SELECT COUNT(*) AS count FROM message_deliveries WHERE state = 'dead'"
-    )
-    dead_pushes = service.db.fetchone(
-        "SELECT COUNT(*) AS count FROM a2a_push_deliveries WHERE state = 'dead'"
-    )
-    started_effect_count = int(started_effects["count"] if started_effects else 0)
-    unknown_effect_count = int(unknown_effects["count"] if unknown_effects else 0)
-    unknown_delivery_count = int(unknown_deliveries["count"] if unknown_deliveries else 0)
-    dead_delivery_count = int(dead_deliveries["count"] if dead_deliveries else 0)
-    dead_push_count = int(dead_pushes["count"] if dead_pushes else 0)
+    started_effect_count = counts["started_effects"]
+    unknown_effect_count = counts["unknown_effects"]
+    unknown_delivery_count = counts["unknown_deliveries"]
+    dead_delivery_count = counts["dead_deliveries"]
+    dead_push_count = counts["dead_pushes"]
     blocking_conditions: list[str] = []
     if unknown_effect_count:
         blocking_conditions.append("unknown_effect_outcome")
@@ -439,8 +448,8 @@ def _doctor(service: ControlPlane, settings: Settings) -> dict[str, Any]:
         "degraded_conditions": degraded_conditions,
         "database": integrity,
         "permissions": permissions,
-        "principals": len(service.list_principals()),
-        "runtimes": len(service.list_runtimes()),
+        "principals": counts["principals"],
+        "runtimes": counts["runtimes"],
         "started_effect_operations": started_effect_count,
         "unknown_effect_operations": unknown_effect_count,
         "unresolved_effect_operations": started_effect_count + unknown_effect_count,
@@ -481,13 +490,14 @@ def run(args: argparse.Namespace) -> int:
             host=args.host or settings.host,
             port=args.port or settings.port,
             reload=bool(args.reload),
+            access_log=False,
         )
         return 0
     if args.command == "backup":
         destination = args.destination or (
             settings.state_dir
             / "backups"
-            / f"control-plane-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
+            / "control-plane-latest.sqlite3"
         )
         backup = backup_sqlite_database(settings.database_path, destination)
         _print(
@@ -535,6 +545,11 @@ def run(args: argparse.Namespace) -> int:
             )
         )
 
+    if args.command == "doctor":
+        result = _doctor(settings)
+        _print(result)
+        return 0 if result["ok"] else 1
+
     service = ControlPlane(Database(settings), settings)
     if args.command == "init":
         result = service.bootstrap()
@@ -556,10 +571,6 @@ def run(args: argparse.Namespace) -> int:
             }
         )
         return 0
-    if args.command == "doctor":
-        result = _doctor(service, settings)
-        _print(result)
-        return 0 if result["ok"] else 1
     if args.command == "prune":
         _print(
             service.db.prune(

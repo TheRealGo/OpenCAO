@@ -17,6 +17,7 @@ from conftest import (
     attach_cao_session_with_peer,
     business_purpose_contract,
     current_cao_session_attachment,
+    seed_pre_checkpoint_review,
 )
 from fastapi.testclient import TestClient
 
@@ -268,8 +269,8 @@ def _reviewed_attached_work(
         completion_message_id,
         evidence="The attached CAO conversation disposed the completion boundary.",
     )
-    reviewed = service.review(
-        reviewer or cao_runtime,
+    reviewed = seed_pre_checkpoint_review(
+        service, reviewer or cao_runtime,
         ReviewInput(
             expected_purpose_version=1 if managed_thread is not None else None,
             attempt_id=attempt["id"],
@@ -284,8 +285,16 @@ def _reviewed_attached_work(
         ),
     )
     review_inbox = service.get_inbox(cao_runtime)
-    assert len(review_inbox["items"]) == 1
-    review_message_id = str(review_inbox["items"][0]["id"])
+    review_messages = [item for item in review_inbox["items"] if item["kind"] == "review"]
+    assert len(review_messages) == 1
+    if managed_thread is not None:
+        continuations = [item for item in review_inbox["items"]
+                         if item["payload"].get("action") == "purpose_continuation"]
+        assert len(continuations) == 1
+        assert reviewed["purpose_continuations"][0]["state"] == "pending"
+    else:
+        assert len(review_inbox["items"]) == 1
+    review_message_id = str(review_messages[0]["id"])
     service.acknowledge(cao_runtime, AckInput(message_ids=[review_message_id]))
     service.mark_message_handled(
         cao_runtime,
@@ -524,6 +533,7 @@ def test_attached_cao_mcp_records_requester_decision_without_user_runtime(system
 
 def test_public_conversation_finishes_reviewed_work_without_guessing_requester_or_work(
     system: dict[str, Any],
+    monkeypatch,
 ) -> None:
     """One attached-CAO Finish closes reviewed Work without a manual pipeline."""
 
@@ -531,6 +541,13 @@ def test_public_conversation_finishes_reviewed_work_without_guessing_requester_o
     # Build the HTTP facade first so its release-catalog reconciliation cannot
     # revoke a CSC issued by the fixture afterward.
     app = create_app(system["settings"])
+
+    async def no_background_reconciliation():
+        # The global event-count assertion below isolates rejected tool calls.
+        # Dispatcher reconciliation has its own tests and may commit events.
+        return None
+
+    monkeypatch.setattr(app.state.dispatcher, "start", no_background_reconciliation)
     attachment, cao_runtime, _runtime_token = _attached_credential(
         system, thread_id="public-finish-close"
     )

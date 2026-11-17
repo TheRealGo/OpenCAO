@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -10,6 +11,7 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -197,6 +199,7 @@ class BoundaryDispositionKind(StrEnum):
     CORRECT = "correct"
     RETRY = "retry"
     WAIT_USER = "wait_user"
+    WAIT_SYSTEM = "wait_system"
     PAUSE = "pause"
     ACCEPT = "accept"
     CANCEL = "cancel"
@@ -424,6 +427,8 @@ class InstructWorkerThreadInput(WorkerThreadLifecycleInput, PurposeCheckedInput)
     """Record one sealed Work for an exact active managed Worker thread."""
 
     title: str | None = Field(default=None, min_length=1, max_length=300)
+    purpose_continuation_id: str | None = Field(default=None, pattern=r"^pcn_[a-f0-9]{32}$")
+    expected_continuation_generation: int | None = Field(default=None, ge=1, strict=True)
     objective: str = Field(min_length=1, validation_alias=AliasChoices("instruction", "objective"))
     maturity: GoalMaturity = GoalMaturity.UNSET
     acceptance: list[str] = Field(default_factory=list)
@@ -709,7 +714,36 @@ class ReasonerTurnAcquireInput(APIModel):
     idempotency_key: str = Field(min_length=1)
 
 
+class PurposeCriterionAssessment(APIModel):
+    criterion_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    evidence: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+
+
+class CheckpointNextInput(APIModel):
+    """The purpose state committed with successful checkpoint acceptance."""
+
+    kind: Literal["continue", "achieved", "wait_until", "wait_user", "pause"]
+    reason: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    evidence: str = Field(min_length=1, max_length=4000, pattern=r"\S")
+    next_instruction: InstructWorkerThreadInput | None = None
+    next_work_item_id: str | None = Field(default=None, pattern=r"^wrk_[a-f0-9]{32}$")
+    resume_at: str | None = None
+    resume_condition: str = ""
+    requester_input_kind: Literal["new_authority", "budget", "business_direction", "private_information"] | None = None
+    criterion_assessments: list[PurposeCriterionAssessment] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def one_next_state(self) -> CheckpointNextInput:
+        if self.kind == "continue":
+            if (self.next_instruction is None) == (self.next_work_item_id is None):
+                raise ValueError("continue requires exactly one next instruction or existing Work")
+        elif self.next_instruction is not None or self.next_work_item_id is not None:
+            raise ValueError("Only continue may assign a successor")
+        return self
+
+
 class BoundaryDispositionInput(PurposeCheckedInput):
+    next_action: CheckpointNextInput | None = Field(default=None, exclude_if=lambda value: value is None)
     turn_id: str = Field(min_length=1)
     lease_token: str = Field(min_length=1)
     expected_generation: int = Field(ge=1)
@@ -717,27 +751,37 @@ class BoundaryDispositionInput(PurposeCheckedInput):
     reason: str = Field(min_length=1)
     instruction: str = ""
     resume_condition: str = ""
+    requester_input_kind: Literal[
+        "new_authority", "budget", "business_direction", "private_information"
+    ] | None = None
     worker_id: str | None = None
     runtime_session_id: str | None = None
 
     @model_validator(mode="after")
     def retry_target_is_retry_only(self) -> BoundaryDispositionInput:
+        if self.next_action is not None and self.kind != BoundaryDispositionKind.ACCEPT:
+            raise ValueError("next_action is valid only with checkpoint acceptance")
         if self.kind != BoundaryDispositionKind.RETRY and (
             self.worker_id is not None or self.runtime_session_id is not None
         ):
             raise ValueError("worker/runtime overrides are valid only for retry")
         if self.kind == BoundaryDispositionKind.WAIT_USER and not self.instruction.strip():
             raise ValueError("wait_user requires the exact requester decision")
+        if self.requester_input_kind is not None and self.kind != BoundaryDispositionKind.WAIT_USER:
+            raise ValueError("requester_input_kind is valid only for wait_user")
         if self.kind == BoundaryDispositionKind.PAUSE:
             if not self.reason.strip():
                 raise ValueError("pause requires a concrete reason")
             if self.instruction:
                 raise ValueError("pause cannot send a Worker instruction")
-        if self.kind in {BoundaryDispositionKind.WAIT_USER, BoundaryDispositionKind.PAUSE}:
+        if self.kind in {
+            BoundaryDispositionKind.WAIT_USER, BoundaryDispositionKind.WAIT_SYSTEM,
+            BoundaryDispositionKind.PAUSE,
+        }:
             if not self.resume_condition.strip():
-                raise ValueError("wait_user and pause require a concrete resume condition")
+                raise ValueError("wait_user, wait_system and pause require a concrete resume condition")
         elif self.resume_condition:
-            raise ValueError("resume_condition is valid only for wait_user or pause")
+            raise ValueError("resume_condition is valid only for wait_user, wait_system or pause")
         return self
 
 
@@ -845,6 +889,42 @@ class WorkerOutputReadInput(APIModel):
     idempotency_key: str = Field(min_length=1, max_length=256)
 
 
+class CriterionAssessment(APIModel):
+    criterion_id: str = Field(pattern=r"^task_(?:instruction|[1-9][0-9]*)$")
+    verdict: Literal["met", "unmet", "unverified"]
+    evidence: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+
+
+class WorkerVerification(APIModel):
+    check: str = Field(min_length=1, max_length=1000, pattern=r"\S")
+    result: Literal["passed", "failed", "not_run"]
+    evidence: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+
+
+class WorkerDecisionReport(APIModel):
+    """A decision-ready report; its business findings remain Worker claims."""
+
+    outcome: str = Field(min_length=1, max_length=3000, pattern=r"\S")
+    criterion_assessments: list[CriterionAssessment] = Field(min_length=1, max_length=64)
+    verification: list[WorkerVerification] = Field(min_length=1, max_length=32)
+    limitations: list[str] = Field(default_factory=list, max_length=32)
+    recommendation: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    decision_needed: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    record_artifact_ids: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("limitations", "record_artifact_ids")
+    @classmethod
+    def bounded_report_items(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        for item in value:
+            if not item.strip() or len(item) > 2000:
+                raise ValueError("report items must be nonempty and bounded")
+            if info.field_name == "record_artifact_ids" and re.fullmatch(r"art_[a-f0-9]{32}", item) is None:
+                raise ValueError("record references must be exact artifact ids")
+        if info.field_name == "record_artifact_ids" and len(set(value)) != len(value):
+            raise ValueError("record references must be distinct")
+        return value
+
+
 class ReportInput(APIModel):
     kind: ReportKind
     expected_goal_version: int = Field(ge=1)
@@ -852,6 +932,9 @@ class ReportInput(APIModel):
     expected_task_packet_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     expected_generation: int = Field(ge=1)
     summary: str = Field(min_length=1)
+    decision_report: WorkerDecisionReport | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     progress_event: Literal["execution_started"] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -903,16 +986,40 @@ class StatusRequestInput(APIModel):
     idempotency_key: str = Field(min_length=1, max_length=256)
 
 
-class CriterionAssessment(APIModel):
-    criterion_id: str = Field(pattern=r"^task_(?:instruction|[1-9][0-9]*)$")
-    verdict: Literal["met", "unmet", "unverified"]
-    evidence: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+class ArtifactAuditScope(APIModel):
+    artifact_id: str = Field(pattern=r"^art_[a-f0-9]{32}$")
+    byte_offset: int = Field(default=0, ge=0, le=1_048_576)
+    byte_count: int = Field(ge=1, le=1_048_576)
+
+
+class PurposeNextActionInput(PurposeCheckedInput):
+    """Resolve a checkpoint's continuing responsibility without revising its task."""
+
+    continuation_id: str = Field(pattern=r"^pcn_[a-f0-9]{32}$")
+    expected_generation: int = Field(ge=1, strict=True)
+    kind: Literal["continue", "achieved", "wait_until", "wait_user", "pause", "resume"]
+    reason: str = Field(min_length=1, max_length=2000, pattern=r"\S")
+    evidence: str = Field(min_length=1, max_length=4000, pattern=r"\S")
+    next_work_item_id: str | None = Field(default=None, pattern=r"^wrk_[a-f0-9]{32}$")
+    resume_at: str | None = Field(default=None, max_length=40)
+    resume_condition: str = Field(default="", max_length=2000)
+    requester_input_kind: Literal["new_authority", "budget", "business_direction", "private_information"] | None = None
+    criterion_assessments: list[PurposeCriterionAssessment] = Field(default_factory=list, max_length=16)
+    idempotency_key: str = Field(min_length=1, max_length=256)
 
 
 class ReviewInput(PurposeCheckedInput):
+    next_action: CheckpointNextInput | None = Field(default=None, exclude_if=lambda value: value is None)
     attempt_id: str
     verdict: ReviewVerdict
     summary: str = Field(min_length=1)
+    review_basis: Literal["report", "artifact_audit"] = Field(
+        default="report", exclude_if=lambda value: value == "report"
+    )
+    audit_reason: str = Field(default="", max_length=2000, exclude_if=lambda value: not value)
+    audit_scopes: list[ArtifactAuditScope] = Field(
+        default_factory=list, max_length=32, exclude_if=lambda value: not value
+    )
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     criterion_assessments: list[CriterionAssessment] = Field(
         default_factory=list, max_length=64, exclude_if=lambda value: not value
@@ -921,6 +1028,17 @@ class ReviewInput(PurposeCheckedInput):
         default=None, ge=1, strict=True, exclude_if=lambda value: value is None
     )
     idempotency_key: str = ""
+
+    @model_validator(mode="after")
+    def next_action_is_acceptance_only(self) -> ReviewInput:
+        if self.next_action is not None and self.verdict != ReviewVerdict.OK:
+            raise ValueError("next_action is valid only for an OK checkpoint review")
+        if self.review_basis == "artifact_audit":
+            if not self.audit_reason.strip() or not self.audit_scopes:
+                raise ValueError("artifact audit requires a concrete reason and exact read scopes")
+        elif self.audit_reason or self.audit_scopes:
+            raise ValueError("audit details require review_basis=artifact_audit")
+        return self
 
 
 class RequesterDecisionInput(PurposeCheckedInput):

@@ -97,6 +97,38 @@ def test_online_backup_includes_commits_but_excludes_an_open_transaction(
     assert values == {"backup_committed_probe": "yes"}
 
 
+def test_default_backup_replaces_one_snapshot_and_preserves_explicit_backups(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = Database(settings)
+    monkeypatch.setattr(cli, "_settings", lambda _args: settings)
+    explicit = tmp_path / "requested.sqlite3"
+    assert cli.run(cli.build_parser().parse_args(["backup", str(explicit)])) == 0
+    capsys.readouterr()
+    explicit_bytes = explicit.read_bytes()
+
+    paths = []
+    for value in ("first", "second"):
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES('backup_probe',?)", (value,),
+            )
+        assert cli.run(cli.build_parser().parse_args(["backup"])) == 0
+        destination = Path(json.loads(capsys.readouterr().out)["backup"])
+        paths.append(destination)
+        with closing(sqlite3.connect(destination)) as connection:
+            assert connection.execute(
+                "SELECT value FROM metadata WHERE key='backup_probe'",
+            ).fetchone() == (value,)
+
+    assert paths[0] == paths[1]
+    assert list((settings.state_dir / "backups").iterdir()) == [paths[0]]
+    assert explicit.read_bytes() == explicit_bytes
+
+
 def test_backup_rejects_untrusted_identity_and_existing_destination(
     tmp_path: Path,
 ) -> None:

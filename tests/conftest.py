@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import itertools
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +31,57 @@ CURRENT_CAO_CATALOG_DIGEST = catalog_digest(conversation_proxy_tools())
 CURRENT_CAO_PROXY_ABI_VERSION = CAO_CONVERSATION_PROXY_ABI_VERSION
 
 
+@pytest.fixture(autouse=True)
+def isolated_instruction_judge(monkeypatch):
+    """Unrelated contract tests never contact a model or the owner's desktop.
+
+    Semantic gate tests replace these dependencies with explicit outcomes;
+    real-model evaluation is an owner-run, separately recorded validation.
+    """
+    from cao_control_plane.instruction_review import (
+        CHECKS,
+        CodexInstructionReviewer,
+        ReviewDecision,
+        ReviewOutcome,
+    )
+
+    def source(_settings, _thread, *, checkpoint=None, **_origin):
+        return [{"role": "requester", "source_digest": "fixture-input",
+                 "text": "Perform the explicitly assigned bounded responsibility and preserve its fixed criteria."}]
+
+    def judge(_self, _snapshot):
+        return ReviewOutcome(ReviewDecision.model_validate({
+            "verdict": "pass", "summary": "Independent unit-test verdict.",
+            "assessments": [{"check": check, "verdict": "met", "reason": "Test-controlled evidence.",
+                "evidence_refs": ["requester_context", "purpose", "candidate", "history"]} for check in CHECKS],
+        }), "test-judge", 1)
+
+    monkeypatch.setattr("cao_control_plane.service.read_requester_context", source)
+    monkeypatch.setattr(CodexInstructionReviewer, "review", judge)
+
+
+@pytest.fixture(autouse=True)
+def release_pytest_asyncio_spare_loop(request):
+    """Close the plugin's idle replacement loop before plain asyncio.run.
+
+    pytest-asyncio's function fixture installs a fresh spare loop at teardown.
+    A later synchronous test using asyncio.run replaces it without closing it,
+    deferring ResourceWarnings to an unrelated test's garbage collection.
+    This releases that test-owned resource; warnings remain errors.
+    """
+    yield
+    if "event_loop" not in request.fixturenames:
+        return
+    policy = asyncio.get_event_loop_policy()
+    try:
+        loop = policy.get_event_loop()
+    except RuntimeError:
+        return
+    if not loop.is_running():
+        loop.close()
+        policy.set_event_loop(None)
+
+
 def business_purpose_contract() -> dict[str, Any]:
     return {
         "outcome": "Keep service outcomes reliable as requirements evolve.",
@@ -40,6 +92,31 @@ def business_purpose_contract() -> dict[str, Any]:
         "authority": "Operate only within the assigned scope; no unrequested external effects.",
         "unmet_action": "Continue the unmet conditions or escalate a concrete blocker to CAO.",
     }
+
+
+def seed_pre_checkpoint_review(service, actor, request):
+    """Seed a valid pre-upgrade accepted checkpoint for lifecycle compatibility.
+
+    Only fixture construction uses the former pending-handoff transaction. New
+    checkpoint acceptance and atomic Next are exercised through the current API.
+    """
+    from cao_control_plane import purpose_continuation
+    def retained_handoff(connection, _actor, work, *, review_id, next_action):
+        assert next_action is None
+        purpose_continuation.require_tx(service, connection, work, review_id=review_id)
+    with patch.object(service, "_accept_checkpoint_next_tx", retained_handoff):
+        return service.review(actor, request)
+
+
+def seed_pre_review_worker_message(service, connection, **values):
+    """Seed retained pre-upgrade input, never a new public instruction.
+
+    Lifecycle tests need historical queued/claimed messages that predate the
+    semantic fence. The normal send gate is tested independently and remains
+    installed immediately after this fixture-only insertion.
+    """
+    with patch("cao_control_plane.service.review_worker_message_tx", return_value=None):
+        return service._message(connection, **values)
 
 
 def current_cao_session_attachment(**values: Any) -> CAOSessionAttachment:
@@ -192,3 +269,16 @@ def legacy_progress_wakes(system, monkeypatch):
         return original(connection, **kwargs)
 
     monkeypatch.setattr(system["service"], "_message", old_message)
+
+
+@pytest.fixture(autouse=True)
+def isolated_native_change_subscription(monkeypatch):
+    """Unit tests do not subscribe the owner's real native application.
+
+    The feed's protocol and transitions have independent fixtures; the release
+    acceptance script exercises the real owner-local subscription.
+    """
+    async def no_native_connection(_self):
+        pass
+    monkeypatch.setattr('cao_control_plane.native_changes.NativeChangeFeed.start', no_native_connection)
+    monkeypatch.setattr('cao_control_plane.native_changes.NativeChangeFeed.stop', no_native_connection)

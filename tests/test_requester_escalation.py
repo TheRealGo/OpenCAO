@@ -28,8 +28,9 @@ def escalation(system):
     request = BoundaryDispositionInput(
         expected_purpose_version=1, turn_id=turn["id"], lease_token=turn["lease_token"],
         expected_generation=work["generation"], kind="wait_user",
-        reason="The supervisor cannot determine a safe solution.",
-        instruction="Advise how to resolve the remaining uncertainty.",
+        reason="The requester must supply a missing private source.",
+        requester_input_kind="private_information",
+        instruction="Supply the private source required by the objective.",
         resume_condition="Guidance is incorporated and safe execution is verified.",
     )
     return service, actor, work, boundary, request
@@ -71,6 +72,9 @@ def test_inbox_and_wake_require_visible_current_requester_communication(escalati
     assert notice["payload"]["decision"] == request.instruction
     assert notice["payload"]["resume_condition"] == request.resume_condition
     rendered = render_message(message)
+    assert "依頼者への相談" in rendered
+    [exact] = MCPServer(service).call_tool(actor, "cao_get_inbox", {"message_id": message["id"]})["items"]
+    rendered = exact["processing_instructions"]
     assert "tell the requester the unmet objective" in rendered
     assert "unknown solution, or system failure" in rendered
     assert "newer requester guidance already resolved" in rendered
@@ -106,7 +110,6 @@ def test_consumed_but_unreported_notice_rearms_only_communication(escalation, te
     )
     reconcile = service.reconcile_incomplete_cao_provider_turn
     assert reconcile(**(arguments | {"native_thread_id": "another-thread"})) == "not_required"
-    assert reconcile(**arguments) == "observed"
     assert reconcile(**arguments) == "scheduled"
     assert reconcile(**arguments) == "not_required"
     current = service.get_work(work["id"])
@@ -160,8 +163,9 @@ def test_proven_unstarted_failure_can_continue_after_requester_guidance(system, 
     service.dispose_boundary(actor, boundary["id"], BoundaryDispositionInput(
         expected_purpose_version=1, turn_id=turn["id"], lease_token=turn["lease_token"],
         expected_generation=work["generation"], kind="wait_user",
-        reason="The supervisor needs advice about the unavailable runtime.",
-        instruction="Advise how the runtime can be restored.",
+        reason="A private source must be supplied before continuation.",
+        requester_input_kind="private_information",
+        instruction="Supply the missing private source.",
         resume_condition="The unstarted runtime is available for safe continuation.",
     ))
     restarted = ControlPlane(Database(system["settings"]), system["settings"])
@@ -203,7 +207,6 @@ def test_failed_communication_recovery_remains_visible_without_another_model_loo
             native_turn_id=f"failed-communication-{index}", terminal_status="completed",
             started_at=100 + index, completed_at=101 + index,
         )
-        assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "observed"
         outcome = service.reconcile_incomplete_cao_provider_turn(**arguments)
         assert outcome == ("scheduled" if index == 0 else "not_required")
         current = service.get_work(work["id"])

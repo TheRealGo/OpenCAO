@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$CAO_PUBLICATION_PYTHON" -m cao_control_plane.publication_guard gh "$@"

@@ -792,6 +792,8 @@ def test_edge_preserves_exact_worker_and_nested_work_allowlists() -> None:
         "worker_label",
         "purpose_text",
         "purpose_status",
+        "purpose_supervision_state",
+        "purpose_resume_at",
         "attention_reason",
         "worker_state",
         "runner_adapter",

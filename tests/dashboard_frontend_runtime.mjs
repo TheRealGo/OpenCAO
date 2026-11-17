@@ -302,8 +302,8 @@ originalSource.emit("dashboard-update", {
 });
 originalSource.emit("dashboard-synced", { lastEventId: "cursor-4", data: "{}" });
 await settle();
-assert.equal(snapshotFetches, 7);
-assert.equal(snapshotRenders, 6);
+assert.equal(snapshotFetches, 6, "queued sync boundaries coalesce into the latest snapshot");
+assert.equal(snapshotRenders, 5);
 assert.equal(maximumConcurrentSnapshotFetches, 1, "event snapshots must be serialized");
 assert.equal(MockEventSource.instances.length, 1);
 assert.equal(originalSource.closed, false);
@@ -312,8 +312,8 @@ snapshotCursor = "cursor-5";
 originalSource.emit("resync-required", { lastEventId: "cursor-resync" });
 await settle();
 assert.equal(originalSource.closed, true, "resync must close the obsolete stream");
-assert.equal(snapshotFetches, 8, "resync must fetch exactly one fresh snapshot");
-assert.equal(snapshotRenders, 7);
+assert.equal(snapshotFetches, 7, "resync must fetch exactly one fresh snapshot");
+assert.equal(snapshotRenders, 6);
 assert.equal(MockEventSource.instances.length, 2, "resync must open one replacement stream");
 assert.match(MockEventSource.instances[1].url, /after=cursor-5$/);
 MockEventSource.instances[1].emit("open");
@@ -330,8 +330,8 @@ await settle();
 await settle();
 assert.equal(disconnectedSource.closed, true, "transport loss must close the stale stream");
 assert.equal(snapshotAborts, 1, "a hung Safari-style fetch must be aborted at its deadline");
-assert.equal(snapshotFetches, 10, "transport loss must retry one deadline-aborted snapshot");
-assert.equal(snapshotRenders, 8, "transport loss must render the fresh snapshot once");
+assert.equal(snapshotFetches, 9, "transport loss must retry one deadline-aborted snapshot");
+assert.equal(snapshotRenders, 7, "transport loss must render the fresh snapshot once");
 assert.equal(
   MockEventSource.instances.length,
   3,
@@ -345,3 +345,16 @@ MockEventSource.instances[2].emit("dashboard-synced", {
 });
 await settle();
 assert.equal(elements.get("connection").textContent, "接続済み");
+
+const fetchesBeforeBurst = snapshotFetches;
+const rendersBeforeBurst = snapshotRenders;
+const liveSource = MockEventSource.instances[2];
+for (let index = 0; index < 100; index += 1) {
+  snapshotCursor = `cursor-burst-${index}`;
+  liveSource.emit("dashboard-synced", { lastEventId: snapshotCursor, data: "{}" });
+}
+await settle();
+assert.equal(snapshotFetches, fetchesBeforeBurst + 1, "a burst must not queue 100 full reads");
+assert.equal(snapshotRenders, rendersBeforeBurst + 1);
+assert.equal(maximumConcurrentSnapshotFetches, 1);
+assert.equal(MockEventSource.instances.length, 3);

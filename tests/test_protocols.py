@@ -21,8 +21,9 @@ from cao_control_plane.mcp import (
     PROTOCOL_VERSION_META_KEY,
     MCPServer,
     conversation_proxy_tools,
+    modern_http_headers,
 )
-from cao_control_plane.models import ReportInput, WorkAssignment
+from cao_control_plane.models import AckInput, ReportInput, WorkAssignment
 
 
 def _meta() -> dict:
@@ -185,6 +186,67 @@ def test_mcp_assignment_and_worker_context(system):
         ),
     )
     assert context["result"]["structuredContent"]["work"]["id"] == work["id"]
+
+
+@pytest.mark.parametrize("surface", ["service", "mcp", "http"])
+def test_worker_inbox_excludes_supervision_notes_without_changing_the_packet(system, surface):
+    service = system["service"]
+    objective = "Verify the CAO_PROTOCOL identifier in the requested local result."
+    metadata = {"allocation_reason": "CAO supervisor-only allocation marker",
+                "future_internal_note": "Retain this note for supervision only."}
+    work = service.assign_work(system["cao"], WorkAssignment(
+        worker_id=system["worker"]["id"], title="Verify the local result",
+        objective=objective, acceptance=["The requested identifier is verified."],
+        non_goals=["Do not publish the result."], metadata=metadata,
+        runtime_session_id=system["runtime"]["id"],
+    ))
+    attempt = work["current_attempt"]
+    before = dict(service.db.fetchone(
+        "SELECT * FROM messages WHERE attempt_id=? AND kind='assignment'", (attempt["id"],)
+    ))
+    arguments = {"attempt_id": attempt["id"], "limit": 1}
+    if surface == "mcp":
+        inbox = MCPServer(service).call_tool(system["worker"], "cao_get_inbox", arguments)
+    elif surface == "http":
+        from fastapi.testclient import TestClient
+
+        from cao_control_plane.api import create_app
+
+        body = _modern("tools/call", {"name": "cao_get_inbox", "arguments": arguments})
+        client = TestClient(create_app(system["settings"]), base_url="http://localhost")
+        try:
+            response = client.post("/mcp", json=body, headers={
+                **modern_http_headers(body),
+                "Authorization": "Bearer " + system["worker_token"],
+            })
+            assert response.status_code == 200
+            inbox = response.json()["result"]["structuredContent"]
+        finally:
+            client.close()
+    else:
+        inbox = service.get_inbox(system["worker"], **arguments)
+    [message] = inbox["items"]
+    assert "metadata" not in message["payload"]
+    assert "supervisor-only allocation marker" not in json.dumps(inbox)
+    assert {"sender_id", "recipient_id", "correlation_id", "causation_id"}.isdisjoint(message)
+    assert message["id"] == before["id"] and message["sequence"] == before["sequence"]
+    assert message["payload_digest"] == before["payload_digest"]
+    assert message["message_digest"] == before["message_digest"]
+    assert message["payload"]["goal_packet_digest"] == attempt["goal_packet_digest"]
+    assert message["payload"]["task_packet_digest"] == attempt["task_packet_digest"]
+    assert message["payload"]["objective"] == objective
+    assert message["payload"]["acceptance"] == work["acceptance"]
+    assert message["payload"]["non_goals"] == work["non_goals"]
+    assert inbox["next_cursor"] is None
+    context = service.get_worker_context(system["worker"], attempt["id"])
+    assert context["inbox"] == [message]
+    assert context["work"]["completion_contract"] == work["completion_contract"]
+    assert json.loads(before["payload_json"])["metadata"] == metadata
+    assert dict(service.db.fetchone("SELECT * FROM messages WHERE id=?", (before["id"],))) == before
+    owner_work = service.get_work(work["id"], system["cao"])
+    assert owner_work["metadata"] == metadata
+    service.acknowledge(system["worker"], AckInput(message_ids=[message["id"]]))
+    assert service.get_inbox(system["worker"], **arguments)["items"] == []
 
 
 def test_mcp_assignment_dependency_omission_keeps_legacy_packets(system):

@@ -215,6 +215,10 @@ serialized update queue forever. A second error emitted by the closed source
 is ignored. This explicit recovery does not depend on browser-specific native
 EventSource retry behavior, so an Edge or Control Plane restart cannot leave an
 authenticated page silently behind or connected to two streams.
+Queued replay barriers are coalesced before a snapshot read starts. Barriers
+received during that read require at most one next read for their latest
+revision, rather than one full read per queued event. A failed read preserves
+the previous rendered state while the existing bounded backoff recovers it.
 `resync-required` discards the cursor, fetches a new snapshot, and intentionally
 opens a replacement stream from that snapshot cursor.
 The text client offers `snapshot()` and `follow(after=...)` methods with the
@@ -372,6 +376,13 @@ does not redirect this owner-local operation to conversation close.
 
 ### Controlled code/schema upgrade and restart
 
+The Control Plane LaunchAgent uses `ProcessType=Interactive`: it serves user
+commands and launches Worker children within bounded startup deadlines.
+macOS Background throttling applies to those children as well. A release check
+must exercise the owner LaunchAgent context, not only a foreground test process.
+Apply migrates only the exact known Background Control Plane plist; customized
+owner plists retain their explicit content/SHA review and controlled restart.
+
 `apply` remains an idempotent deployment/configuration action. It does not
 restart an already loaded LaunchAgent merely because Python or static files
 changed. Use the separate `upgrade` action for a reviewed code or schema
@@ -417,6 +428,26 @@ not expose a Control Plane self-stop or a separate restart implementation.
 
 Execute the exact same arguments with either a matching owner-only `upgrade`
 effect receipt or both `--execute --owner-confirm`, and without `--plan-only`.
+
+For a service implementation update whose MCP contracts and bridge configuration
+are unchanged, `upgrade` and `restart` accept the explicit `--services-only`
+scope. The source database must retain the target conversation catalog digest
+and current proxy ABI; planning and the executor recheck them before service
+effects. A changed or unavailable contract cannot select this scope. It uses the
+same reviewed plist/config/database bindings, disposable migration, exact process
+fencing, final backup and target readiness checks below, without depending on or
+operating the native Codex host. Its plan records reload scope `none` and
+application `not_requested`; its result records status `services_ready`, host restart `not_performed`,
+MCP reload `not_requested` and conversation verification `not_requested`. These
+values make no claim that a conversation reloaded or a native-host fault was
+repaired. With this explicit scope, a post-restart `/ready` 503 can admit only
+`native_change_subscription_unavailable` while the target release, schema and
+catalog match, database integrity and canonical authority hold, projection is
+healthy, and the dispatcher is running without a cycle error or any other issue.
+The global readiness response remains degraded. All CAO service faults still
+block completion. Use the default full scope or separate `refresh-mcp` when the bridge or
+MCP configuration/catalog must change.
+
 The authorized workflow is fixed:
 
 1. re-read the database, release, owner plist, loaded LaunchAgent arguments,
@@ -424,16 +455,23 @@ The authorized workflow is fixed:
 2. take a disposable online backup, run the current `Database` migration on
    only that copy, verify the complete projection at the target schema, and
    delete the disposable copy;
-3. require the currently running Control Plane and Edge to be healthy. Each
-   upgrade/restart HTTP probe has a bounded 30-second timeout because full
+3. verify the exact source identity, integral database, canonical authority,
+   authenticated Dashboard snapshot and Edge HTML. Source technical readiness,
+   including a failed dispatcher or native subscription, can be repaired by
+   this authorized restart when the disposable target migration and projection
+   already passed. Requiring that failing capability to become ready first
+   would prevent its own repair. Each upgrade/restart HTTP probe has a bounded 60-second timeout because full
    database and projection verification can exceed the short status probe's
-   five seconds as history grows. A timeout still fails the readiness gate. A
-   source Control Plane whose only readiness failure is its projection may be
-   upgraded only when the source database is integral, authority is canonical,
-   the dispatcher and Edge are healthy, and the disposable target migration
-   has already rebuilt that exact database copy with a healthy projection;
-   database, authority, dispatcher, target-projection, or Edge degradation is
-   never bypassed;
+   five seconds, and even thirty seconds, as history grows. If the source
+   readiness endpoint is unavailable, its own repair may proceed only with
+   independently verified source integrity and target projection, matching
+   live source identity, an authenticated canonical snapshot and ready Edge.
+   An explicit integrity or authority failure still refuses the update.
+   Post-restart readiness timeouts still fail the readiness gate.
+   Source database integrity, canonical authority,
+   target verification and the authenticated source/Edge bindings remain
+   required. Post-restart checks require full target readiness, except for the
+   single excluded native capability in the explicit service scope above;
 4. capture every process in each isolated LaunchAgent process group with its
    macOS audit token, boot out Edge and then Control Plane, and confirm both
    jobs are unloaded; wait for every captured execution to exit, escalating
@@ -441,11 +479,13 @@ The authorized workflow is fixed:
    graceful shutdown stalls, then require each process group to be empty and
    both loopback HTTP surfaces to be unreachable;
 5. take the plan-bound, migration-free final backup with replacement disabled;
-6. bootstrap Control Plane and require `/health` and `/ready` to report the
+6. retire the stopped coordinator's managed Worker transport connections through
+   canonical enrollment failure and recovery, then bootstrap Control Plane and
+   require `/health` and `/ready` to report the
    exact target release, schema, and MCP catalog digest;
 7. bootstrap Edge and require both authenticated snapshot JSON and browser
    HTML readiness;
-8. before stopping either CAO service, verify the plan-bound bundled Codex
+8. for the default full scope, before stopping either CAO service, verify the plan-bound bundled Codex
    executable, exact owner LaunchAgent, and canonical socket's kernel peer.
    After CAO service readiness, reuse an attested current host or replace one
    proven-stale mapped-image generation through the exact targeted LaunchAgent
@@ -453,6 +493,26 @@ The authorized workflow is fixed:
    `config/mcpServer/reload` with a matching empty JSON-RPC result. The
    lifecycle may report the CAO services `ready`, but current-task catalog
    verification remains explicitly `pending`.
+   The initialize user agent includes a client-selected originator, so its
+   product wording is not host authentication. For the attested host, retain
+   the bounded initialize/platform checks and exact socket binding without
+   requiring a product-name substring or maintaining client-name exceptions.
+9. after every requested readiness and reload gate succeeds, recheck the exact
+   rollback file identity and SHA-256 and delete that temporary copy. The result
+   reports `backup_retained=false`; the path and digest describe the completed
+   operation, not a retained restore point. A replaced file or failed/unknown
+   earlier gate stops cleanup without deleting unrelated state.
+
+The reviewed plan names this Worker connection policy and the result counts the
+retired connections. This step follows the exact process fence, unreachable
+service checks and final backup; plan-only, normal startup, conversation close
+and a failed stop cannot invoke it. It revokes the old transport credentials
+instead of leaving a live-looking `busy` lease until its TTL expires. Durable CAO
+attachments, Worker lifecycle and purpose remain intact. Submitted inputs,
+unknown effects and remote jobs are preserved as unknown; retirement never
+proves that they stopped, replays them or accepts their results. Existing Work
+uses the normal structured recovery path. A distinct later instruction can use
+a fresh connection epoch and the normal exact native-history readiness checks.
 
 The final backup is never taken while an old LaunchAgent root or child still
 exists. PID reuse cannot redirect an escalation signal, and a new or
@@ -460,15 +520,18 @@ previously uncaptured process-group member stops the upgrade before backup
 instead of being killed or ignored. No Tailscale command runs during
 `upgrade`, and no stopped service or unknown effect is retried automatically.
 If an effect command has an unknown outcome,
-inspect the recorded plan and live state before any recovery action. The final
-backup remains at the pre-migration schema for an explicitly reviewed restore;
-restoring it is never an automatic response after new durable writes.
+inspect the recorded plan and live state before any recovery action. A backup
+retained after a failed or unknown upgrade remains at the pre-migration schema
+for an explicitly reviewed restore; restoring it is never an automatic
+response after new durable writes. Successful upgrades do not accumulate
+rollback copies.
 
-The final Codex host refresh is mandatory. The plan uses only Codex Desktop's
+The final Codex host refresh is mandatory in the full scope. The plan uses only Codex Desktop's
 canonical owner-local `~/.codex/app-server-control/app-server-control.sock`;
 the public lifecycle CLI accepts no alternate socket or executable. The socket
-must have a real, owner-only `0700` parent and an owner-owned, non-symlink Unix
-socket leaf with `0600` permissions. The bundled executable must be a real,
+must have a real, owner-only `0700` parent and an owner-owned Unix socket with
+`0600` permissions. The canonical owner-controlled alias may point directly to
+that socket in another real owner-only `0700` directory. The bundled executable must be a real,
 non-writable executable owned by root or the current owner and satisfy the
 OpenAI signing requirement. Its file generation is part of the reviewed plan
 digest and is checked again immediately before a host effect. The daemon
@@ -500,6 +563,17 @@ a new audit-token generation whose path, mapped vnode, argv, and loaded job
 match the plan. Missing mapped-image evidence fails before the kickstart;
 timeout, nonzero or malformed kickstart output, or an unproved postcondition
 is an unknown effect and is never retried automatically.
+
+The same explicit owner operation can recover a missing canonical socket or
+an owner-controlled alias whose target has disappeared. It does not require
+that failed endpoint to attest its own recovery. Preflight instead binds the
+exact plan-bound loaded owner job, ordered process arguments, PID/ASID and audit
+generation to the signed current executable. It also records and rechecks the
+owner-only socket parent and absent leaf or dangling alias immediately before
+the single targeted kickstart. An unsafe endpoint, changed alias, restored
+socket or changed process refuses that plan before the effect. A successful
+recovery must pass the ordinary socket-peer, mapped-image and daemon checks
+before MCP reload. It never creates a second daemon or changes the alias itself.
 
 A declared `pid` backend instead requires the exact standalone managed path,
 a non-null managed version, and the official controlled lineage
@@ -571,17 +645,18 @@ submits the official `config/mcpServer/reload` request to the existing App
 Server and requires its ACK; the
 [official App Server contract](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md)
 queues that refresh for every loaded thread's next active turn. It performs one
-targeted LaunchAgent kickstart only when the mapped App Server executable image
-is proven stale, then proves the
+targeted LaunchAgent kickstart when the mapped App Server executable image
+is proven stale or the canonical control endpoint is missing under the exact
+loaded-owner-job recovery contract above. It then proves the
 old generation retired and the socket was replaced before submitting reload.
-A backend without the exact owner LaunchAgent needed for that stale-image
+A backend without the exact owner LaunchAgent needed for that host
 replacement fails before mutation. The action does not invoke standalone
 daemon `bootstrap`, `restart`, or `stop`. It reports
 `submitted_for_next_active_turn` only as the compatibility reload state and
 reports `current_conversation_verification=pending`. It does not stop or
 restart the Control Plane or Dashboard, signal stdio bridge processes, mutate
 Worker state, or run a broad process kill. Bridge generations are enumerated
-only when a proven-stale root needs exact retirement fencing. A task whose own
+only when an attested root needs exact retirement fencing. A task whose own
 stdio transport is already closed cannot repair that transport by calling a
 tool through it; run this owner-local lifecycle action through a still-live
 host control path, continue the affected task, then require `cao_start` and

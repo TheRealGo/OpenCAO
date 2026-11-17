@@ -170,34 +170,8 @@ else:
         ),
         encoding="utf-8",
     )
-    if delivery["method"] == "thread/queue/add":
-        client_id = delivery["params"]["clientUserMessageId"]
-        print(json.dumps({{
-            "id": delivery["id"],
-            "result": {{
-                "queuedSubmission": {{
-                    "id": "queued-contract-submission",
-                    "clientUserMessageId": client_id,
-                    "input": delivery["params"]["input"],
-                }}
-            }},
-        }}), flush=True)
-        print(json.dumps({{
-            "method": "item/started",
-            "params": {{
-                "threadId": "contract-thread",
-                "turnId": "contract-turn",
-                "startedAtMs": 1,
-                "item": {{
-                    "id": "contract-user-message",
-                    "type": "userMessage",
-                    "clientId": client_id,
-                    "content": delivery["params"]["input"],
-                }},
-            }},
-        }}), flush=True)
-    else:
-        print(json.dumps({{"id": delivery["id"], "result": {{"turn": {{"id": "contract-turn"}}}}}}), flush=True)
+    assert delivery["method"] == "turn/start"
+    print(json.dumps({{"id": delivery["id"], "result": {{"turn": {{"id": "contract-turn", "status": "inProgress"}}}}}}), flush=True)
     print(json.dumps({{"method": "turn/completed", "params": {{"turn": {{"id": "contract-turn", "status": "completed"}}}}}}), flush=True)
 '''
 
@@ -358,7 +332,7 @@ def test_codex_real_process_binds_stdio_bridge_to_exact_thread(tmp_path: Path) -
         result, runtime, ticket = asyncio.run(exercise())
 
         assert result.success
-        assert result.metadata["delivery_method"] == "thread_queue"
+        assert result.metadata["delivery_method"] == "direct_turn"
         assert result.metadata["delivery_acceptance"] == "completed"
         parsed = _assert_record(record, str(runtime["enrollment_capability_socket"]), ticket)
         assert parsed["argv"] == []
@@ -375,7 +349,7 @@ def test_codex_real_process_binds_stdio_bridge_to_exact_thread(tmp_path: Path) -
             == parsed["config"]["mcpServers"]["cao_control_plane"]
         )
         delivery = parsed["delivery"]
-        assert delivery["method"] == "thread/queue/add"
+        assert delivery["method"] == "turn/start"
         assert delivery["params"]["threadId"] == "contract-thread"
         assert delivery["params"]["clientUserMessageId"].startswith(
             "cao-delivery-"

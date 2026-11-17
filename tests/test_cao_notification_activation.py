@@ -148,13 +148,10 @@ def test_bounded_activation_pages_reach_later_cold_item_after_consumed_history(
         return "pending"
 
     monkeypatch.setattr(adapter, "activate_desktop_cao_thread", activate)
-    visited_sequences: list[int] = []
-    activated = 0
-    for _ in range(5):
-        candidates = dispatcher._cao_supervision_activation_candidates()
-        assert 1 <= len(candidates) <= 2
-        visited_sequences.extend(candidate["message_sequence"] for candidate in candidates)
-        activated += asyncio.run(dispatcher._activate_cao_supervision_threads(candidates))
+    candidates = dispatcher._cao_supervision_activation_candidates()
+    assert len(candidates) == len(accepted)
+    visited_sequences = [candidate["message_sequence"] for candidate in candidates]
+    activated = asyncio.run(dispatcher._activate_cao_supervision_threads(candidates))
 
     assert observed == [message["id"] for message in accepted]
     assert visited_sequences == sorted(set(visited_sequences))
@@ -162,7 +159,7 @@ def test_bounded_activation_pages_reach_later_cold_item_after_consumed_history(
     assert cold_queue == set()
     wrapped = dispatcher._cao_supervision_activation_candidates()
     assert [candidate["message_id"] for candidate in wrapped] == [
-        message["id"] for message in accepted[:2]
+        message["id"] for message in accepted
     ]
     assert [dict(row) for row in service.db.fetchall("SELECT * FROM message_deliveries")] == before
     assert service.db.fetchone("SELECT COUNT(*) FROM events")[0] == event_count
@@ -302,7 +299,7 @@ def test_fixed_activation_rounds_revisit_pending_messages_during_continuous_arri
         event_count = service.db.fetchone("SELECT COUNT(*) FROM events")[0]
         generation = service.db.commit_generation()
         candidates = dispatcher._cao_supervision_activation_candidates()
-        assert 1 <= len(candidates) <= 2
+        assert len(candidates) == len(initial) + len(arrivals)
         pages.append([candidate["message_id"] for candidate in candidates])
         assert asyncio.run(dispatcher._activate_cao_supervision_threads(candidates)) == 0
         assert service.db.commit_generation() == generation
@@ -312,11 +309,12 @@ def test_fixed_activation_rounds_revisit_pending_messages_during_continuous_arri
         )
 
     initial_ids = [message["id"] for message in initial]
-    assert pages[:3] == [initial_ids[:2], initial_ids[2:4], initial_ids[4:]]
+    assert pages[0] == initial_ids
+    assert pages[1][:len(initial_ids)] == initial_ids
     assert ceilings[:4] == [initial[-1]["sequence"]] * 4
-    # The first pending messages are revisited at the next round, even though
+    # Every pending message is included in each complete metadata round, even though
     # a fresh accepted notification arrived before every subsequent scan.
-    assert pages[3] == initial_ids[:2]
+    assert pages[3][:len(initial_ids)] == initial_ids
     assert all(observed.count(message_id) >= 2 for message_id in initial_ids)
     assert arrivals[0]["id"] in observed
     assert all(isinstance(ceiling, int) and ceiling > 0 for ceiling in ceilings)

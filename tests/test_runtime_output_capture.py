@@ -232,12 +232,7 @@ for raw in sys.stdin:
     if method == 'thread/start':
         result = {'thread': {'id': 'native-thread'}}
     elif method == 'turn/start':
-        result = {'turn': {'id': 'native-turn'}}
-    elif method == 'thread/queue/add':
-        user = {'type': 'userMessage', 'id': 'input-item', 'clientId': request['params']['clientUserMessageId']}
-        emit('item/started', {'threadId': 'other-thread', 'turnId': 'wrong-turn', 'item': user})
-        emit('item/started', {'threadId': 'native-thread', 'turnId': 'native-turn', 'item': user})
-        result = {'queuedSubmission': {'id': 'queue-item', 'clientUserMessageId': user['clientId']}}
+        result = {'turn': {'id': 'native-turn', 'status': 'inProgress'}}
     else:
         result = {}
     print(json.dumps({'id': request['id'], 'result': result}), flush=True)
@@ -246,7 +241,7 @@ for raw in sys.stdin:
         for name in config:
             if name.startswith('mcp_servers.'):
                 emit('mcpServer/startupStatus/updated', {'threadId': 'native-thread', 'name': name.split('.', 1)[1], 'status': 'ready'})
-    if method not in ('turn/start', 'thread/queue/add'):
+    if method != 'turn/start':
         continue
     text = request['params']['input'][0]['text']
     emit('item/completed', {'threadId': 'other-thread', 'turnId': 'native-turn', 'item': {'type': 'agentMessage', 'id': 'wrong-thread', 'text': 'wrong-thread-output'}})
@@ -315,7 +310,7 @@ def test_codex_managed_queue_binds_the_client_message_before_queue_ack(monkeypat
         )
     )
     assert result.success is True
-    assert result.metadata["delivery_method"] == "thread_queue"
+    assert result.metadata["delivery_method"] == "direct_turn"
     assert [event.kind for event in events] == ["message", "turn_end"]
     assert all(
         event.native_thread_id == "native-thread" and event.turn_id == "native-turn"

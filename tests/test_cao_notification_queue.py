@@ -16,17 +16,15 @@ from test_worker_output_delivery import _capture_fixture, _legacy_output_notific
 
 from cao_control_plane.models import AckInput
 from cao_control_plane.runtime import (
+    CodexRpcError,
     Dispatcher,
     _codex_delivery_client_user_message_id,
     render_message,
 )
 
 
-def _queued_output(system: dict[str, Any]) -> tuple[dict[str, Any], str, str, dict[str, Any]]:
-    service = system["service"]
-    actor, work, binding = _capture_fixture(system)
-    output = _legacy_output_notification(service, work, binding)
-    message_id = output["notification_message_id"]
+def _queue_admission(service, actor, message):
+    message_id = message["id"]
     attachment_id = actor["_cao_attachment_id"]
     attachment = service.get_cao_attachment(attachment_id)
     runtime_id = attachment["runtime"]["id"]
@@ -63,10 +61,20 @@ def _queued_output(system: dict[str, Any]) -> tuple[dict[str, Any], str, str, di
         "clientUserMessageId": _codex_delivery_client_user_message_id(message),
         "input": [{"type": "text", "text": render_message(message)}],
     }
+    return item
+
+
+def _queued_output(system: dict[str, Any]) -> tuple[dict[str, Any], str, str, dict[str, Any]]:
+    service = system["service"]
+    actor, work, binding = _capture_fixture(system)
+    output = _legacy_output_notification(service, work, binding)
+    message_id = output["notification_message_id"]
+    row = service.db.fetchone("SELECT * FROM messages WHERE id=?", (message_id,))
+    item = _queue_admission(service, actor, dict(row))
     return (
         actor,
         work["id"],
-        attachment_id,
+        actor["_cao_attachment_id"],
         {"item": item, "binding": binding, "message_id": message_id},
     )
 
@@ -107,6 +115,173 @@ def _host(monkeypatch: pytest.MonkeyPatch, host: QueueHost) -> None:
         return host
 
     monkeypatch.setattr("cao_control_plane.runtime._JsonRpcDesktopSocket.connect", connect)
+
+
+def _queued_purpose(system, tmp_path, decision):
+    from test_purpose_continuation import _checkpoint, _next_request, _pending, _wake
+
+    from cao_control_plane.database import utc_after
+    from cao_control_plane.models import PurposeNextActionInput
+
+    service, actor, thread, work, _, _ = _checkpoint(
+        system, tmp_path, finite=decision == "achieved"
+    )
+    continuation = _pending(service, work)
+    wake = _wake(service, continuation)
+    item = _queue_admission(service, actor, wake)
+    if decision == "assigned":
+        service.instruct_worker_thread(actor, _next_request(thread, continuation))
+    elif decision in {"waiting", "achieved"}:
+        purpose = service.get_work(work["id"])["worker_purpose"]
+        service.record_purpose_next_action(
+            actor,
+            PurposeNextActionInput(
+                continuation_id=continuation["id"],
+                expected_generation=continuation["generation"],
+                expected_purpose_version=continuation["purpose_version"],
+                kind="achieved" if decision == "achieved" else "wait_until",
+                reason="The exact next purpose decision is recorded.",
+                evidence="The fixed conditions and next dependency were verified.",
+                resume_at=utc_after(3600) if decision == "waiting" else None,
+                resume_condition="Observe the recorded dependency." if decision == "waiting" else "",
+                criterion_assessments=[
+                    {"criterion_id": x["id"], "evidence": "Verified fixed purpose result."}
+                    for x in purpose["contract"]["criteria"]
+                ] if decision == "achieved" else [],
+                idempotency_key="decide-queued-purpose",
+            ),
+        )
+    return service, work["id"], wake["id"], item
+
+
+@pytest.mark.parametrize("decision", ["assigned", "waiting", "achieved"])
+def test_decided_purpose_wake_is_removed_without_reopening_work(
+    system, settings, tmp_path, monkeypatch, decision
+):
+    async def scenario():
+        service, work_id, message_id, item = _queued_purpose(system, tmp_path, decision)
+        before = service.get_work(work_id)
+        host = QueueHost([item])
+        _host(monkeypatch, host)
+
+        assert await Dispatcher(service, settings).reconcile_cao_notification_queues() == 1
+        assert host.deleted == [item["id"]]
+        delivery = service.db.fetchone(
+            "SELECT * FROM message_deliveries WHERE message_id=?", (message_id,)
+        )
+        assert delivery["state"] == "dead"
+        assert delivery["delivered_at"] is not None
+        assert delivery["acknowledged_at"] is None and delivery["handled_at"] is None
+        after = service.get_work(work_id)
+        for key in ["state", "generation", "goal_version", "reviews", "open_boundaries", "worker_outputs"]:
+            assert after[key] == before[key]
+        assert await Dispatcher(service, settings).reconcile_cao_notification_queues() == 0
+        assert host.deleted == [item["id"]]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("condition", ["pending", "unknown", "edited", "consumed"])
+def test_unresolved_or_unconfirmed_purpose_wake_is_preserved(
+    system, settings, tmp_path, monkeypatch, condition
+):
+    async def scenario():
+        service, _, message_id, item = _queued_purpose(
+            system, tmp_path, "pending" if condition == "pending" else "assigned"
+        )
+        if condition == "unknown":
+            service.db.execute(
+                "UPDATE message_deliveries SET state='dispatched' WHERE message_id=?", (message_id,)
+            )
+        if condition == "edited":
+            item["input"][0]["text"] = "A user edited this queued input."
+        host = QueueHost([item])
+        if condition == "consumed":
+            host.before_delete = lambda: host.items.clear()
+        _host(monkeypatch, host)
+        before = dict(service.db.fetchone(
+            "SELECT * FROM message_deliveries WHERE message_id=?", (message_id,)
+        ))
+
+        assert await Dispatcher(service, settings).reconcile_cao_notification_queues() == 0
+        assert host.deleted == []
+        assert dict(service.db.fetchone(
+            "SELECT * FROM message_deliveries WHERE message_id=?", (message_id,)
+        )) == before
+
+    asyncio.run(scenario())
+
+
+def test_older_purpose_wake_is_removed_while_current_generation_remains_pending(
+    system, settings, tmp_path, monkeypatch
+):
+    from test_purpose_continuation import _pending, _wake
+
+    from cao_control_plane import purpose_continuation
+
+    async def scenario():
+        service, work_id, old_message_id, old_item = _queued_purpose(system, tmp_path, "waiting")
+        monkeypatch.setattr(purpose_continuation, "utc_now", lambda: "2101-01-01T00:00:00Z")
+        assert service.reconcile_cao_supervision_obligations() == 1
+        work = service.get_work(work_id)
+        current = _pending(service, work)
+        assert current["generation"] == 3 and current["state"] == "pending"
+        current_wake = _wake(service, current)
+        attachment_id = service.db.fetchone(
+            "SELECT supervisor_attachment_id FROM work_items WHERE id=?", (work_id,)
+        )[0]
+        current_item = _queue_admission(service, {"_cao_attachment_id": attachment_id}, current_wake)
+        host = QueueHost([old_item, current_item])
+        current_item["id"] = "current-purpose-wake"
+        _host(monkeypatch, host)
+
+        assert await Dispatcher(service, settings).reconcile_cao_notification_queues() == 1
+        assert host.deleted == [old_item["id"]]
+        assert host.items == [current_item]
+        assert service.db.fetchone(
+            "SELECT state FROM message_deliveries WHERE message_id=?", (old_message_id,)
+        )[0] == "dead"
+        assert service.db.fetchone(
+            "SELECT state FROM message_deliveries WHERE message_id=?", (current_wake["id"],)
+        )[0] == "delivered"
+        assert _pending(service, work) == current
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error", [
+    {"code": -32600, "message": "session 00000000-0000-0000-0000-000000000001 is archived. Run `codex unarchive 00000000-0000-0000-0000-000000000001` to unarchive it first."},
+    {"code": -32603, "message": "failed to read thread: invalid thread-store request: no rollout found for thread id 00000000-0000-0000-0000-000000000001"},
+])
+def test_historical_unavailable_queue_preserves_delivery_without_reporting_live_failure(
+    system, settings, monkeypatch, error,
+):
+    async def scenario():
+        service = system["service"]
+        _, _, _, fixture = _queued_output(system)
+        _terminal(service, fixture["binding"])
+        before = [tuple(row) for row in service.db.fetchall("SELECT * FROM message_deliveries ORDER BY message_id, recipient_id")]
+        host = QueueHost([fixture["item"]])
+        request = host.request
+
+        async def unavailable(method, params, **kwargs):
+            if method == "thread/queue/list":
+                host.methods.append(method)
+                raise CodexRpcError(error)
+            return await request(method, params, **kwargs)
+
+        host.request = unavailable
+        _host(monkeypatch, host)
+        dispatcher = Dispatcher(service, settings)
+        assert await dispatcher.reconcile_cao_notification_queues() == 0
+        assert dispatcher.cao_notification_queue_error == ""
+        assert dispatcher.cao_notification_queue_failure_counts == {}
+        assert host.methods == ["initialize", "thread/queue/list"]
+        assert host.deleted == []
+        assert [tuple(row) for row in service.db.fetchall("SELECT * FROM message_deliveries ORDER BY message_id, recipient_id")] == before
+        assert not service.db.fetchall("SELECT * FROM events WHERE event_type LIKE 'cao.notification_queue_remov%'")
+
+    asyncio.run(scenario())
 
 
 def test_handled_wake_is_removed_from_native_queue_without_rehandling(
@@ -223,11 +398,18 @@ def test_consumption_race_does_not_mark_unread_output_handled(system, settings, 
     asyncio.run(scenario())
 
 
-def test_unknown_deletion_is_observed_again_without_blind_retry(system, settings, monkeypatch):
+@pytest.mark.parametrize("wake_kind", ["output", "purpose"])
+def test_unknown_deletion_is_observed_again_without_blind_retry(
+    system, settings, tmp_path, monkeypatch, wake_kind
+):
     async def scenario():
         service = system["service"]
-        _, _, _, fixture = _queued_output(system)
-        _terminal(service, fixture["binding"])
+        if wake_kind == "purpose":
+            _, _, message_id, item = _queued_purpose(system, tmp_path, "assigned")
+            fixture = {"message_id": message_id, "item": item}
+        else:
+            _, _, _, fixture = _queued_output(system)
+            _terminal(service, fixture["binding"])
         host = QueueHost([fixture["item"]])
         request = host.request
 

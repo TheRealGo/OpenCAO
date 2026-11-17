@@ -12,6 +12,7 @@ from conftest import (
     attach_cao_session_with_peer,
     business_purpose_contract,
     current_cao_session_attachment,
+    seed_pre_review_worker_message,
 )
 from pydantic import ValidationError as PydanticValidationError
 
@@ -33,6 +34,7 @@ from cao_control_plane.models import (
     BoundaryDispositionKind,
     BoundaryInput,
     CloseCAOConversationInput,
+    GoalRevision,
     InstructWorkerThreadInput,
     MessageKind,
     ResumeWorkerThreadInput,
@@ -400,7 +402,7 @@ def _seed_historical_disconnected_status_request(
     attempt = work["current_attempt"]
     response_due_at = utc_after(response_due_seconds)
     with service.db.transaction() as connection:
-        message = service._message(
+        message = seed_pre_review_worker_message(service,
             connection,
             sender_id=actor["id"],
             recipient_id=str(attempt["worker_id"]),
@@ -593,7 +595,13 @@ def test_terminal_recovery_ignores_historical_work_on_the_same_runtime(system) -
     assert service.get_work(historical["id"])["state"] == "canceled"
 
 
-def test_pre_submit_failure_is_recoverable_after_mcp_bootstrap(system) -> None:
+@pytest.mark.parametrize("diagnostic_holds,legacy_link,missing_lineage_event", [
+    (0, False, False), (1, False, False), (2, False, False),
+    (2, True, False), (2, True, True),
+])
+def test_pre_submit_failure_is_recoverable_after_mcp_bootstrap(
+    system, diagnostic_holds, legacy_link, missing_lineage_event, monkeypatch,
+) -> None:
     actor = _attached(system, suffix="b")
     native_thread_id = "native-pre-submit-recovery"
     ids = _seed_managed_thread(
@@ -692,6 +700,60 @@ def test_pre_submit_failure_is_recoverable_after_mcp_bootstrap(system) -> None:
     assert evidence["assignment_delivery_boundary"] == "not_submitted"
     assert evidence["safe_to_redeliver"] is True
     assert evidence["safety_reason"] == "assignment_not_submitted"
+
+    from cao_control_plane.runtime_recovery import (
+        RuntimeRecoveryObservation,
+        pending_runtime_recovery_holds,
+        record_runtime_recovery_observation,
+    )
+
+    for index in range(diagnostic_holds):
+        turn = service.acquire_reasoner_turn(
+            actor, work["id"], boundary_id=boundary["id"],
+            expected_generation=waiting["generation"],
+            idempotency_key=f"hold-pre-submit-{index}",
+        )
+        service.dispose_boundary(actor, boundary["id"], BoundaryDispositionInput(
+            turn_id=turn["id"], lease_token=turn["lease_token"],
+            expected_generation=waiting["generation"], expected_purpose_version=1,
+            kind="wait_system", reason="Diagnose the exact failed bootstrap.",
+            resume_condition="The exact pre-submission route is diagnosed.",
+        ))
+        [candidate] = pending_runtime_recovery_holds(service)
+        assert candidate["assignment_not_submitted_proven"] is True
+        observation = RuntimeRecoveryObservation(
+            "ready", "runtime_assignment_not_submitted", str(index + 1) * 64,
+            "not_submitted", False, True,
+        )
+        if legacy_link and index == 0:
+            # Produce the old sealed format through its original constructor,
+            # without rewriting any Boundary metadata or input digest.
+            with monkeypatch.context() as legacy:
+                legacy.setattr(service, "_system_recovery_origin_metadata_tx", lambda *a, **kw: None)
+                assert record_runtime_recovery_observation(service, candidate, observation)
+        else:
+            assert record_runtime_recovery_observation(service, candidate, observation)
+        waiting = service.get_work(work["id"])
+        boundary = waiting["open_boundaries"][0]
+        if legacy_link and index == 0:
+            assert boundary["recovery_action"] == "system_reconciliation"
+            if missing_lineage_event:
+                service.db.execute(
+                    "DELETE FROM events WHERE event_type='cao.system_recovery_ready' "
+                    "AND json_extract(data_json,'$.boundary_id')=?", (boundary["id"],),
+                )
+            continue
+        if missing_lineage_event:
+            assert boundary["recovery_action"] == "system_reconciliation"
+            assert waiting["current_attempt"]["attempt_number"] == 1
+            assert service.db.fetchone("SELECT COUNT(*) n FROM messages WHERE work_item_id=? "
+                                      "AND kind='assignment'", (work["id"],))["n"] == 1
+            return
+        assert boundary["recovery_action"] == "dispose_continue_or_correct", boundary["metadata"]
+        assert waiting["current_attempt"]["assignment_delivery"]["safe_to_redeliver"] is True
+        assert waiting["current_attempt"]["attempt_number"] == 1
+        assert service.db.fetchone("SELECT state FROM message_deliveries WHERE message_id = ?",
+                                  (delivery["message_id"],))["state"] == "dead"
 
     actor = _revoke_and_reattach_cao(system, actor, suffix="b")
     turn = service.acquire_reasoner_turn(
@@ -997,6 +1059,7 @@ def test_get_work_exposes_crossed_mcp_boundary_as_unsafe_to_redeliver(system) ->
         "heartbeat_observed": True,
         "worker_report_observed": False,
         "assignment_delivery_boundary": "not_observed",
+        "failure_code": None,
         "safe_to_redeliver": False,
         "safe_to_reconcile": False,
         "recovery_action": "system_reconciliation",
@@ -1175,10 +1238,12 @@ def test_post_mcp_unknown_delivery_reconciles_on_same_work_and_native_thread(
             lease_token=turn["lease_token"],
             expected_generation=waiting["generation"],
             kind=BoundaryDispositionKind.WAIT_USER if consult_requester else BoundaryDispositionKind.CONTINUE,
+            requester_input_kind="private_information" if consult_requester else None,
             resume_condition="The requester supplied guidance for safe reconciliation." if consult_requester else "",
             reason="Reconcile the exact unknown Assignment on its original logical thread.",
             instruction=(
-                "Inspect the current task and workspace state first. Report completion if it "
+                ("Supply the missing private source, then reconcile safely. " if consult_requester else "")
+                + "Inspect the current task and workspace state first. Report completion if it "
                 "already happened; otherwise continue only the unmet acceptance conditions."
             ),
         ),
@@ -1834,6 +1899,88 @@ def test_finish_archives_an_active_thread_with_revoked_spec_metadata(system) -> 
         (ids["thread_id"],),
     )
     assert anomaly is not None
+
+
+@pytest.mark.parametrize("operation", ["finish", "delete"])
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("corrupt_historical_digest", [False, True])
+def test_terminal_lifecycle_audits_each_attempt_against_its_own_goal_revision(
+    system, operation: str, completed: bool, corrupt_historical_digest: bool,
+) -> None:
+    actor = _attached(system, suffix="c")
+    ids = _seed_managed_thread(system, actor, ordinal=834)
+    service = system["service"]
+    work = service.assign_work(
+        actor,
+        _seeded_managed_work_assignment(
+            ids,
+            title="Verify a bounded local result",
+            objective="Return the initial local result.",
+            acceptance=["The local result is recorded."],
+            idempotency_key="initial-revision",
+        ),
+    )
+    prior_attempt_id = work["current_attempt"]["id"]
+    revised = service.revise_goal(
+        actor,
+        work["id"],
+        GoalRevision(
+            expected_version=1,
+            expected_purpose_version=1,
+            instruction="Return the clarified local result.",
+            maturity="defined",
+            acceptance=["The clarified local result is recorded."],
+            reason="The requester clarified the unstarted checkpoint.",
+            idempotency_key="clarified-revision",
+        ),
+    )
+    assert revised["goal_version"] == 2
+    if completed:
+        with service.db.transaction() as connection:
+            connection.execute(
+                "UPDATE attempts SET state = 'completed' WHERE id = ?",
+                (revised["current_attempt"]["id"],),
+            )
+            connection.execute(
+                "UPDATE work_items SET state = 'waiting_user', attention_owner = 'user' "
+                "WHERE id = ?",
+                (work["id"],),
+            )
+    if corrupt_historical_digest:
+        service.db.execute(
+            "UPDATE attempts SET goal_packet_digest = ? WHERE id = ?",
+            ("0" * 64, prior_attempt_id),
+        )
+    history = [
+        dict(row)
+        for row in service.db.fetchall(
+            "SELECT * FROM goal_revisions WHERE work_item_id = ? ORDER BY version",
+            (work["id"],),
+        )
+    ]
+
+    result = getattr(service, f"{operation}_worker_thread")(
+        actor, _command(ids, 1, f"terminal-{operation}")
+    )
+
+    assert result["thread_state"] == ("archived" if operation == "finish" else "deleted")
+    anomaly = service.db.fetchone(
+        "SELECT data_json FROM events "
+        "WHERE event_type = 'managed_worker_thread.retained_anomaly' AND aggregate_id = ?",
+        (ids["thread_id"],),
+    )
+    if corrupt_historical_digest:
+        assert anomaly is not None
+        assert json.loads(anomaly["data_json"])["anomaly_kinds"] == {"attempt_metadata": 1}
+    else:
+        assert anomaly is None
+    assert [
+        dict(row)
+        for row in service.db.fetchall(
+            "SELECT * FROM goal_revisions WHERE work_item_id = ? ORDER BY version",
+            (work["id"],),
+        )
+    ] == history
 
 
 def test_terminal_transport_does_not_replace_logical_worker_thread(
@@ -3746,7 +3893,7 @@ def test_non_pre_mcp_runtime_boundaries_cannot_requeue_failed_runtime(system, re
     )
 
 
-def test_system_reconciliation_requires_escalation_before_handling(
+def test_system_reconciliation_requires_cao_disposition_before_handling(
     system,
 ) -> None:
     actor = _attached(system, suffix="c")
@@ -3821,13 +3968,14 @@ def test_system_reconciliation_requires_escalation_before_handling(
             resume_condition="The requester supplies guidance and the safe continuation is verified.",
         ),
     )
-    assert disposition["kind"] == "wait_user"
+    assert disposition["kind"] == "wait_system"
     after = service.get_work(failed["id"])
     assert after["generation"] == before["generation"]
-    assert after["state"] == "user_needed"
-    assert after["attention_owner"] == "user"
-    assert after["current_attempt"]["state"] == "input_required"
-    assert after["user_needed"]["boundary_id"] == boundary["id"]
+    assert after["state"] == "waiting_supervisor"
+    assert after["attention_owner"] == "cao"
+    assert after["current_attempt"]["state"] == "waiting_supervisor"
+    assert after["system_recovery"]["boundary_id"] == boundary["id"]
+    assert after["requester_escalation"] is None
     assert after["open_boundaries"] == []
     assert (
         service.db.fetchone(
@@ -3851,7 +3999,7 @@ def test_system_reconciliation_requires_escalation_before_handling(
         "boundary_id": boundary["id"],
         "disposition_id": disposition["id"],
         "generation": failed["generation"],
-        "kind": "wait_user",
+        "kind": "wait_system",
     }
     assert recovery_message["id"] not in {item["id"] for item in service.get_inbox(actor)["items"]}
     handled_history = {
@@ -3865,7 +4013,7 @@ def test_system_reconciliation_requires_escalation_before_handling(
 
 
 
-def test_unfinished_failure_escalates_once_and_survives_notification_handling(system) -> None:
+def test_required_requester_input_survives_notification_handling(system) -> None:
     service = system["service"]
     actor = _attached(system, suffix="escalation")
     _ids, work, boundary, _request = _prepare_runtime_recovery(
@@ -3887,8 +4035,9 @@ def test_unfinished_failure_escalates_once_and_survives_notification_handling(sy
     request = BoundaryDispositionInput(
         expected_purpose_version=1, turn_id=turn["id"], lease_token=turn["lease_token"],
         expected_generation=work["generation"], kind="wait_user",
-        reason="The supervisor cannot determine a safe solution to the execution fault.",
-        instruction="Advise which remaining approach can achieve the original objective.",
+        reason="The requester must supply a private source before work can proceed.",
+        requester_input_kind="private_information",
+        instruction="Supply the missing private source for the original objective.",
         resume_condition="Requester guidance is incorporated and safe execution is verified.",
     )
     disposition = service.dispose_boundary(actor, boundary["id"], request)

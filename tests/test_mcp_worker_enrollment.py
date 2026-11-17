@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -167,7 +168,8 @@ class _Response:
 class _Client:
     calls: list[tuple[str, dict[str, str] | None, dict[str, Any]]]
 
-    def __init__(self, **_: Any) -> None:
+    def __init__(self, **kwargs: Any) -> None:
+        self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
         self.calls = _Client.calls
 
     async def __aenter__(self) -> _Client:

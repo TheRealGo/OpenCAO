@@ -71,6 +71,10 @@ The attached conversation exposes one Worker hub:
   direction for one exact same-project Worker, with a confirmed purpose version.
 - `cao_instruct_worker_thread` records one sealed task for one exact public
   `worker_thread_id`, using `instruction` and `expected_purpose_version`.
+  A paused or achieved purpose returns the non-retryable public reason
+  `worker_purpose_paused` or `worker_purpose_achieved` and the required
+  requester-directed resumption or new purpose. The refusal sends no instruction
+  and never exposes the underlying private error or changes purpose authority.
 - `cao_list_managed_workers` lists project-scoped logical Workers without
   runtime, credential, or private Directory identity.
 - `cao_finish_worker_thread` archives the exact Worker and stops future
@@ -100,38 +104,68 @@ output reads; artifact delivery and requester acceptance remain separate.
 `cao_review` verdicts are exactly `ok` and `needs_work`. Requester acceptance
 is a separate conversation action, not a requester MCP or REST route.
 
+The [report review contract](cao-operator-runbook.md#review-reports-and-audit-when-needed)
+defines report-based acceptance, optional structured reports and scoped audits.
+
 ### Work, Delivery, and recovery
 
-Attached CAO conversations cannot poll mutable state. `cao_get_work`,
-`cao_get_inbox`, `cao_query`, `cao_read_work_history` and the model's
-`cao_list_managed_workers` allow
-one read per resource after a verified native input, a new notification, or a
-committed relevant supervisor command. Admission persists across bridge and
-daemon replacement. Time passing, heartbeats, silent Worker changes, different
-filters and repeated attachment setup do not renew it. A repeat returns
-`cao_state_polling_prohibited`, `retryable=false`, and
-`next_action=end_turn_await_notification`; end the turn and use the existing
-durable notification route.
+New CAO notifications show four bounded lines: the Dashboard's Worker label and
+reported event, the task title, the requested CAO action, and one exact lookup:
+`cao_get_inbox(message_id="msg_…")`. Display labels are sealed with the Message;
+they never select a Worker or grant authority. The preview contains neither
+provider output text nor packet digests or detailed operating instructions.
 
-Only server-issued forward cursors continue collection reads, including
+Read that exact Message before acting. The lookup returns only its addressed
+report or output references and `processing_instructions`, including the original
+packet/Boundary identifiers, purpose and evidence checks, recovery route and
+single-Delivery handling rules. It remains readable after a later notification,
+disposition or handling; it does not ACK, handle, review or dispose anything.
+Attachment scope, Worker inbox FIFO and bounded read sizes still apply.
+Messages already sealed without compact presentation retain their original
+rendering, so an input already queued before an upgrade keeps its exact identity.
+
+Attached CAO conversations use notifications rather than polling while waiting.
+`cao_get_work`, `cao_get_inbox`, `cao_query`, `cao_read_work_history` and
+`cao_list_managed_workers` are repeatable bounded reads. A discarded response,
+failed parallel consumer, reconnect or committed change can require another
+read without another requester input. Reads use the existing attachment and
+conversation authority; they do not require native input observation, consume a
+read allowance, or authorize a mutation. Pagination retains its normal cursor
+validation and size limits.
+
+A notification does not replace the conversation's existing authority,
+restrict the CAO to one Work, or cancel pending requester direction.
+The CAO normally processes the named Message and Work, preserving earlier
+requester instructions across provider errors and later notifications. Existing
+attachment isolation, inbox ordering, task checks and external-effect authority
+remain enforced. Repeated reads, ACK, handling and a reasoner lease do not grant
+new effect or task authority. After settling the notified action, end the turn
+and await the next durable notification instead of repeatedly checking for work.
+
+Genuine requester and cross-chat inputs retain their existing bounded read and
+command authority. Attachment readiness and explicit Worker lifecycle
+commands remain independent. For a status-only question, answer from confirmed
+information first and identify what is still unknown; do not make new
+instructions, purpose changes, status requests or a fresh review a prerequisite
+for that answer. Existing authorized continuation resumes on its own trigger.
+The Work/inbox results carry this trigger guidance. Sealed Message presentation
+and processing instructions remain intact.
+
+Use returned forward cursors for collection reads, including
 `next_before_sequence` for older history pages. Immutable artifact and output
 chunks retain their existing read rules.
-The owner edge observes native input identities using the supported App Server
-`thread/turns/list` API, never requester text or a model-supplied override.
-Missing native observations cannot renew admission. Native
-cross-chat instructions are represented by Codex as standalone
+Native cross-chat instructions are represented by Codex as standalone
 `functionCallOutput` inputs with namespace `codex_app` and name
-`send_message_to_thread`; their native item identities also renew one read.
-Ordinary tool results and assistant output never renew it. This read admission
-does not make message text external-effect authority. Input item identities
-require a full view of the latest turn; the summary view may omit them.
-Native input probes own and close their event loop while preserving an existing
-idle or running host loop.
-Proxy-authenticated attachment readiness probes remain independent of model
-read admission;
-their proof does not authorize another tool or expose Worker state to the model.
+`send_message_to_thread`. Their text remains subject to the conversation's
+existing authority and does not grant external-effect authority by itself.
 Lifecycle commands, Worker context/reporting, Dashboard refresh, and daemon
 recovery retain their existing contracts.
+
+Worker `cao_get_context` and direct `cao_get_inbox` share one allowlisted
+message view. It retains task semantics, message identities, packet digests,
+acknowledgment state and pagination while omitting internal routing and
+supervision metadata. The canonical messages and the CAO's full audit view
+remain unchanged, and technical identifiers in the task retain their exact text.
 
 CAO reads current `worker_purpose` before every instruction or judgment and
 confirms its version in each business command. `cao_revise_goal` and `objective`
@@ -171,12 +205,30 @@ an explicit historical unknown recovery value fails closed as
 
 A Worker sends `cao_report(kind=progress, progress_event=execution_started)`
 once after its first actual operation, with concrete evidence. The exact Attempt
-receives one durable start event and one CAO Delivery; duplicate start reports and
-ordinary progress cannot produce repeated start wakes. The start report leaves
+receives one durable start event. Start reports and ordinary progress remain
+history-only unless answering an explicit status request. The start report leaves
 Work attention with Worker and creates no decision Boundary or approval gate.
 It is a Worker report, not acceptance or proof of task completion. Its receipt is
-visible as `current_attempt.activity.execution_start`. Unread start notifications
-are not coalesced merely because a later completion Boundary arrives.
+visible as `current_attempt.activity.execution_start`. Retained pre-upgrade start
+Deliveries keep their existing incorporation contract.
+
+### Worker report receipts
+
+`cao_report` returns a compact acknowledgment with current Work/Attempt state
+and `report_receipt`, rather than the Work's complete history. The receipt
+binds this exact report Message, Work and Attempt. Its `artifact_ids` and
+`artifacts` describe only this call's registered rows, including each digest
+and `verified` content-archive status. An unverified URI reference never
+receives `verified=true`.
+
+An artifact report can succeed while `completion_manifest_state` remains
+`not_finalized`. Continue working or submit `completion_claim`; do not replay
+registration because a completion manifest is still empty. Completion snapshots
+the verified Attempt artifacts and returns `completion_artifact_ids` with
+`completion_manifest_state=finalized`. These receipts do not imply CAO review
+or requester acceptance. Idempotent replay returns the same operation receipt;
+a retained pre-upgrade response can recover it from the exact report Message
+without registering content again.
 
 ### Verified artifact reads
 

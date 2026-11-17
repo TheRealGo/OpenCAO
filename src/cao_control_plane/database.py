@@ -40,7 +40,7 @@ from .security import canonical_json as security_canonical_json
 from .security import contains_control_plane_secret
 from .worker_purpose import work_purpose_tx
 
-SCHEMA_VERSION = 49
+SCHEMA_VERSION = 53
 APPLICATION_ID = 0x43414F32  # "CAO2"
 
 
@@ -165,7 +165,9 @@ def _checked_owner_sqlite_file(path: Path) -> tuple[Path, os.stat_result]:
     return candidate.resolve(strict=True), info
 
 
-def _read_only_sqlite(path: Path) -> sqlite3.Connection:
+def read_only_sqlite_connection(path: Path) -> sqlite3.Connection:
+    """Open existing state without creating it or changing persisted settings."""
+
     connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only = ON")
@@ -177,7 +179,7 @@ def inspect_sqlite_database(path: Path) -> SQLiteDatabaseIdentity:
 
     checked, before = _checked_owner_sqlite_file(path)
     try:
-        with closing(_read_only_sqlite(checked)) as connection:
+        with closing(read_only_sqlite_connection(checked)) as connection:
             application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
             user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             row = connection.execute(
@@ -240,7 +242,7 @@ def backup_sqlite_database(
     os.close(descriptor)
     try:
         with (
-            closing(_read_only_sqlite(source_path)) as source_connection,
+            closing(read_only_sqlite_connection(source_path)) as source_connection,
             closing(sqlite3.connect(temporary)) as target_connection,
         ):
             source_connection.backup(target_connection)
@@ -597,24 +599,6 @@ CREATE TABLE IF NOT EXISTS cao_attachment_connections (
 CREATE INDEX IF NOT EXISTS cao_attachment_connections_attachment_state_expiry_idx
     ON cao_attachment_connections(attachment_id, state, lease_expires_at);
 
--- State-read admission belongs to the durable attachment, never a bridge or
--- wall-clock cooldown. Store only input identities and cursor digests.
-CREATE TABLE IF NOT EXISTS cao_state_read_inputs (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    attachment_id TEXT NOT NULL REFERENCES cao_session_attachments(id) ON DELETE CASCADE,
-    input_digest TEXT NOT NULL,
-    UNIQUE(attachment_id, input_digest)
-);
-CREATE TABLE IF NOT EXISTS cao_state_read_cursors (
-    attachment_id TEXT NOT NULL REFERENCES cao_session_attachments(id) ON DELETE CASCADE,
-    resource TEXT NOT NULL,
-    cause_digest TEXT NOT NULL,
-    reservation_id TEXT NOT NULL,
-    pending INTEGER NOT NULL CHECK(pending IN (0, 1)),
-    next_cursor_digest TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY(attachment_id, resource)
-);
-
 CREATE TABLE IF NOT EXISTS cao_runtime_tickets (
     id TEXT PRIMARY KEY,
     attachment_id TEXT NOT NULL REFERENCES cao_session_attachments(id) ON DELETE CASCADE,
@@ -732,6 +716,31 @@ CREATE INDEX IF NOT EXISTS work_items_worker_state_idx
     ON work_items(assigned_worker_id, state, priority DESC);
 CREATE INDEX IF NOT EXISTS work_items_attention_idx
     ON work_items(attention_owner, state);
+
+-- Independent semantic reviews are supervisor-private evidence. They survive
+-- Worker retirement and cannot be supplied by a public command argument.
+CREATE TABLE IF NOT EXISTS instruction_reviews (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    attachment_id TEXT NOT NULL REFERENCES cao_session_attachments(id),
+    worker_thread_id TEXT NOT NULL,
+    command_digest TEXT NOT NULL,
+    candidate_kind TEXT NOT NULL CHECK(candidate_kind IN ('purpose','assignment','instruction','status_request')),
+    proposal_digest TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK(verdict IN ('pass','reject','needs_evidence','unavailable')),
+    result_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    elapsed_ms INTEGER NOT NULL,
+    usage_json TEXT NOT NULL,
+    work_item_id TEXT,
+    message_id TEXT,
+    consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0,1)),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS instruction_reviews_worker_idx
+    ON instruction_reviews(worker_thread_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS source_receipts (
     id TEXT PRIMARY KEY,
@@ -1314,6 +1323,9 @@ CREATE TABLE IF NOT EXISTS boundary_dispositions (
     reason TEXT NOT NULL,
     instruction TEXT NOT NULL DEFAULT '',
     resume_condition TEXT NOT NULL DEFAULT '',
+    recovery_blocker TEXT NOT NULL DEFAULT '',
+    recovery_probe_digest TEXT NOT NULL DEFAULT '',
+    requester_input_kind TEXT NOT NULL DEFAULT '',
     request_digest TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -2777,6 +2789,99 @@ def _legacy_system_escalation_input_matches(
     )
 
 
+def _legacy_conversation_close_turn_matches(
+    connection: sqlite3.Connection, turn: sqlite3.Row, boundary: sqlite3.Row,
+) -> bool:
+    """Preserve only the exact synthetic CANCEL receipt from the old close writer.
+
+    Its input was the unwrapped Boundary digest and its result was the decision
+    digest. Require the immutable disposition, deterministic system seal, owner
+    lineage and canonical close-command receipt; never repair arbitrary digests.
+    Diagnostic events are not required because normal retention may prune them.
+    """
+    if not (
+        turn["state"] == "completed"
+        and turn["work_item_id"] == boundary["work_item_id"]
+        and turn["generation"] == boundary["generation"]
+        and turn["input_digest"] == boundary["input_digest"]
+        and turn["lease_token_digest"] == canonical_digest(f"conversation-close:{turn['id']}")
+        and turn["completed_at"] == turn["created_at"] == turn["updated_at"] == turn["lease_expires_at"]
+    ):
+        return False
+    owner = connection.execute(
+        """SELECT work.supervisor_attachment_id,
+                  attachment.generation AS attachment_generation,
+                  goal.supervisor_attachment_generation AS goal_attachment_generation
+           FROM work_items AS work
+           JOIN cao_session_attachments AS attachment
+             ON attachment.id = work.supervisor_attachment_id
+            AND attachment.principal_id = work.supervisor_id
+           JOIN goal_revisions AS goal
+             ON goal.work_item_id = work.id AND goal.version = ?
+           WHERE work.id = ? AND work.supervisor_id = ?""",
+        (turn["goal_version"], turn["work_item_id"], turn["supervisor_id"]),
+    ).fetchone()
+    if owner is None or owner["goal_attachment_generation"] is None:
+        return False
+    attachment_id = str(owner["supervisor_attachment_id"])
+    prefix = f"conversation-close:{attachment_id}:"
+    suffix = f":{boundary['id']}"
+    key = str(turn["idempotency_key"])
+    if not key.startswith(prefix) or not key.endswith(suffix):
+        return False
+    raw_generation = key[len(prefix):-len(suffix)]
+    try:
+        generation = int(raw_generation)
+    except ValueError:
+        return False
+    if not (
+        str(generation) == raw_generation
+        and int(owner["goal_attachment_generation"]) <= generation <= int(owner["attachment_generation"])
+    ):
+        return False
+    close_digest = canonical_digest({
+        "attachment_id": attachment_id, "attachment_generation": generation,
+    })
+    receipts = connection.execute(
+        """SELECT request_digest, result_json FROM idempotency_results
+           WHERE actor_id = ? AND operation = ?""",
+        (turn["supervisor_id"], f"close_cao_conversation:{attachment_id}:{generation}"),
+    ).fetchall()
+    if len(receipts) != 1 or receipts[0]["request_digest"] != close_digest:
+        return False
+    try:
+        result = json.loads(receipts[0]["result_json"])
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not (
+        isinstance(result, dict)
+        and set(result) == {"status", "scope", "work_items_canceled", "managed_workers_stopped"}
+        and result["status"] == "closed" and result["scope"] == "conversation"
+        and type(result["work_items_canceled"]) is int and result["work_items_canceled"] >= 0
+        and type(result["managed_workers_stopped"]) is int and result["managed_workers_stopped"] == 0
+    ):
+        return False
+    decision = connection.execute(
+        """SELECT * FROM boundary_dispositions
+           WHERE boundary_id = ? AND reasoner_turn_id = ? AND generation = ?
+             AND decided_by = ? AND kind = 'cancel' AND instruction = ''""",
+        (boundary["id"], turn["id"], turn["generation"], turn["supervisor_id"]),
+    ).fetchone()
+    if decision is None:
+        return False
+    reason = "The requester explicitly closed this CAO conversation."
+    decision_digest = canonical_digest({
+        "kind": "cancel", "reason": reason, "instruction": "",
+        "attachment_id": attachment_id, "attachment_generation": generation,
+        "close_request_digest": close_digest,
+    })
+    return bool(
+        decision["reason"] == reason
+        and decision["request_digest"] == turn["result_digest"] == decision_digest
+        and decision["created_at"] == turn["created_at"]
+    )
+
+
 def _backfill_goal_and_task_packets(connection: sqlite3.Connection) -> None:
     """Migrate only packet identities that can be reconstructed exactly.
 
@@ -3447,8 +3552,10 @@ def _backfill_goal_and_task_packets(connection: sqlite3.Connection) -> None:
         )
         stored_binding = require_task_binding(table="reasoner turn", row=row, expected=expected)
         stored_input_digest = str(row["input_digest"] or "")
+        legacy_conversation_close = False
         if stored_input_digest and stored_input_digest != input_digest:
-            if not _legacy_system_escalation_input_matches(connection, row, boundary):
+            legacy_conversation_close = _legacy_conversation_close_turn_matches(connection, row, boundary)
+            if not legacy_conversation_close and not _legacy_system_escalation_input_matches(connection, row, boundary):
                 raise RuntimeError("stored reasoner turn input digest is invalid")
             input_digest = stored_input_digest  # Preserve the exact legacy audit receipt.
 
@@ -3469,6 +3576,8 @@ def _backfill_goal_and_task_packets(connection: sqlite3.Connection) -> None:
                     "task_packet_digest": boundary["task_packet_digest"],
                 }
             )
+            if legacy_conversation_close:
+                expected_result_digest = result_digest  # Already verified against the exact close receipt.
             if result_digest and result_digest != expected_result_digest:
                 raise RuntimeError("stored reasoner result digest is invalid")
             result_digest = expected_result_digest
@@ -5754,6 +5863,86 @@ def _exact_assignment_not_submitted_is_proven(
     connection: sqlite3.Connection,
     row: Mapping[str, Any],
 ) -> bool:
+    if not _pre_submit_assignment_transport_is_proven(connection, row):
+        return False
+    runtime_id = str(row["runtime_session_id"] or "")
+    runtime = connection.execute("SELECT metadata_json FROM runtime_sessions WHERE id=?", (runtime_id,)).fetchone()
+    metadata = json.loads(runtime["metadata_json"])
+    if metadata["last_dispatch"]["diagnostics"]["failure_code"] == "runtime_thread_not_found":
+        return _cold_native_handle_replacement_is_proven(connection, worker_id=str(row["worker_id"]), runtime_id=runtime_id)
+    return True
+
+
+def _cold_native_handle_replacement_is_proven(
+    connection: sqlite3.Connection, *, worker_id: str, runtime_id: str,
+) -> bool:
+    """Replace only a lost handle whose entire managed input history is unsubmitted.
+
+    Missing history or an empty output alone is never non-execution evidence.
+    Require normal managed creation and positive transport receipts for every
+    retained Attempt. This does not authorize any command or replay; callers
+    still own the exact Work, enrollment, generation and effect admission.
+    """
+    runtime = connection.execute(
+        "SELECT native_session_id, metadata_json FROM runtime_sessions WHERE id=? AND principal_id=? "
+        "AND adapter='codex-app-server' AND state IN ('failed','missing','stopped')", (runtime_id, worker_id),
+    ).fetchone()
+    if runtime is None or not runtime["native_session_id"]:
+        return False
+    try:
+        metadata = json.loads(runtime["metadata_json"])
+        diagnosis = metadata["last_dispatch"]["diagnostics"]
+        if (diagnosis["failure_code"] != "runtime_thread_not_found"
+                or diagnosis["dispatch_phase"] != "thread_binding"
+                or diagnosis["delivery_acceptance"] != "not_submitted"):
+            return False
+    except (TypeError, ValueError, KeyError):
+        return False
+    origins = connection.execute(
+        "SELECT origin.data_json FROM managed_worker_specs spec JOIN managed_worker_threads thread "
+        "ON thread.managed_spec_id=spec.id JOIN events origin ON origin.aggregate_id=spec.id "
+        "AND origin.event_type='managed_worker.created' WHERE spec.principal_id=? "
+        "AND spec.runtime_session_id=? AND spec.adapter='codex-app-server' "
+        "AND spec.state='enabled' AND thread.state='active'", (worker_id, runtime_id),
+    ).fetchall()
+    if len(origins) != 1:
+        return False
+    try:
+        if json.loads(origins[0]["data_json"]).get("principal_id") != worker_id:
+            return False
+    except (ValueError, AttributeError):
+        return False
+    unsafe = connection.execute(
+        """SELECT 1 WHERE
+        EXISTS (SELECT 1 FROM messages WHERE sender_id=? AND kind IN
+                   ('progress','question','blocker','artifact','completion_claim'))
+        OR EXISTS (SELECT 1 FROM message_deliveries d JOIN messages m ON m.id=d.message_id
+                   WHERE d.recipient_id=? AND m.kind IN ('instruction','status_request'))
+        OR EXISTS (SELECT 1 FROM effect_operations WHERE principal_id=?)
+        OR EXISTS (SELECT 1 FROM events e JOIN attempts a ON e.aggregate_id=a.id
+                   WHERE a.worker_id=? AND e.event_type IN
+                       ('attempt.provider_queue_accepted','attempt.provider_turn_started','attempt.execution_started'))
+        OR EXISTS (SELECT 1 FROM worker_output_streams s JOIN attempts a ON a.id=s.attempt_id
+                   WHERE a.worker_id=? AND s.source_turn_digest<>'')
+        OR EXISTS (SELECT 1 FROM worker_output_receipts r JOIN attempts a ON a.id=r.attempt_id
+                   WHERE a.worker_id=? AND r.content_digest<>'')
+        OR EXISTS (SELECT 1 FROM runtime_credentials c JOIN worker_enrollments e ON e.id=c.enrollment_id
+                   WHERE e.principal_id=? AND c.state='active')
+        OR EXISTS (SELECT 1 FROM runtime_enrollment_tickets t JOIN worker_enrollments e ON e.id=t.enrollment_id
+                   WHERE e.principal_id=? AND t.state='pending')""", (worker_id,) * 8,
+    ).fetchone()
+    if unsafe:
+        return False
+    attempts = connection.execute(
+        "SELECT id AS attempt_id, worker_id, runtime_session_id FROM attempts WHERE worker_id=?", (worker_id,),
+    ).fetchall()
+    return bool(attempts) and all(_pre_submit_assignment_transport_is_proven(connection, attempt) for attempt in attempts)
+
+
+def _pre_submit_assignment_transport_is_proven(
+    connection: sqlite3.Connection,
+    row: Mapping[str, Any],
+) -> bool:
     """Prove App Server submission never occurred for one exact Assignment."""
 
     deliveries = connection.execute(
@@ -5806,6 +5995,7 @@ def _exact_assignment_not_submitted_is_proven(
             "runtime_protocol_invalid_json",
             "runtime_process_exited",
             "runtime_dispatch_failed",
+            "runtime_thread_not_found",
         }
     ):
         return False
@@ -7862,7 +8052,7 @@ class Database:
     def wait_for_commit(
         self,
         after: int,
-        timeout: float,
+        timeout: float | None,
         *,
         cancelled: threading.Event | None = None,
     ) -> int:
@@ -7874,16 +8064,17 @@ class Database:
         """
 
         with self._commit_condition:
-            remaining = max(timeout, 0.0)
-            deadline = monotonic() + remaining
-            while (
-                self._commit_generation <= after
-                and remaining > 0
-                and (cancelled is None or not cancelled.is_set())
-            ):
+            deadline = monotonic() + max(timeout, 0.0) if timeout is not None else None
+            while self._commit_generation <= after and (cancelled is None or not cancelled.is_set()):
+                remaining = deadline - monotonic() if deadline is not None else None
+                if remaining is not None and remaining <= 0:
+                    break
                 self._commit_condition.wait(remaining)
-                remaining = deadline - monotonic()
             return self._commit_generation
+
+    def notify_external_commit(self) -> None:
+        """Publish a native-event/data_version-verified cross-process commit."""
+        self._notify_commit()
 
     def wake_commit_waiters(self) -> None:
         """Wake local commit waiters without publishing a commit generation."""
@@ -7998,6 +8189,9 @@ class Database:
                         raise RuntimeError(
                             f"database schema {existing} is newer than supported {SCHEMA_VERSION}"
                         )
+                    if existing < 53:
+                        connection.execute("DROP TABLE IF EXISTS cao_state_read_cursors")
+                        connection.execute("DROP TABLE IF EXISTS cao_state_read_inputs")
                     _ensure_delivery_reactivation_policy_schema(
                         connection,
                         existing_schema_version=existing,
@@ -8511,6 +8705,21 @@ class Database:
                         connection.execute(
                             "ALTER TABLE boundary_dispositions "
                             "ADD COLUMN resume_condition TEXT NOT NULL DEFAULT ''"
+                        )
+                    if "recovery_blocker" not in disposition_columns:
+                        connection.execute(
+                            "ALTER TABLE boundary_dispositions "
+                            "ADD COLUMN recovery_blocker TEXT NOT NULL DEFAULT ''"
+                        )
+                    if "recovery_probe_digest" not in disposition_columns:
+                        connection.execute(
+                            "ALTER TABLE boundary_dispositions "
+                            "ADD COLUMN recovery_probe_digest TEXT NOT NULL DEFAULT ''"
+                        )
+                    if "requester_input_kind" not in disposition_columns:
+                        connection.execute(
+                            "ALTER TABLE boundary_dispositions "
+                            "ADD COLUMN requester_input_kind TEXT NOT NULL DEFAULT ''"
                         )
                     delivery_columns = {
                         str(column["name"])
@@ -9050,6 +9259,10 @@ class Database:
                         47: "durable Worker business purpose and checked supervision",
                         48: "requester escalation for exact CAO-owned system boundaries",
                         49: "durable conversation state-read admission",
+                        50: "CAO-owned technical recovery holds and evidence-triggered continuation",
+                        51: "Durable diagnostic fingerprints for technical recovery supervision",
+                        52: "Independent Codex review before supervisor instruction commit",
+                        53: "Remove state-read admission counters",
                     }
                     if existing < 31:
                         _backfill_managed_worker_threads(connection)

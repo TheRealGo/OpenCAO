@@ -558,6 +558,7 @@ def test_dashboard_snapshot_and_history_are_sanitized_and_deterministic(system):
                 "attention_owner": "worker",
                 "supervision_pause": None,
                 "requester_escalation": None,
+                "system_recovery": None,
                 "next_boundary_summary": None,
                 "pending_supervisor_boundary": False,
                 "recovery_action": None,

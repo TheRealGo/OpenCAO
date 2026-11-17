@@ -97,3 +97,20 @@ def test_publication_rejects_tracked_files_beneath_a_replaced_directory(source_r
     payloads, errors = publication.checked_source(source_repo)
     assert "docs/guide.md: not a distributable source file" in errors
     assert "docs/guide.md" not in payloads
+
+
+def test_publication_allows_only_named_runtime_hooks_and_checks_their_content(source_repo):
+    hook = source_repo / "src/cao_control_plane/runtime_hooks/git/pre-commit"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("#!/bin/sh\nexit 0\n")
+    payloads, errors = publication.checked_source(source_repo)
+    assert not errors
+    assert str(hook.relative_to(source_repo)) in payloads
+    unknown = hook.with_name("unreviewed-hook")
+    unknown.write_text("#!/bin/sh\nexit 0\n")
+    _, errors = publication.checked_source(source_repo)
+    assert any("unreviewed-hook: not a distributable source file" in error for error in errors)
+    unknown.unlink()
+    hook.write_text("ghp_" + "A" * 36)
+    _, errors = publication.checked_source(source_repo)
+    assert any("possible GitHub credential" in error for error in errors)

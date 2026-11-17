@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from conftest import (
     CURRENT_CAO_CATALOG_DIGEST,
@@ -330,6 +331,7 @@ def test_proxy_obtains_one_use_bootstrap_before_attaching_conversation(
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:
@@ -418,6 +420,7 @@ def test_initial_dashboard_failure_keeps_attachment_and_immediate_control_plane_
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:
@@ -605,6 +608,7 @@ def test_initial_attachment_failure_is_bounded_and_does_not_retry_or_present(
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:
@@ -685,6 +689,7 @@ def test_pending_bridge_returns_to_unattached_state_after_csc_401_without_retry_
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:
@@ -818,6 +823,7 @@ def test_attached_cao_start_renews_an_expired_csc_in_one_call(
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:
@@ -955,6 +961,7 @@ def test_verified_connection_stays_usable_after_one_transient_reprobe_failure(
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:
@@ -1161,6 +1168,7 @@ def test_successful_conversation_close_resets_proxy_and_same_thread_reattaches_o
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:

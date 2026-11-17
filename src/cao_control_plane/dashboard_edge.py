@@ -732,6 +732,19 @@ def render_dashboard_snapshot(body: Mapping[str, Any], *, timezone: tzinfo | Non
 def _render_worker_lines(worker: Mapping[str, Any], *, timezone: tzinfo | None = None) -> list[str]:
     lines = [f"- {_display(worker['worker_label'])}"]
     lines.append(f"  Business purpose: {_display(worker.get('purpose_text'))}")
+    purpose_state = worker.get("purpose_supervision_state")
+    purpose_next = {
+        "pending": "次の作業をCAOが判断する必要があります。",
+        "waiting": "記録された観測時刻を待っています。",
+        "user_needed": "継続に必要な具体的入力の確認待ちです。",
+        "achieved": "固定した目的の達成条件を検証済みです。",
+        "paused": "依頼者の明示指示により、目的の継続を休止しています。",
+        "invalid": "目的の継続記録を確認できません。",
+    }.get(str(purpose_state))
+    if purpose_next:
+        lines.append(f"  次の作業: {purpose_next}")
+    if purpose_state == "waiting" and worker.get("purpose_resume_at"):
+        lines.append(f"  次の観測時刻: {_display(local_timestamp_display(worker['purpose_resume_at'], timezone=timezone))}")
     if worker["attention_reason"] is not None:
         lines.append(f"  attention reason {_display(worker['attention_reason'])}")
     for item in worker["current_work_items"]:
@@ -889,6 +902,11 @@ def _worker_items(value: object) -> list[dict[str, Any]]:
                     if raw_worker.get("purpose_status") in {"defined", "unset", "invalid"}
                     else "unset"
                 ),
+                "purpose_supervision_state": _safe_status(
+                    raw_worker.get("purpose_supervision_state"),
+                    frozenset({"pending", "waiting", "user_needed", "assigned", "achieved", "paused", "stopped", "superseded", "invalid", "none"}),
+                ),
+                "purpose_resume_at": _safe_timestamp(raw_worker.get("purpose_resume_at")),
                 "attention_reason": _safe_status(
                     raw_worker.get("attention_reason"), ATTENTION_REASONS
                 ),

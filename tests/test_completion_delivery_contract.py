@@ -469,13 +469,20 @@ def test_artifact_report_registers_without_delivery_then_claim_freezes_it(
     assert after_later_artifact["delivery_state"] == "ready"
 
 
+@pytest.mark.parametrize("local_without_digest", [False, True])
 def test_unresolved_artifact_locator_is_opaque_and_never_enters_final_manifest(
-    system,
+    system, tmp_path, local_without_digest,
 ) -> None:
     service = system["service"]
     raw_uri = "workspace:/Users/example/private/result.txt"
     raw_uri_digest = hashlib.sha256(raw_uri.encode("utf-8")).hexdigest()
     content_digest = hashlib.sha256(b"unverified-content").hexdigest()
+    if local_without_digest:
+        source = tmp_path / "result.txt"
+        source.write_bytes(b"unverified-content")
+        raw_uri = source.as_uri()
+        raw_uri_digest = hashlib.sha256(raw_uri.encode("utf-8")).hexdigest()
+        content_digest = ""
     work = _assign_direct(
         system,
         completion_contract=CompletionContract.COMPLETION_REQUIRED,

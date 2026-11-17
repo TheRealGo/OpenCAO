@@ -311,7 +311,7 @@ class A2AServer:
         actor: dict[str, Any],
         request: Mapping[str, Any],
     ) -> dict[str, Any]:
-        response = self.handle_jsonrpc(actor, request)
+        response = await asyncio.to_thread(self.handle_jsonrpc, actor, request)
         if (
             request.get("method") == "SendMessage"
             and "result" in response

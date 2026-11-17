@@ -24,6 +24,7 @@ from .models import (
     RuntimeState,
     WorkerOutputReadInput,
 )
+from .response_evidence import response_snapshot_tx
 from .security import (
     canonical_json,
     contains_control_plane_secret,
@@ -50,6 +51,7 @@ class WorkerOutputEvent:
     phase: Literal["commentary", "final", "unspecified"] = "unspecified"
     status: Literal["running", "completed", "failed", "interrupted"] = "running"
     complete: bool = True
+    bind_native_thread: bool = True
 
 
 def _digest(value: Any) -> str:
@@ -119,11 +121,13 @@ def _substantive_output_refs_tx(
         "SELECT * FROM worker_output_receipts WHERE stream_id = ? AND event_kind = 'message' ORDER BY sequence",
         (stream_id,),
     ).fetchall()
-    finals = [row for row in rows if row["phase"] == "final"]
+    readable = [row for row in rows if row["content_digest"] and row["byte_count"] > 0
+                and row["capture_state"] in {"available", "partial"}]
+    finals = [row for row in readable if row["phase"] == "final"]
     return [
         {"output_id": str(row["id"]), "digest": str(row["content_digest"]),
          "capture_state": str(row["capture_state"]), "complete": bool(row["complete"])}
-        for row in (finals or rows)
+        for row in (finals or readable)
     ]
 
 
@@ -226,6 +230,8 @@ def observe_output(
         or (event.kind == "message" and (not event.item_id or event.status != "running"))
         or (event.kind == "turn_end" and event.status == "running")
         or (not failure and (not event.native_thread_id or not event.turn_id))
+        or type(event.bind_native_thread) is not bool
+        or (not event.bind_native_thread and (not failure or event.turn_id))
         or any(len(value) > 512 for value in (event.native_thread_id, event.turn_id, event.item_id))
     ):
         raise ValidationError("invalid provider-owned Worker output envelope")
@@ -240,6 +246,7 @@ def observe_output(
             "phase": event.phase,
             "status": event.status,
             "complete": event.complete,
+            **({"bind_native_thread": False} if not event.bind_native_thread else {}),
         }
     )
     with service.db.transaction() as connection:
@@ -334,10 +341,10 @@ def observe_output(
             and str(runtime["native_session_id"]) != event.native_thread_id
         ):
             raise ConflictError("Worker output belongs to another provider thread")
-        if event.native_thread_id:
-            # Preserve a provider-created thread before any later transport
-            # failure can erase it from the dispatch result. This private
-            # locator belongs only in the canonical runtime column.
+        if event.native_thread_id and event.bind_native_thread:
+            # Preserve unknown/submitted provider context. An adapter-proven
+            # pre-submission startup failure retains its observed handle only
+            # in the receipt because thread/start alone need not persist it.
             connection.execute(
                 "UPDATE runtime_sessions SET native_session_id = ? WHERE id = ? AND native_session_id = ''",
                 (event.native_thread_id, runtime_id),
@@ -570,6 +577,7 @@ def finalize_capture_tx(
         and dispatch_data["result"].get("success") is True
         and output["turn_status"] == "completed"
     )
+    response_evidence = response_snapshot_tx(connection, stream, output)
     pending = connection.execute(
         """SELECT 1 FROM messages m JOIN message_deliveries d ON d.message_id = m.id
            WHERE m.attempt_id = ? AND d.recipient_id = ? AND d.runtime_session_id = ?
@@ -665,7 +673,8 @@ def finalize_capture_tx(
         "attempt",
         attempt_id,
         "",
-        {"output_id": str(output["id"]), "notification_message_id": notification_id},
+        {"output_id": str(output["id"]), "notification_message_id": notification_id,
+         "response_evidence": response_evidence},
     )
     result = connection.execute(
         "SELECT * FROM worker_output_receipts WHERE id = ?", (output["id"],)

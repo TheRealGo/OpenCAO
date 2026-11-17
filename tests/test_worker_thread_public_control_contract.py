@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 
+from cao_control_plane.errors import ConflictError, ControlPlaneError
 from cao_control_plane.mcp import MCPServer, conversation_server_tools
 from cao_control_plane.models import (
     InstructWorkerThreadInput,
@@ -178,13 +179,9 @@ def test_models_keep_three_goal_maturities_and_resume_has_no_task_shape() -> Non
         )
 
 
-def test_new_instruction_resume_and_list_projections_are_privacy_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_new_instruction_resume_and_list_projections_are_privacy_safe() -> None:
     service = WorkerControlContractService()
     server = MCPServer(service)  # type: ignore[arg-type]
-    # This service double isolates DTO projection; durable read admission is
-    # exercised against a real ControlPlane in its behavior regressions.
-    monkeypatch.setattr(server._state_reads, "reserve", lambda *args: None)
-
     created = server.call_tool(
         _actor(),
         "cao_new_worker_thread",
@@ -266,6 +263,7 @@ def test_new_instruction_resume_and_list_projections_are_privacy_safe(monkeypatc
                 "state": "active",
                 "worker_thread_id": "wth_public",
                 "worker_purpose": None,
+                "purpose_supervision": {"state": "none", "count": 0, "resume_at": None},
                 "supervision_guidance": PURPOSE_GUIDANCE,
                 "generation": 1,
                 "assignment_readiness": "not_connected",
@@ -289,6 +287,48 @@ def test_new_instruction_resume_and_list_projections_are_privacy_safe(monkeypatc
         "private-native-session",
         "private-enrollment",
         "/private/requester-selected-directory",
+    ):
+        assert private_value not in rendered
+
+
+@pytest.mark.parametrize("reason_code", [
+    "worker_purpose_paused", "worker_purpose_achieved", "private_admission_failure"
+])
+def test_instruction_refusal_exposes_only_known_purpose_state(
+    monkeypatch: pytest.MonkeyPatch, reason_code: str
+) -> None:
+    service = WorkerControlContractService()
+
+    def refuse(_actor: dict[str, Any], _request: InstructWorkerThreadInput) -> None:
+        raise ConflictError(
+            "private-runtime at /private/worker-directory",
+            reason_code=reason_code,
+            native_session_id="private-native-session",
+            runtime_session_id="private-runtime",
+            next_action="private-recovery-action",
+        )
+
+    monkeypatch.setattr(service, "instruct_worker_thread", refuse)
+    with pytest.raises(ControlPlaneError) as caught:
+        MCPServer(service).call_tool(  # type: ignore[arg-type]
+            _actor(), "cao_instruct_worker_thread",
+            {
+                "worker_thread_id": "wth_public",
+                "instruction": "Perform one bounded verification.",
+                "idempotency_key": "refused-instruction",
+            },
+        )
+    error = caught.value
+    assert error.code == "conflict" and error.status_code == 409
+    if reason_code.startswith("worker_purpose_"):
+        assert error.details == {"reason_code": reason_code, "retryable": False}
+        assert "requester-directed" in error.message
+    else:
+        assert error.details is None
+    rendered = json.dumps({"message": error.message, "details": error.details})
+    for private_value in (
+        "private-runtime", "/private/worker-directory", "private-native-session",
+        "private-recovery-action", "private_admission_failure",
     ):
         assert private_value not in rendered
 

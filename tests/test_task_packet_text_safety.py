@@ -20,6 +20,15 @@ def test_task_packet_accepts_measurement_and_enumeration_prose(text):
 
 
 @pytest.mark.parametrize("text", [
+    "GET /api/items を確認する。",
+    "そのIDのGET /api/items を確認する。",
+    "準備はPOST /api/items で行う。",
+])
+def test_task_packet_accepts_explicit_http_routes_in_japanese_prose(text):
+    _require_worker_safe_task_payload({"instruction": text})
+
+
+@pytest.mark.parametrize("text", [
     "/owner/private/evidence.txt",
     "確認済み)/owner/private/evidence.txt",
     "50%/owner/private/evidence.txt",
@@ -30,6 +39,10 @@ def test_task_packet_accepts_measurement_and_enumeration_prose(text):
     "読む ~/private/evidence.txt",
     "読む file:///owner/private/evidence.txt",
     "読む https://localhost/private/evidence.txt",
+    "そのIDのGET /Users/example/private/evidence.txt を確認する。",
+    "準備はPOST /etc/private/evidence.txt で行う。",
+    "TARGETGET /api/items",
+    "_GET /api/items",
 ])
 def test_task_packet_still_rejects_concrete_private_locators(text):
     with pytest.raises(ValidationError):

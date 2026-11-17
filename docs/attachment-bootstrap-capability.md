@@ -172,6 +172,13 @@ conversation or prove that another process's embedded MCP bridge was refreshed.
 Existing terminal-turn corroboration, generation fences, Review and disposition
 requirements still apply. Credential lease expiry alone does not erase an
 admitted catalog: a cold conversation may reacquire credentials when awakened.
+For an active attachment with pending supervision, existing wake-route
+reconciliation renews an expired supervision lease using that exact admitted
+catalog and ABI, then replaces its unavailable wake reservation. The same
+attachment generation, Work and Message identities are preserved. Expired
+connection credentials remain expired and require ordinary authenticated
+bootstrap in the awakened conversation. This does not reopen a closed
+attachment, admit a stale catalog, or replay a dispatched/unknown Delivery.
 Explicit revocation, connection failure or catalog invalidation provides no such
 continuity evidence. Ordinary authenticated inbox reads, list, New, instruction
 and Worker lifecycle controls do not use this automatic-wake gate. Other
