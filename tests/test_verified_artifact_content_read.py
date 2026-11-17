@@ -278,6 +278,12 @@ def test_artifact_read_rejects_generic_credentials_outside_requested_chunk(
             len(private_key_prefix.encode()),
             len((private_key_prefix + private_key_lead_in).encode()),
         ),
+        (
+            "proxy-token-outside-chunk",
+            private_key_prefix + "https://example.invalid/api?service-runtime-proxy-token=" + "P" * 32,
+            len(private_key_prefix.encode()),
+            len(private_key_prefix.encode()),
+        ),
     )
 
     for key, text_content, requested_bytes, credential_start in cases:

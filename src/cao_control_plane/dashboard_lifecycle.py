@@ -21,12 +21,14 @@ import secrets
 import shlex
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import sleep
@@ -36,6 +38,7 @@ import httpx
 
 from .canonical import canonical_sha256
 from .config import Settings
+from .connection_contract import CAO_CONVERSATION_PROXY_ABI_VERSION
 from .dashboard_credentials import _read_owner_only_file, load_dashboard_credentials
 from .database import (
     Database,
@@ -43,6 +46,7 @@ from .database import (
     SQLiteDatabaseIdentity,
     backup_sqlite_database,
     inspect_sqlite_database,
+    read_only_sqlite_connection,
 )
 from .projection import verify_projection
 from .release_identity import ReleaseIdentity, current_release_identity
@@ -69,6 +73,8 @@ _CODEX_MCP_RELOAD_STATUS = "submitted_for_next_active_turn"
 _CODEX_APP_SERVER_RESTART_STATUS = "not_performed"
 _CODEX_APP_SERVER_RESTART_PERFORMED_STATUS = "performed"
 _CODEX_CURRENT_CONVERSATION_VERIFICATION = "pending"
+_WORKER_RESTART_CONNECTION_POLICY = "retire_after_process_fence_and_offline_backup"
+_CODEX_APP_SERVER_EXECUTABLE = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
 _OPENAI_TEAM_IDENTIFIER = "2DC432GLL2"
 _CODEX_COMMAND_TIMEOUT_SECONDS = 20.0
 _CODEX_HOST_RESTART_ATTEMPTS = 100
@@ -115,7 +121,6 @@ _CODEX_LAUNCHAGENT_RESOURCE_LIMIT_KEYS = frozenset(
 )
 _CODEX_USER_AGENT_PATTERN = re.compile(r"(?:^|[^a-z0-9])codex(?:[^a-z0-9]|$)", re.IGNORECASE)
 _CODEX_APP_SERVER_PROBE_CLIENT_NAME = "codex_app_server_daemon"
-_LEGACY_LIFECYCLE_USER_AGENT_PREFIX = "cao-dashboard-lifecycle/"
 _HOSTNAME = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
@@ -419,7 +424,12 @@ class DashboardUpgradePlan:
     codex_mcp_reload_application: str
     readiness_attempts: int
     readiness_interval_seconds: float
+    worker_connection_policy: str
     plan_digest: str
+
+    @property
+    def services_only(self) -> bool:
+        return self.codex_mcp_reload_scope == "none"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -448,6 +458,8 @@ class DashboardUpgradeResult:
     codex_mcp_reload_scope: str
     codex_mcp_reload_application: str
     current_conversation_verification: str
+    backup_retained: bool
+    worker_connections_retired: int
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -489,20 +501,32 @@ class CodexMCPRefreshResult:
 
 
 @dataclass(frozen=True, slots=True)
+class MissingCodexControlEndpoint:
+    """Owner endpoint absence, rechecked before an explicit host recovery."""
+
+    parent_identity: tuple[int, int, int, int, int]
+    alias_identity: tuple[int, int, int, int, int] | None = None
+    alias_target: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CodexAppServerMCPPreflight:
-    """Read-only host classification bound to one canonical socket inode."""
+    """Read-only host classification bound to its endpoint and process."""
 
     backend: str
-    socket_device: int
-    socket_inode: int
+    socket_device: int | None
+    socket_inode: int | None
     bundled_executable_identity: tuple[int, int, int, int, int]
     desktop_peer: CodexAppServerPeerObservation | None = None
     desktop_process: DarwinAuditProcessIdentity | None = None
     desktop_bridges: tuple[DarwinAuditProcessIdentity, ...] = ()
     desktop_restart_required: bool = False
+    missing_endpoint: MissingCodexControlEndpoint | None = None
 
     @property
-    def socket_identity(self) -> tuple[int, int]:
+    def socket_identity(self) -> tuple[int, int] | None:
+        if self.socket_device is None or self.socket_inode is None:
+            return None
         return (self.socket_device, self.socket_inode)
 
 
@@ -629,6 +653,7 @@ def _launchagent_plist_bytes(
     *,
     program_arguments: Sequence[str] | None = None,
     keep_alive: object = True,
+    process_type: str | None = None,
 ) -> bytes:
     return _plist_bytes(
         {
@@ -639,9 +664,16 @@ def _launchagent_plist_bytes(
             "StandardErrorPath": plan.log_path,
             "RunAtLoad": True,
             "KeepAlive": keep_alive,
-            "ProcessType": "Background",
+            "ProcessType": process_type or _launchagent_process_type(plan.label),
         }
     )
+
+
+def _launchagent_process_type(label: str) -> str:
+    # The Control Plane and its children serve user commands under bounded
+    # startup deadlines. Background CPU/I/O throttling also reaches those
+    # children; running without a window does not make this background work.
+    return "Interactive" if label == _CP_LABEL else "Background"
 
 
 def _launch_agent(
@@ -661,7 +693,7 @@ def _launch_agent(
         "StandardErrorPath": str(log_path),
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Background",
+        "ProcessType": _launchagent_process_type(label),
     }
     return LaunchAgentPlan(
         label=label,
@@ -806,13 +838,18 @@ def canonical_codex_app_server_socket() -> Path:
 
 def canonical_codex_app_server_executable() -> Path:
     """Return the exact signed Codex executable bundled with Desktop."""
-    from .runtime import bundled_codex_app_server_executable
 
-    # A plan may describe an absent host, but execution still requires the
-    # existing file identity, signature, and exact process/LaunchAgent binding.
-    return bundled_codex_app_server_executable() or Path(
-        "/Applications/Codex.app/Contents/Resources/codex"
+    packaged = (
+        _CODEX_APP_SERVER_EXECUTABLE.parent
+        / "codex-cli"
+        / "CodexCLI.app"
+        / "Contents"
+        / "MacOS"
+        / "codex"
     )
+    if not _CODEX_APP_SERVER_EXECUTABLE.is_file() and packaged.is_file():
+        return packaged
+    return _CODEX_APP_SERVER_EXECUTABLE
 
 
 def _canonical_owner_launchagent_dir() -> Path:
@@ -1142,16 +1179,27 @@ def _require_codex_mcp_refresh_plan(plan: CodexMCPRefreshPlan) -> None:
 
 
 def _require_dashboard_upgrade_plan(plan: DashboardUpgradePlan) -> None:
+    if (plan.format != _UPGRADE_FORMAT or _recomputed_plan_digest(plan) != plan.plan_digest
+            or plan.worker_connection_policy != _WORKER_RESTART_CONNECTION_POLICY):
+        raise ValueError("Dashboard upgrade plan no longer matches its reviewed digest")
+    if plan.services_only:
+        if (
+            plan.codex_mcp_reload_application != "not_requested"
+            or plan.codex_app_server_executable != ""
+            or plan.codex_app_server_executable_identity is not None
+            or plan.codex_app_server_socket != ""
+            or plan.codex_desktop_launchagent is not None
+        ):
+            raise ValueError("Dashboard upgrade plan no longer matches its reviewed digest")
+        return
     _require_codex_desktop_launchagent_shape(plan.codex_desktop_launchagent)
     if (
-        plan.format != _UPGRADE_FORMAT
-        or plan.codex_mcp_reload_scope != _CODEX_MCP_RELOAD_SCOPE
+        plan.codex_mcp_reload_scope != _CODEX_MCP_RELOAD_SCOPE
         or plan.codex_mcp_reload_application != _CODEX_MCP_RELOAD_APPLICATION
         or plan.codex_app_server_executable != str(canonical_codex_app_server_executable())
         or not _valid_codex_executable_identity(plan.codex_app_server_executable_identity)
         or not isinstance(plan.codex_app_server_socket, str)
         or not Path(plan.codex_app_server_socket).expanduser().is_absolute()
-        or _recomputed_plan_digest(plan) != plan.plan_digest
     ):
         raise ValueError("Dashboard upgrade plan no longer matches its reviewed digest")
 
@@ -1182,6 +1230,23 @@ def _upgrade_launchagent_binding(
     )
 
 
+def _require_unchanged_conversation_mcp_contract(database: Path, target_catalog: str) -> None:
+    message = "services-only upgrade requires the unchanged conversation MCP catalog and proxy ABI"
+    try:
+        with closing(read_only_sqlite_connection(database)) as connection:
+            metadata = dict(connection.execute(
+                "SELECT key,value FROM metadata WHERE key IN "
+                "('conversation_mcp_catalog_digest','conversation_mcp_proxy_abi_version')"
+            ).fetchall())
+    except (OSError, sqlite3.Error) as error:
+        raise ValueError(message) from error
+    if (
+        metadata.get("conversation_mcp_catalog_digest") != target_catalog
+        or metadata.get("conversation_mcp_proxy_abi_version") != str(CAO_CONVERSATION_PROXY_ABI_VERSION)
+    ):
+        raise ValueError(message)
+
+
 def build_dashboard_upgrade_plan(
     lifecycle: DashboardLifecyclePlan,
     *,
@@ -1198,18 +1263,13 @@ def build_dashboard_upgrade_plan(
     target_identity: ReleaseIdentity | None = None,
     readiness_attempts: int = 30,
     readiness_interval_seconds: float = 1.0,
+    services_only: bool = False,
 ) -> DashboardUpgradePlan:
     """Build a reviewed upgrade plan without writing files or running commands."""
 
-    if codex_desktop_launchagent is None:
-        codex_desktop_launchagent = discover_codex_desktop_launchagent_binding()
     database = _absolute_path(database_path, label="database path")
     backup = _absolute_path(backup_destination, label="backup destination")
     credentials = _absolute_path(credentials_file, label="credentials file")
-    codex_socket = _planned_codex_app_server_socket(codex_app_server_socket)
-    codex_executable = canonical_codex_app_server_executable()
-    codex_executable_identity = _planned_codex_executable_identity(codex_executable)
-    _require_codex_desktop_launchagent_shape(codex_desktop_launchagent)
     if database == backup:
         raise ValueError("backup destination must differ from the live database")
     if not source_identity.ok:
@@ -1223,6 +1283,23 @@ def build_dashboard_upgrade_plan(
         raise ValueError("target release identity is invalid or cannot read the source schema")
     if readiness_attempts < 1 or readiness_interval_seconds < 0:
         raise ValueError("readiness policy must be bounded and non-negative")
+    codex_socket: Path | None
+    codex_executable: Path | None
+    if services_only:
+        if codex_app_server_socket is not None or codex_desktop_launchagent is not None:
+            raise ValueError("services-only upgrade cannot target a Codex host")
+        _require_unchanged_conversation_mcp_contract(database, target.mcp_catalog_digest)
+        codex_socket = codex_executable = None
+        codex_executable_identity = None
+        reload_scope, reload_application = "none", "not_requested"
+    else:
+        if codex_desktop_launchagent is None:
+            codex_desktop_launchagent = discover_codex_desktop_launchagent_binding()
+        codex_socket = _planned_codex_app_server_socket(codex_app_server_socket)
+        codex_executable = canonical_codex_app_server_executable()
+        codex_executable_identity = _planned_codex_executable_identity(codex_executable)
+        _require_codex_desktop_launchagent_shape(codex_desktop_launchagent)
+        reload_scope, reload_application = _CODEX_MCP_RELOAD_SCOPE, _CODEX_MCP_RELOAD_APPLICATION
 
     control_plane = _upgrade_launchagent_binding(
         lifecycle.control_plane,
@@ -1250,16 +1327,17 @@ def build_dashboard_upgrade_plan(
         "control_plane_origin": lifecycle.prohibited_control_plane_origin,
         "edge_origin": lifecycle.expected_edge_origin,
         "credentials_file": str(credentials),
-        "codex_app_server_executable": str(codex_executable),
+        "codex_app_server_executable": str(codex_executable) if codex_executable else "",
         "codex_app_server_executable_identity": codex_executable_identity,
-        "codex_app_server_socket": str(codex_socket),
+        "codex_app_server_socket": str(codex_socket) if codex_socket else "",
         "codex_desktop_launchagent": (
             asdict(codex_desktop_launchagent) if codex_desktop_launchagent is not None else None
         ),
-        "codex_mcp_reload_scope": _CODEX_MCP_RELOAD_SCOPE,
-        "codex_mcp_reload_application": _CODEX_MCP_RELOAD_APPLICATION,
+        "codex_mcp_reload_scope": reload_scope,
+        "codex_mcp_reload_application": reload_application,
         "readiness_attempts": readiness_attempts,
         "readiness_interval_seconds": readiness_interval_seconds,
+        "worker_connection_policy": _WORKER_RESTART_CONNECTION_POLICY,
     }
     digest = _plan_digest(partial)
     return DashboardUpgradePlan(
@@ -1274,14 +1352,15 @@ def build_dashboard_upgrade_plan(
         control_plane_origin=lifecycle.prohibited_control_plane_origin,
         edge_origin=lifecycle.expected_edge_origin,
         credentials_file=str(credentials),
-        codex_app_server_executable=str(codex_executable),
+        codex_app_server_executable=str(codex_executable) if codex_executable else "",
         codex_app_server_executable_identity=codex_executable_identity,
-        codex_app_server_socket=str(codex_socket),
+        codex_app_server_socket=str(codex_socket) if codex_socket else "",
         codex_desktop_launchagent=codex_desktop_launchagent,
-        codex_mcp_reload_scope=_CODEX_MCP_RELOAD_SCOPE,
-        codex_mcp_reload_application=_CODEX_MCP_RELOAD_APPLICATION,
+        codex_mcp_reload_scope=reload_scope,
+        codex_mcp_reload_application=reload_application,
         readiness_attempts=readiness_attempts,
         readiness_interval_seconds=readiness_interval_seconds,
+        worker_connection_policy=_WORKER_RESTART_CONNECTION_POLICY,
         plan_digest=digest,
     )
 
@@ -1291,7 +1370,7 @@ def canonical_launchagent_plist(plan: LaunchAgentPlan) -> bytes:
 
 
 def _previous_canonical_launchagent_plist(plan: LaunchAgentPlan) -> bytes | None:
-    """Return only the exact plist emitted by the immediately prior release."""
+    """Retain the exact legacy crash-only/edge-argument migration."""
 
     arguments: Sequence[str]
     if plan.label == _CP_LABEL:
@@ -1311,6 +1390,7 @@ def _previous_canonical_launchagent_plist(plan: LaunchAgentPlan) -> bytes | None
         plan,
         program_arguments=arguments,
         keep_alive={"Crashed": True},
+        process_type="Background",
     )
 
 
@@ -1441,8 +1521,8 @@ class HttpxProbe:
     """Bounded, redirect-free loopback probe for status and lifecycle checks."""
 
     def __init__(self, *, timeout_seconds: float = 5.0) -> None:
-        if not 0 < timeout_seconds <= 30.0:
-            raise ValueError("loopback probe timeout must be positive and at most 30 seconds")
+        if not 0 < timeout_seconds <= 60.0:
+            raise ValueError("loopback probe timeout must be positive and at most 60 seconds")
         self.timeout_seconds = timeout_seconds
 
     def get(self, url: str, headers: Mapping[str, str]) -> HttpResult:
@@ -2210,7 +2290,18 @@ def preflight_dashboard_upgrade(
         raise RuntimeError("source database identity drifted after the upgrade plan")
     if release_identity() != plan.target_identity:
         raise RuntimeError("target release identity drifted after the upgrade plan")
-    _checked_codex_socket(Path(plan.codex_app_server_socket))
+    if not plan.services_only:
+        try:
+            _checked_codex_socket(Path(plan.codex_app_server_socket))
+        except ValueError:
+            if (plan.codex_desktop_launchagent is None
+                    or Path(plan.codex_app_server_socket) != canonical_codex_app_server_socket()):
+                raise
+            preflight_codex_app_server_mcp(
+                Path(plan.codex_app_server_socket),
+                desktop_launchagent=plan.codex_desktop_launchagent,
+                expected_bundled_executable_identity=plan.codex_app_server_executable_identity,
+            )
     verifier = migration_preflight or verify_dashboard_upgrade_migration
     migrated = verifier(plan, backup_database)
     return DashboardUpgradePreflightResult(
@@ -2298,6 +2389,41 @@ def _release_identity_ready(
     )
 
 
+def _services_control_plane_ready(result: HttpResult, target: ReleaseIdentity) -> bool:
+    """Admit the excluded native fault without changing global readiness."""
+
+    body = result.body
+    if (
+        result.status_code != 503
+        or not _content_type(result, "application/json")
+        or body is None
+        or body.get("ready") is not False
+        or body.get("release_id") != target.release_id
+        or body.get("schema_version") != target.schema_version
+        or body.get("mcp_catalog_digest") != target.mcp_catalog_digest
+    ):
+        return False
+    database = body.get("database")
+    authority = body.get("authority")
+    projection = body.get("projection")
+    dispatcher = body.get("dispatcher")
+    return bool(
+        isinstance(database, Mapping)
+        and database.get("ok") is True
+        and database.get("integrity") == ["ok"]
+        and database.get("foreign_key_errors") == []
+        and isinstance(authority, Mapping)
+        and authority.get("mode") == "canonical"
+        and isinstance(projection, Mapping)
+        and projection.get("healthy") is True
+        and projection.get("violations") == []
+        and isinstance(dispatcher, Mapping)
+        and dispatcher.get("running") is True
+        and dispatcher.get("last_error") is None
+        and dispatcher.get("issues") == ["native_change_subscription_unavailable"]
+    )
+
+
 class HttpxDashboardUpgradeProbe:
     """Bounded loopback readiness checks for a reviewed upgrade plan."""
 
@@ -2338,51 +2464,69 @@ class HttpxDashboardUpgradeProbe:
             and ready.body is not None
             and ready.body.get("ready") is True
         )
-        projection_repair_ready = self._projection_repair_preflight_ready(
+        source_repair_ready = self._source_repair_preflight_ready(
             plan,
             health,
             ready,
             target_projection_verified=target_projection_verified,
+            source_snapshot=snapshot,
         )
         if not (
-            (current_ready or projection_repair_ready)
+            (current_ready or source_repair_ready)
             and snapshot.status_code == 200
             and _content_type(snapshot, "application/json")
             and _edge_html_ready(edge)
         ):
             raise RuntimeError(
-                "upgrade preflight requires a ready or target-verified "
-                "projection-repairable Control Plane and a ready Edge"
+                "upgrade preflight requires an authenticated canonical source "
+                "with a target-verified database and a ready Edge"
             )
 
     @staticmethod
-    def _projection_repair_preflight_ready(
+    def _source_repair_preflight_ready(
         plan: DashboardUpgradePlan,
         health: HttpResult,
         ready: HttpResult,
         *,
         target_projection_verified: bool,
+        source_snapshot: HttpResult | None = None,
     ) -> bool:
-        """Admit only a target-verified repair of source projection readiness.
+        """Technical readiness cannot veto an authorized repair of itself.
 
-        This is not a general degraded-mode bypass.  The source database,
-        canonical authority, dispatcher, live release identity, Dashboard, and
-        Edge must all remain healthy.  The only failing readiness component is
-        the source projection, and the disposable target migration must already
-        have rebuilt that exact database copy without violations.
+        The surrounding preflight attests the exact loaded owner processes,
+        reviewed plists, source database, authenticated Dashboard and Edge.
+        A disposable copy must pass target migration/projection verification.
+        Post-restart readiness still requires the exact target to be healthy.
         """
 
         if (
             not target_projection_verified
             or health.status_code != 200
-            or ready.status_code != 503
             or not _content_type(health, "application/json")
-            or not _content_type(ready, "application/json")
             or health.body is None
-            or ready.body is None
             or health.body.get("status") != "ok"
-            or ready.body.get("ready") is not False
             or health.body.get("schema_version") != plan.source_identity.schema_version
+            or not isinstance(health.body.get("release_id"), str)
+            or not health.body.get("release_id")
+            or not isinstance(health.body.get("mcp_catalog_digest"), str)
+            or not health.body.get("mcp_catalog_digest")
+        ):
+            return False
+        if ready.status_code == 0:
+            # The owner preflight already verified source integrity and the
+            # complete target projection independently. An unavailable audit
+            # endpoint must not veto its own repair; retain authenticated live
+            # canonical authority, source identity and Edge checks instead.
+            authority = (source_snapshot.body.get("authority")
+                         if source_snapshot is not None and source_snapshot.body is not None else None)
+            return bool(source_snapshot is not None and source_snapshot.status_code == 200
+                        and _content_type(source_snapshot, "application/json")
+                        and isinstance(authority, Mapping) and authority.get("mode") == "canonical")
+        if (
+            ready.status_code != 503
+            or not _content_type(ready, "application/json")
+            or ready.body is None
+            or ready.body.get("ready") is not False
             or ready.body.get("schema_version") != plan.source_identity.schema_version
             or health.body.get("release_id") != ready.body.get("release_id")
             or health.body.get("mcp_catalog_digest") != ready.body.get("mcp_catalog_digest")
@@ -2390,8 +2534,6 @@ class HttpxDashboardUpgradeProbe:
             return False
         database = ready.body.get("database")
         authority = ready.body.get("authority")
-        projection = ready.body.get("projection")
-        dispatcher = ready.body.get("dispatcher")
         return bool(
             isinstance(database, Mapping)
             and database.get("ok") is True
@@ -2399,14 +2541,6 @@ class HttpxDashboardUpgradeProbe:
             and database.get("foreign_key_errors") == []
             and isinstance(authority, Mapping)
             and authority.get("mode") == "canonical"
-            and isinstance(projection, Mapping)
-            and projection.get("healthy") is False
-            and isinstance(projection.get("violations"), list)
-            and len(projection["violations"]) > 0
-            and isinstance(dispatcher, Mapping)
-            and dispatcher.get("healthy") is True
-            and dispatcher.get("running") is True
-            and dispatcher.get("issues") == []
         )
 
     def _wait(
@@ -2443,10 +2577,12 @@ class HttpxDashboardUpgradeProbe:
                 health,
                 plan.target_identity,
                 require_ready=False,
-            ) and _release_identity_ready(
-                readiness,
-                plan.target_identity,
-                require_ready=True,
+            ) and (
+                _release_identity_ready(readiness, plan.target_identity, require_ready=True)
+                or (
+                    plan.services_only
+                    and _services_control_plane_ready(readiness, plan.target_identity)
+                )
             )
 
         self._wait(
@@ -2513,7 +2649,7 @@ async def _read_exact_app_server_result(
 def _require_codex_initialize_result(
     result: Mapping[str, object],
     *,
-    allow_legacy_lifecycle_originator: bool = False,
+    attested_host: bool = False,
 ) -> None:
     """Reject a generic JSON-RPC peer before sending the reload effect."""
 
@@ -2526,10 +2662,7 @@ def _require_codex_initialize_result(
         or not 1 <= len(user_agent) <= 1024
         or (
             _CODEX_USER_AGENT_PATTERN.search(user_agent) is None
-            and not (
-                allow_legacy_lifecycle_originator
-                and user_agent.startswith(_LEGACY_LIFECYCLE_USER_AGENT_PREFIX)
-            )
+            and not attested_host
         )
         or not isinstance(codex_home, str)
         or not 1 <= len(codex_home) <= 4096
@@ -3003,7 +3136,7 @@ async def _reload_codex_mcp_server(
     release_id: str,
     *,
     expected_socket_identity: tuple[int, int] | None = None,
-    allow_legacy_lifecycle_originator: bool = False,
+    attested_host: bool = False,
 ) -> None:
     from .runtime import _JsonRpcDesktopSocket
 
@@ -3057,7 +3190,7 @@ async def _reload_codex_mcp_server(
         )
         _require_codex_initialize_result(
             initialize_result,
-            allow_legacy_lifecycle_originator=(allow_legacy_lifecycle_originator),
+            attested_host=attested_host,
         )
         await rpc.send({"method": "initialized", "params": {}})
         request_id = rpc.next_id
@@ -3103,7 +3236,7 @@ def _reload_codex_mcp_server_after_preflight(
     release_id: str,
     prepared: CodexAppServerMCPPreflight,
 ) -> None:
-    """Reload one attested host, including a bounded legacy-originator recovery."""
+    """Reload the verified host regardless of its client-selected originator."""
 
     if (
         prepared.backend not in {"desktop_owner_local", "managed_pid"}
@@ -3115,7 +3248,7 @@ def _reload_codex_mcp_server_after_preflight(
             socket_path,
             release_id,
             expected_socket_identity=prepared.socket_identity,
-            allow_legacy_lifecycle_originator=True,
+            attested_host=True,
         )
     )
 
@@ -3243,6 +3376,64 @@ def _checked_managed_codex_executable(
         raise RuntimeError("managed Codex executable lineage changed") from error
 
 
+def _missing_codex_control_endpoint(path: Path) -> MissingCodexControlEndpoint:
+    """Recognize absence only; unsafe or newly restored endpoints still fail."""
+    parent = _file_identity(_checked_codex_socket_parent(path.parent))
+    try:
+        leaf = path.lstat()
+    except FileNotFoundError:
+        return MissingCodexControlEndpoint(parent)
+    if not stat.S_ISLNK(leaf.st_mode) or leaf.st_uid != os.getuid():
+        raise ValueError("Codex control endpoint is not absent")
+    target = Path(os.readlink(path))
+    if not target.is_absolute() or target.resolve(strict=False) != target:
+        raise ValueError("Codex control endpoint alias is invalid")
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return MissingCodexControlEndpoint(parent, _file_identity(leaf), os.fspath(target))
+    raise ValueError("Codex control endpoint is not absent")
+
+
+def _preflight_disconnected_codex_desktop(
+    socket_path: Path,
+    missing: MissingCodexControlEndpoint,
+    executable: Path,
+    signed_info: os.stat_result,
+    binding: CodexDesktopLaunchAgentBinding,
+    inspector: CodexAppServerHostInspector,
+    command_runner: BoundedCodexCommandRunner,
+) -> CodexAppServerMCPPreflight:
+    """Use the exact loaded owner job when its socket cannot attest a peer."""
+    command = ("/bin/launchctl", "print", f"gui/{os.getuid()}/{binding.label}")
+    try:
+        loaded = command_runner(command, _CODEX_COMMAND_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError, TimeoutError) as error:
+        raise RuntimeError("Codex Desktop owner job is unavailable") from error
+    raw_pid = _launchctl_scalar(loaded.stdout, "pid")
+    if (loaded.returncode != 0 or raw_pid is None or not raw_pid.isascii()
+            or not raw_pid.isdecimal() or int(raw_pid) <= 1):
+        raise RuntimeError("Codex Desktop owner job has no running process")
+    pid = int(raw_pid)
+    asid = _loaded_codex_desktop_launchagent_asid(binding, pid, command_runner)
+    process = inspector.capture_process(pid, expected_asid=asid)
+    if (process.pid != pid or process.uid != os.geteuid()
+            or executable != Path(binding.program_arguments[0])
+            or _lifecycle_process_argv(pid) != binding.program_arguments):
+        raise RuntimeError("disconnected Codex Desktop process identity is invalid")
+    bridges = inspector.capture_cao_bridges(pid, expected_asid=asid)
+    if inspector.capture_process(pid, expected_asid=asid) != process:
+        raise RuntimeError("Codex Desktop process generation changed during preflight")
+    if _missing_codex_control_endpoint(socket_path) != missing:
+        raise RuntimeError("Codex control endpoint changed during recovery preflight")
+    return CodexAppServerMCPPreflight(
+        backend="desktop_owner_local", socket_device=None, socket_inode=None,
+        bundled_executable_identity=_file_identity(signed_info),
+        desktop_process=process, desktop_bridges=bridges,
+        desktop_restart_required=True, missing_endpoint=missing,
+    )
+
+
 def preflight_codex_app_server_mcp(
     socket_path: Path,
     *,
@@ -3256,13 +3447,25 @@ def preflight_codex_app_server_mcp(
     if socket_path != canonical_codex_app_server_socket():
         raise RuntimeError("Codex app-server refresh requires the canonical control socket")
     _require_codex_desktop_launchagent_shape(desktop_launchagent)
-    socket_before = _checked_codex_socket(socket_path)
+    missing = None
+    try:
+        socket_before = _checked_codex_socket(socket_path)
+    except ValueError:
+        if desktop_launchagent is None:
+            raise
+        missing = _missing_codex_control_endpoint(socket_path)
     executable, signed_info = _checked_codex_app_server_executable(command_runner)
     if (
         expected_bundled_executable_identity is not None
         and _file_identity(signed_info) != expected_bundled_executable_identity
     ):
         raise RuntimeError("Codex app-server executable changed after planning")
+    if missing is not None:
+        assert desktop_launchagent is not None
+        return _preflight_disconnected_codex_desktop(
+            socket_path, missing, executable, signed_info, desktop_launchagent,
+            host_inspector or DarwinCodexAppServerHostInspector(), command_runner,
+        )
     version_command = (
         os.fspath(executable),
         "app-server",
@@ -3402,14 +3605,14 @@ def _kickstart_codex_desktop_app_server(
     interval_seconds: float,
     expected_bundled_executable_identity: tuple[int, int, int, int, int] | None,
 ) -> CodexAppServerMCPPreflight:
-    """Replace one exact stale Desktop generation through its owner LaunchAgent."""
+    """Replace one exact stale or disconnected host through its owner job."""
 
     old_peer = prepared.desktop_peer
     old_process = prepared.desktop_process
     if (
         not prepared.desktop_restart_required
-        or old_peer is None
         or old_process is None
+        or (old_peer is None and prepared.missing_endpoint is None)
         or attempts < 1
         or interval_seconds < 0
     ):
@@ -3426,28 +3629,38 @@ def _kickstart_codex_desktop_app_server(
         )
     ):
         raise RuntimeError("signed Codex Desktop executable changed before restart")
-    current_socket = _checked_codex_socket(socket_path)
-    if (current_socket.st_dev, current_socket.st_ino) != prepared.socket_identity:
-        raise RuntimeError("Codex app-server socket changed before targeted restart")
-    current_peer = host_inspector.inspect(socket_path)
-    if (
-        current_peer.pid != old_peer.pid
-        or current_peer.uid != old_peer.uid
-        or current_peer.start_signature != old_peer.start_signature
-    ):
-        raise RuntimeError("Codex Desktop peer changed before targeted restart")
+    if prepared.missing_endpoint is not None:
+        if _missing_codex_control_endpoint(socket_path) != prepared.missing_endpoint:
+            raise RuntimeError("Codex control endpoint changed before targeted restart")
+        if _lifecycle_process_argv(old_process.pid) != binding.program_arguments:
+            raise RuntimeError("disconnected Codex Desktop argv changed before restart")
+    else:
+        assert old_peer is not None
+        current_socket = _checked_codex_socket(socket_path)
+        if (current_socket.st_dev, current_socket.st_ino) != prepared.socket_identity:
+            raise RuntimeError("Codex app-server socket changed before targeted restart")
+        current_peer = host_inspector.inspect(socket_path)
+        if (
+            current_peer.pid != old_peer.pid
+            or current_peer.uid != old_peer.uid
+            or current_peer.start_signature != old_peer.start_signature
+        ):
+            raise RuntimeError("Codex Desktop peer changed before targeted restart")
     asid = _loaded_codex_desktop_launchagent_asid(
         binding,
-        old_peer.pid,
+        old_process.pid,
         command_runner,
     )
-    if host_inspector.capture_process(old_peer.pid, expected_asid=asid) != old_process:
+    if host_inspector.capture_process(old_process.pid, expected_asid=asid) != old_process:
         raise RuntimeError("Codex Desktop process changed before targeted restart")
     if (
-        host_inspector.capture_cao_bridges(old_peer.pid, expected_asid=asid)
+        host_inspector.capture_cao_bridges(old_process.pid, expected_asid=asid)
         != prepared.desktop_bridges
     ):
         raise RuntimeError("CAO MCP bridge generations changed before targeted restart")
+    if (prepared.missing_endpoint is not None
+            and _missing_codex_control_endpoint(socket_path) != prepared.missing_endpoint):
+        raise RuntimeError("Codex control endpoint changed before targeted restart")
 
     command = (
         "/bin/launchctl",
@@ -3467,7 +3680,7 @@ def _kickstart_codex_desktop_app_server(
         or not raw_new_pid.isascii()
         or not raw_new_pid.isdecimal()
         or int(raw_new_pid) <= 1
-        or int(raw_new_pid) == old_peer.pid
+        or int(raw_new_pid) == old_process.pid
     ):
         raise LifecycleUnknownOutcome("targeted Codex Desktop restart outcome is unknown")
     new_pid = int(raw_new_pid)
@@ -3522,7 +3735,7 @@ def refresh_codex_app_server_mcp(
     restart_interval_seconds: float = _CODEX_HOST_RESTART_INTERVAL_SECONDS,
     expected_bundled_executable_identity: tuple[int, int, int, int, int] | None = None,
 ) -> str:
-    """Reload a healthy host, replacing it only for a proven stale image."""
+    """Reload a healthy host; recover an attested stale or disconnected one."""
 
     prepared = preflight_codex_app_server_mcp(
         socket_path,
@@ -3604,7 +3817,6 @@ def refresh_codex_mcp(
     if release_identity() != plan.target_identity:
         raise RuntimeError("target release identity drifted after the MCP refresh plan")
     socket_path = Path(plan.codex_app_server_socket)
-    _checked_codex_socket(socket_path)
     raw_restart_status: str | None
     if reload_codex_mcp is refresh_codex_app_server_mcp:
         _require_current_codex_executable_plan_identity(
@@ -3618,6 +3830,7 @@ def refresh_codex_mcp(
             expected_bundled_executable_identity=(plan.codex_app_server_executable_identity),
         )
     else:
+        _checked_codex_socket(socket_path)
         raw_restart_status = reload_codex_mcp(
             socket_path,
             plan.target_identity.release_id,
@@ -3663,6 +3876,71 @@ def _require_launchagent_unloaded(
         raise LifecycleUnknownOutcome(f"LaunchAgent {binding.label} is still loaded")
 
 
+def _upgrade_backup_identity(path: Path) -> tuple[int, int, int, int]:
+    """Bind cleanup to the exact private file produced by this upgrade."""
+
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+            or path.resolve(strict=True) != path.absolute()
+        ):
+            raise RuntimeError("upgrade backup identity is unsafe; backup preserved")
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+    except OSError:
+        raise RuntimeError("upgrade backup identity is unavailable; cleanup stopped") from None
+
+
+def _discard_upgrade_backup(
+    backup: SQLiteBackupResult, identity: tuple[int, int, int, int],
+) -> None:
+    """Discard only this verified rollback copy after every readiness gate."""
+
+    if _upgrade_backup_identity(backup.path) != identity:
+        raise RuntimeError("upgrade backup changed; backup preserved")
+    try:
+        descriptor = os.open(backup.path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != identity:
+                raise RuntimeError("upgrade backup changed; backup preserved")
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        if digest != backup.sha256 or _upgrade_backup_identity(backup.path) != identity:
+            raise RuntimeError("upgrade backup changed; backup preserved")
+        backup.path.unlink()
+        descriptor = os.open(backup.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise RuntimeError("upgrade backup cleanup failed; inspect before retrying") from None
+
+
+def retire_stopped_worker_connections(plan: DashboardUpgradePlan) -> int:
+    """Use the canonical service only at the executor's offline restart boundary."""
+    from .service import ControlPlane
+
+    plist = _bound_upgrade_plist(plan.control_plane)
+    arguments = plist.get("ProgramArguments")
+    if not isinstance(arguments, list):
+        raise RuntimeError("stopped Control Plane config binding is unavailable")
+    raw = _plist_argument(arguments, "--config")
+    if raw is None:
+        raise RuntimeError("stopped Control Plane config binding is unavailable")
+    config = Path(raw)
+    if not config.is_absolute():
+        config = Path(plan.control_plane.working_directory) / config
+    settings = Settings.load(config, prepare_directories=False)
+    if settings.database_path.resolve(strict=False) != Path(plan.database_path).resolve(strict=False):
+        raise RuntimeError("stopped Control Plane database binding changed")
+    service = ControlPlane(Database(settings), settings)
+    return service._retire_worker_connections_after_shared_stop(restart_plan_digest=plan.plan_digest)
+
+
 def upgrade_dashboard_lifecycle(
     plan: DashboardUpgradePlan,
     runner: CommandRunner,
@@ -3672,6 +3950,7 @@ def upgrade_dashboard_lifecycle(
     preflight: DashboardUpgradePreflight = preflight_dashboard_upgrade,
     backup_database: DashboardUpgradeBackup = backup_sqlite_database,
     reload_codex_mcp: CodexMCPReloader = refresh_codex_app_server_mcp,
+    retire_worker_connections: Callable[[DashboardUpgradePlan], int] = retire_stopped_worker_connections,
     codex_host_preflight: Callable[
         [Path], CodexAppServerMCPPreflight
     ] = preflight_codex_app_server_mcp,
@@ -3689,13 +3968,18 @@ def upgrade_dashboard_lifecycle(
         execute=execute,
         owner_confirmed=owner_confirmed,
     )
+    if plan.services_only:
+        _require_unchanged_conversation_mcp_contract(
+            Path(plan.database_path), plan.target_identity.mcp_catalog_digest,
+        )
     if (
-        reload_codex_mcp is refresh_codex_app_server_mcp
+        not plan.services_only
+        and reload_codex_mcp is refresh_codex_app_server_mcp
         and Path(plan.codex_app_server_socket) != canonical_codex_app_server_socket()
     ):
         raise ValueError("dashboard upgrade requires the canonical Codex app-server control socket")
     raw_restart_status: str | None
-    if reload_codex_mcp is refresh_codex_app_server_mcp:
+    if not plan.services_only and reload_codex_mcp is refresh_codex_app_server_mcp:
         _require_current_codex_executable_plan_identity(
             plan.codex_app_server_executable,
             plan.codex_app_server_executable_identity,
@@ -3718,6 +4002,10 @@ def upgrade_dashboard_lifecycle(
 
     # Re-read both exact plist identities after the disposable migration test
     # and immediately before stopping either service.
+    if plan.services_only:
+        _require_unchanged_conversation_mcp_contract(
+            Path(plan.database_path), plan.target_identity.mcp_catalog_digest,
+        )
     _require_upgrade_plist(plan.control_plane)
     _require_upgrade_plist(plan.edge)
     controller = process_controller or ExactDashboardUpgradeProcessController()
@@ -3746,13 +4034,22 @@ def upgrade_dashboard_lifecycle(
         or not _is_sha256(backup.sha256)
     ):
         raise RuntimeError("migration-free backup evidence does not match the upgrade plan")
+    backup_identity = _upgrade_backup_identity(backup.path)
+
+    # The old coordinator's managed transports cannot survive this restart.
+    # Revoke their credentials through the canonical recovery path instead of
+    # retaining a live-looking busy lease until its unrelated TTL expires.
+    # Keep the original snapshot and every unknown input/effect unchanged.
+    retired_connections = retire_worker_connections(plan)
 
     _launchctl_effect(runner, "bootstrap", plan.control_plane)
     probe.wait_for_control_plane(plan)
     _launchctl_effect(runner, "bootstrap", plan.edge)
     probe.wait_for_edge(plan)
 
-    if reload_codex_mcp is refresh_codex_app_server_mcp:
+    if plan.services_only:
+        raw_restart_status = _CODEX_APP_SERVER_RESTART_STATUS
+    elif reload_codex_mcp is refresh_codex_app_server_mcp:
         raw_restart_status = refresh_codex_app_server_mcp(
             Path(plan.codex_app_server_socket),
             plan.target_identity.release_id,
@@ -3765,8 +4062,9 @@ def upgrade_dashboard_lifecycle(
             plan.target_identity.release_id,
         )
     restart_status = _normalized_codex_restart_status(raw_restart_status)
+    _discard_upgrade_backup(backup, backup_identity)
     return DashboardUpgradeResult(
-        status="ready",
+        status="services_ready" if plan.services_only else "ready",
         plan_digest=plan.plan_digest,
         backup_path=str(backup.path),
         backup_sha256=backup.sha256,
@@ -3774,10 +4072,14 @@ def upgrade_dashboard_lifecycle(
         backup_identity=backup.backup_identity,
         target_identity=plan.target_identity,
         codex_app_server_restart=restart_status,
-        codex_mcp_reload=_CODEX_MCP_RELOAD_STATUS,
+        codex_mcp_reload="not_requested" if plan.services_only else _CODEX_MCP_RELOAD_STATUS,
         codex_mcp_reload_scope=plan.codex_mcp_reload_scope,
         codex_mcp_reload_application=plan.codex_mcp_reload_application,
-        current_conversation_verification=_CODEX_CURRENT_CONVERSATION_VERIFICATION,
+        current_conversation_verification=(
+            "not_requested" if plan.services_only else _CODEX_CURRENT_CONVERSATION_VERIFICATION
+        ),
+        backup_retained=False,
+        worker_connections_retired=retired_connections,
     )
 
 
@@ -3883,11 +4185,15 @@ def _write_canonical_plist(plan: LaunchAgentPlan) -> str:
     canonical = canonical_launchagent_plist(plan)
     if state == "content-conflict":
         previous = _previous_canonical_launchagent_plist(plan)
+        background_control_plane = (
+            _launchagent_plist_bytes(plan, process_type="Background")
+            if plan.label == _CP_LABEL else None
+        )
         try:
             actual = path.read_bytes()
         except OSError as error:
             raise RuntimeError(f"refusing to replace {plan.label}: unknown") from error
-        if previous is None or actual != previous:
+        if actual not in (previous, background_control_plane):
             raise RuntimeError(f"refusing to replace {plan.label}: {state}")
         _ensure_launchagent_directories(plan)
         _atomic_replace_plist(path, canonical)

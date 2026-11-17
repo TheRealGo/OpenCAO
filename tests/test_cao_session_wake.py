@@ -13,6 +13,7 @@ from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 from conftest import attach_cao_session_with_peer, current_cao_session_attachment
@@ -67,6 +68,13 @@ _INVALID_TURN_CHRONOLOGIES = [
     (102, 101),
     (100, 2**62),
 ]
+
+
+def _legacy_terminal_observation(service, arguments):
+    # Seed a pre-upgrade first observation for migration/fence tests. The real
+    # runtime no longer requires a second unchanged native read.
+    with patch.object(service, "_recover_incomplete_reasoner_delivery_tx", return_value="observed"):
+        return service.reconcile_incomplete_cao_provider_turn(**arguments)
 
 
 def _attach(system: dict[str, Any], *, thread_id: str = "cao-thread") -> dict[str, Any]:
@@ -272,6 +280,11 @@ def test_live_completion_wake_renders_as_supervisor_boundary(
     assert message["kind"] == ReportKind.COMPLETION_CLAIM.value
     assert message.get("recovery_action") is None
     rendered = render_message(message)
+    assert len(rendered.splitlines()) == 4
+    assert "完了申告" in rendered
+    assert f'cao_get_inbox(message_id="{message["id"]}")' in rendered
+    [exact] = system["service"].get_inbox(conversation_actor, message_id=message["id"])["items"]
+    rendered = exact["processing_instructions"]
     assert "Supervisor boundary ready for disposition" in rendered
     assert "dispose this boundary exactly once" in rendered
     assert "system-owned recovery Boundary" not in rendered
@@ -704,7 +717,7 @@ def test_worker_boundary_resumes_the_exact_attached_cao_thread(system: dict[str,
     assert "cao.crc_" not in str(system["service"].list_runtimes())
 
 
-def test_incomplete_recovery_hands_unmet_work_to_requester_consultation(
+def test_incomplete_recovery_retains_unmet_work_under_cao_ownership(
     system: dict[str, Any],
 ) -> None:
     attachment = _attach(system, thread_id="state-change-only-wake")
@@ -748,8 +761,11 @@ def test_incomplete_recovery_hands_unmet_work_to_requester_consultation(
     )
     assert [row["state"] for row in turns] == ["completed"]
     current = system["service"].get_work(work["id"])
-    assert current["state"] == "user_needed"
-    assert current["requester_escalation"]["notification_state"] == "queued"
+    assert current["state"] == "waiting_supervisor"
+    assert current["attention_owner"] == "cao"
+    assert current["requester_escalation"] is None
+    assert current["system_recovery"]["notification_state"] == "queued"
+    assert current["system_recovery"]["requester_action_required"] is False
     assert system["service"].reconcile_cao_supervision_obligations() == 0
 
 
@@ -2055,7 +2071,7 @@ def test_provider_consumed_wake_without_mcp_gets_one_durable_successor(
                 "SELECT state FROM message_deliveries WHERE message_id = ? AND recipient_id = ?",
                 (delivery["message_id"], system["cao"]["id"]),
             )
-            assert first_persisted is not None and first_persisted["state"] == "delivered"
+            assert first_persisted is not None and first_persisted["state"] == "dead"
             assert dispatcher._cao_supervision_activation_candidates() == []
             assert (
                 await dispatcher._activate_cao_supervision_threads(
@@ -2063,7 +2079,7 @@ def test_provider_consumed_wake_without_mcp_gets_one_durable_successor(
                         updated_before="2099-01-01T00:00:00Z"
                     )
                 )
-                == 1
+                == 0
             )
         finally:
             server.close()
@@ -2083,7 +2099,7 @@ def test_provider_consumed_wake_without_mcp_gets_one_durable_successor(
             "thread/queue/list",
             "thread/turns/list",
         ]
-        * 2
+        * 1
     )
     persisted = system["service"].db.fetchone(
         "SELECT state, last_error FROM message_deliveries "
@@ -2398,7 +2414,7 @@ def test_existing_terminal_observation_cannot_bypass_invalid_new_chronology(
         "delivery_generation": delivery["generation"],
         **_terminal_cao_proof(attachment, delivery),
     }
-    assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "observed"
+    assert _legacy_terminal_observation(service, arguments) == "observed"
     before = service.db.commit_generation()
     arguments.update(started_at=started_at, completed_at=completed_at)
     with pytest.raises(ValidationError, match="exact terminal provider turn evidence"):
@@ -2432,7 +2448,6 @@ def test_identical_completed_chronology_admits_one_terminal_recovery(
         **_terminal_cao_proof(attachment, delivery),
         "terminal_status": terminal_status,
     }
-    assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "observed"
     assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "scheduled"
     assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "not_required"
 
@@ -2474,7 +2489,7 @@ def test_terminal_cao_summary_read_is_bounded_and_fails_closed(
                 return 1, {"data": [turn], "nextCursor": "second-page" if calls == 1 else None}
             return 1, {
                 "data": [],
-                "nextCursor": "same-page" if history_case == "repeated_cursor" else f"page-{calls}",
+                "nextCursor": "same-page" if history_case == "repeated_cursor" else (f"page-{calls}" if calls < 6 else None),
             }
 
     async def read() -> Any:
@@ -2487,7 +2502,7 @@ def test_terminal_cao_summary_read_is_bounded_and_fails_closed(
 
     if history_case in {"page_cap", "invalid_status"}:
         assert asyncio.run(read()) == "pending"
-        assert calls == (5 if history_case == "page_cap" else 1)
+        assert calls == (6 if history_case == "page_cap" else 1)
     else:
         with pytest.raises(RuntimeAdapterError, match=r"^cao_provider_turn_evidence_unavailable$"):
             asyncio.run(read())
@@ -2533,7 +2548,7 @@ def test_cao_terminal_proof_cannot_be_corroborated_by_changed_authority(
         "delivery_generation": delivery["generation"],
         **_terminal_cao_proof(attachment, delivery),
     }
-    assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "observed"
+    assert _legacy_terminal_observation(service, arguments) == "observed"
     observed = service.db.fetchone(
         "SELECT data_json FROM events WHERE event_type = 'cao.supervision_provider_turn_incomplete_observed' AND aggregate_id = ?",
         (delivery["message_id"],),
@@ -2665,14 +2680,13 @@ def test_legacy_empty_queue_observation_cannot_substitute_for_terminal_proof(
             system["cao"]["id"],
             legacy_data,
         )
-    assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "observed"
+    assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "scheduled"
     assert (
         service.db.fetchone(
             "SELECT state FROM message_deliveries WHERE message_id = ?", (delivery["message_id"],)
         )["state"]
-        == "delivered"
+        == "dead"
     )
-    assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "scheduled"
     assert service.reconcile_incomplete_cao_provider_turn(**arguments) == "not_required"
 
 
@@ -2974,7 +2988,6 @@ def test_reconnect_reactivates_only_unsuperseded_failed_successor(system: dict[s
         "delivery_generation": int(delivery["generation"]),
         **_terminal_cao_proof(attachment, delivery),
     }
-    assert reconcile(**arguments) == "observed"
     assert reconcile(**arguments) == "scheduled"
     successor = system["service"].db.fetchone(
         """
@@ -3046,7 +3059,6 @@ def test_reconnect_never_reactivates_superseded_wake_beside_accepted_successor(
         "delivery_generation": int(delivery["generation"]),
         **_terminal_cao_proof(attachment, delivery),
     }
-    assert reconcile(**arguments) == "observed"
     assert reconcile(**arguments) == "scheduled"
     successor = system["service"].db.fetchone(
         """
@@ -3747,9 +3759,84 @@ def test_missing_wake_runtime_is_replaced_before_completion_dispatch(
     assert restarted_service.get_runtime(old_runtime_id)["state"] == "missing"
 
 
+def test_expired_supervision_lease_does_not_strand_completion(system: dict[str, Any]) -> None:
+    service = system["service"]
+    attachment = _attach(system, thread_id="expired-supervision-wake")
+    work, _ = _worker_boundary(system, attachment)
+    delivery = _boundary_delivery(system, work["id"])
+    service.db.execute(
+        "UPDATE cao_session_attachments SET lease_expires_at = '2000-01-01T00:00:00Z' "
+        "WHERE id = ?", (attachment["id"],),
+    )
+    service.db.execute(
+        "UPDATE runtime_sessions SET lease_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+        (attachment["runtime_session_id"],),
+    )
+    service.db.execute(
+        "UPDATE cao_attachment_connections SET lease_expires_at = '2000-01-01T00:00:00Z' "
+        "WHERE attachment_id = ?", (attachment["id"],),
+    )
+    service.expire_runtime_leases()
+    old_credentials = tuple(tuple(r) for r in service.db.fetchall(
+        "SELECT id,state,expires_at FROM cao_conversation_credentials WHERE attachment_id = ?",
+        (attachment["id"],),
+    ))
+    assert old_credentials and all(row[1] == "expired" for row in old_credentials)
+    adapter = _CAOBrokerAdapter(service, consume_delivery=True)
+    dispatcher = Dispatcher(service, system["settings"], registry=cast(Any, _Registry(adapter)))
+
+    assert asyncio.run(dispatcher.run_once()) == 1
+
+    current = service.get_cao_attachment(attachment["id"])
+    assert current["generation"] == attachment["generation"]
+    assert current["runtime_session_id"] != attachment["runtime_session_id"]
+    assert current["lease_expires_at"] >= attachment["lease_expires_at"]
+    assert tuple(tuple(r) for r in service.db.fetchall(
+        "SELECT id,state,expires_at FROM cao_conversation_credentials WHERE attachment_id = ?",
+        (attachment["id"],),
+    )) == old_credentials
+    assert _boundary_delivery(system, work["id"])["state"] == "handled"
+    assert len(adapter.calls) == 1
+    assert asyncio.run(dispatcher.run_once()) == 0
+    assert len(adapter.calls) == 1
+    assert delivery["message_id"] == _boundary_delivery(system, work["id"])["message_id"]
+
+
+@pytest.mark.parametrize("fence", ["closed", "stale_catalog", "failed_connection"])
+def test_expired_supervision_lease_preserves_connection_fences(
+    system: dict[str, Any], fence: str,
+) -> None:
+    service = system["service"]
+    attachment = _attach(system, thread_id="expired-supervision-fence")
+    work, _ = _worker_boundary(system, attachment)
+    service.db.execute(
+        "UPDATE cao_session_attachments SET lease_expires_at = '2000-01-01T00:00:00Z' "
+        "WHERE id = ?", (attachment["id"],),
+    )
+    if fence == "closed":
+        service.db.execute("UPDATE cao_session_attachments SET state = 'revoked' WHERE id = ?",
+                           (attachment["id"],))
+    elif fence == "stale_catalog":
+        service.db.execute("UPDATE cao_attachment_connections SET proxy_catalog_digest = ? "
+                           "WHERE attachment_id = ?", ("0" * 64, attachment["id"]))
+    else:
+        service.db.execute("UPDATE cao_attachment_connections SET state = 'failed' "
+                           "WHERE attachment_id = ?", (attachment["id"],))
+    before = dict(service.db.fetchone("SELECT * FROM cao_session_attachments WHERE id = ?",
+                                     (attachment["id"],)))
+
+    assert service.reconcile_cao_wake_routes() == 0
+
+    assert dict(service.db.fetchone("SELECT * FROM cao_session_attachments WHERE id = ?",
+                                   (attachment["id"],))) == before
+    assert _boundary_delivery(system, work["id"])["state"] == "queued"
+
+
+@pytest.mark.parametrize("expired_attachment", [False, True])
 def test_wake_route_replacement_never_rebinds_unknown_delivery(
     system: dict[str, Any],
     legacy_progress_wakes,
+    expired_attachment: bool,
 ) -> None:
     attachment = _attach(system, thread_id="unknown-wake-fence")
     service = system["service"]
@@ -3810,6 +3897,11 @@ def test_wake_route_replacement_never_rebinds_unknown_delivery(
         ),
     )
 
+    if expired_attachment:
+        service.db.execute(
+            "UPDATE cao_session_attachments SET lease_expires_at = '2000-01-01T00:00:00Z' "
+            "WHERE id = ?", (attachment["id"],),
+        )
     assert service.reconcile_cao_wake_routes() == 1
     rows = service.db.fetchall(
         "SELECT m.sequence, d.state, d.generation, d.runtime_session_id "

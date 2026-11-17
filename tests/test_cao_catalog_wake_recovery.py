@@ -97,7 +97,6 @@ def test_upgrade_parks_wakes_without_changing_work_or_delivery(
     else:
         candidates = restarted.pending_cao_supervision_activations(updated_before=utc_after(1))
         assert [row["message_id"] for row in candidates] == [delivery["message_id"]]
-        assert restarted.reconcile_incomplete_cao_provider_turn(**arguments) == "observed"
         assert restarted.reconcile_incomplete_cao_provider_turn(**arguments) == "scheduled"
         assert restarted.reconcile_incomplete_cao_provider_turn(**arguments) == "not_required"
 

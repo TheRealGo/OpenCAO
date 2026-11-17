@@ -88,16 +88,14 @@ def test_managed_codex_activity_accepts_only_the_exact_thread_and_turn() -> None
 
 
 @pytest.mark.parametrize("layout", ["codex", "codex-cli/CodexCLI.app/Contents/MacOS/codex"])
-@pytest.mark.parametrize("path_cli", [None, "/older-cli/codex"])
-@pytest.mark.parametrize("bundle_name", ["Codex.app", "ChatGPT.app"])
-def test_default_codex_command_uses_the_desktop_release(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, settings, path_cli: str | None, bundle_name: str, layout: str
+def test_default_codex_command_uses_bundled_host_when_daemon_path_is_minimal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, settings, layout: str
 ) -> None:
-    bundled = tmp_path / bundle_name / "Contents" / "Resources" / layout
+    bundled = tmp_path / "ChatGPT.app" / "Contents" / "Resources" / layout
     bundled.parent.mkdir(parents=True)
     bundled.write_text("", encoding="utf-8")
     bundled.chmod(0o700)
-    monkeypatch.setattr("cao_control_plane.runtime.shutil.which", lambda _name: path_cli)
+    monkeypatch.setattr("cao_control_plane.runtime.shutil.which", lambda _name: None)
     monkeypatch.setattr(
         "cao_control_plane.runtime._BUNDLED_CODEX_EXECUTABLES", (bundled,)
     )
@@ -108,9 +106,6 @@ def test_default_codex_command_uses_the_desktop_release(
         "--stdio",
     ]
     assert _default_codex_app_server_command() == expected
-    from cao_control_plane.dashboard_lifecycle import canonical_codex_app_server_executable
-
-    assert canonical_codex_app_server_executable() == bundled
     assert CodexAppServerAdapter(settings).prepare_launch({"metadata": {}})[
         "_resolved_codex_command"
     ] == expected
@@ -466,11 +461,7 @@ class _CodexProcess:
             {
                 "id": 3,
                 "result": {
-                    "queuedSubmission": {
-                        "id": "queued-1",
-                        "clientUserMessageId": client_id,
-                        "input": [],
-                    }
+                    "turn": {"id": "turn-1", "status": "inProgress", "items": []}
                 },
             },
             {
@@ -536,6 +527,7 @@ def test_codex_mcp_startup_failure_is_bounded_as_not_submitted(
     assert failed.value.metadata == {
         "delivery_acceptance": "not_submitted",
         "dispatch_phase": "mcp_startup",
+        "failure_code": "runtime_process_exited",
     }
 
 

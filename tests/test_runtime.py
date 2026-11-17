@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from dataclasses import replace
 
@@ -28,11 +29,13 @@ from cao_control_plane.models import (
 )
 from cao_control_plane.runtime import (
     AdapterRegistry,
+    CodexAppServerAdapter,
     Dispatcher,
     RuntimeAdapterError,
     _ManagedWorkerActivityMonitor,
     render_message,
 )
+from cao_control_plane.worker_output import WorkerOutputEvent
 
 
 def test_default_runtime_registry_rejects_retired_tmux_transport() -> None:
@@ -295,11 +298,9 @@ def test_dispatcher_stop_releases_commit_wait_executor_promptly(system, monkeypa
         monkeypatch.setattr(service.db, "wait_for_commit", observe_wait)
         dispatcher = Dispatcher(service, settings)
         await dispatcher.start()
-        # Remain well below the disabled 60-second recovery scan without
-        # depending on subsecond thread scheduling on a loaded host.
-        await asyncio.wait_for(wait_started.wait(), timeout=5.0)
-        await asyncio.wait_for(dispatcher.stop(), timeout=5.0)
-        await asyncio.wait_for(wait_finished.wait(), timeout=5.0)
+        await asyncio.wait_for(wait_started.wait(), timeout=1.0)
+        await asyncio.wait_for(dispatcher.stop(), timeout=1.0)
+        await asyncio.wait_for(wait_finished.wait(), timeout=1.0)
         assert dispatcher.running is False
 
     asyncio.run(exercise())
@@ -312,6 +313,8 @@ def test_dispatcher_recovery_deadline_runs_expiry_recovery(system, monkeypatch):
             system["settings"],
             dispatcher_recovery_scan_seconds=0.01,
         )
+        from cao_control_plane.database import utc_now
+        service.db.execute("UPDATE runtime_sessions SET lease_expires_at=? WHERE id=?", (utc_now(), system["runtime"]["id"]))
         recovery_cycle = asyncio.Event()
         original_expire = service.expire_runtime_leases
         original_recover = service.recover_expired_reasoner_turns
@@ -330,7 +333,7 @@ def test_dispatcher_recovery_deadline_runs_expiry_recovery(system, monkeypatch):
         dispatcher = Dispatcher(service, settings)
         await dispatcher.start()
         try:
-            await asyncio.wait_for(recovery_cycle.wait(), timeout=1.0)
+            await asyncio.wait_for(recovery_cycle.wait(), timeout=3.0)
             assert calls >= 2
         finally:
             await dispatcher.stop()
@@ -417,7 +420,7 @@ def test_managed_worker_activity_renews_on_heartbeat_and_progress_then_times_out
             assert report_activity[3] > heartbeat_activity[3]
             await asyncio.sleep(0.08)
             assert not waiting.done()
-            assert await asyncio.wait_for(waiting, timeout=1.0) == "worker_inactive_timeout"
+            assert await asyncio.wait_for(waiting, timeout=0.15) == "worker_inactive_timeout"
         finally:
             monitor.close()
             if not waiting.done():
@@ -504,7 +507,7 @@ def test_background_dispatcher_refills_while_a_worker_turn_is_still_running(syst
         )
         await dispatcher.start()
         try:
-            await asyncio.wait_for(first_started.wait(), timeout=5.0)
+            await asyncio.wait_for(first_started.wait(), timeout=1.0)
             service.assign_work(
                 system["cao"],
                 WorkAssignment(
@@ -515,13 +518,66 @@ def test_background_dispatcher_refills_while_a_worker_turn_is_still_running(syst
                     runtime_session_id=second_runtime["id"],
                 ),
             )
-            await asyncio.wait_for(second_delivered.wait(), timeout=5.0)
+            await asyncio.wait_for(second_delivered.wait(), timeout=1.0)
             assert not release_first.is_set()
         finally:
             release_first.set()
             await dispatcher.stop()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("kind", ["assignment", "instruction", "user_input"])
+@pytest.mark.parametrize("has_purpose", [False, True])
+def test_worker_messages_preserve_requester_voice_and_protocol(kind, has_purpose) -> None:
+    payload = {
+        "title": "Verify the local result",
+        "objective": "Please finish the requested local result and report back to me.",
+        "instruction": "Please verify the remaining local result and report back to me.",
+        "goal_packet_digest": "a" * 64,
+        "task_packet_digest": "b" * 64,
+        "acceptance": ["The original local result is verified."],
+    }
+    if has_purpose:
+        payload["worker_purpose"] = {"text": "Deliver the verified local result.", "version": 1}
+    rendered = render_message({"kind": kind, "work_item_id": "wrk_example", "payload": payload})
+
+    assert not re.search(r"(?<![\w-])CAO(?![\w-])|Chief Agent Officer", rendered, re.I)
+    assert "report back to me" in rendered
+    assert "a" * 64 in rendered and "b" * 64 in rendered
+    if kind == "assignment":
+        assert "cao_report" in rendered
+        assert "cao_get_context" in rendered
+        assert "The original local result is verified." in rendered
+    else:
+        assert "continue to the requested outcome" in rendered
+
+
+def test_worker_reporting_catalog_uses_requester_without_changing_tool_names() -> None:
+    from cao_control_plane.mcp import COMMON_TOOLS, WORKER_TOOLS
+
+    for tool in [*COMMON_TOOLS.values(), *WORKER_TOOLS.values()]:
+        assert not re.search(r"(?<![\w-])CAO(?![\w-])|Chief Agent Officer", tool["description"], re.I)
+    assert WORKER_TOOLS["cao_report"]["name"] == "cao_report"
+    assert COMMON_TOOLS["cao_get_inbox"]["name"] == "cao_get_inbox"
+
+
+@pytest.mark.parametrize("kind", ["assignment", "instruction", "user_input"])
+def test_worker_turn_guidance_reaches_assignment_and_correction_lanes(kind: str) -> None:
+    rendered = render_message(
+        {
+            "kind": kind,
+            "work_item_id": "wrk_example",
+            "payload": {
+                "objective": "Complete the assigned result.",
+                "instruction": "Complete the remaining result.",
+            },
+        }
+    )
+
+    assert "commentary or nonterminal progress" in rendered
+    assert "A final answer ends this execution turn and returns your result to me" in rendered
+    assert "continue tool execution" in rendered
 
 
 def test_assignment_render_uses_provider_owned_output_and_optional_structured_reports() -> None:
@@ -591,7 +647,7 @@ def test_incomplete_reasoner_recovery_render_forbids_same_state_polling() -> Non
     assert "Do not wait, sleep, or poll" in rendered
     assert "cao_start" in rendered
     assert "periodic no-change updates" in rendered
-    assert "use wait_user to persist the blocker" in rendered
+    assert "use wait_system to retain responsibility" in rendered
     assert "Do not repeat a non-retryable operation" in rendered
     assert "leave the delivery unhandled" not in rendered
 
@@ -633,7 +689,7 @@ def test_normal_completion_boundary_render_requires_supervisor_disposition() -> 
         (
             "worker_inactive_timeout",
             "system_reconciliation",
-            "escalate with wait_user",
+            "CAO retains responsibility",
         ),
     ),
 )
@@ -660,7 +716,8 @@ def test_recovery_render_uses_only_the_selected_current_action(
     assert expected in rendered
     if recovery_action == "system_reconciliation":
         assert "another Worker" in rendered
-        assert "Tell the requester" in rendered
+        assert "reports impact" in rendered
+        assert "never ask whether routine recovery may proceed" in rendered
     else:
         assert "dispose this boundary exactly once" in rendered.lower()
     assert "Delivery message ID: msg_recovery" in rendered
@@ -922,9 +979,11 @@ def test_runtime_adapter_output_cannot_claim_worker_completion(system):
         ),
     )
 
-    assert disposition["kind"] == "wait_user"
+    assert disposition["kind"] == "wait_system"
     observed = service.get_work(work["id"])
-    assert observed["state"] == "user_needed"
+    assert observed["state"] == "waiting_supervisor"
+    assert observed["attention_owner"] == "cao"
+    assert observed["system_recovery"]["requester_action_required"] is False
     assert observed["generation"] == current["generation"]
     assert observed["open_boundaries"] == []
     assert (
@@ -1148,6 +1207,219 @@ def test_completed_unacknowledged_turn_terminalizes_head_before_successor(system
     claimed = dispatcher._claim_delivery()
     assert claimed is not None
     assert claimed["message_id"] == successor_message_id
+
+
+@pytest.mark.parametrize(
+    ("mode", "ack_proof"),
+    [("immediate", "valid"), ("retained", "valid"), ("no_successor", "valid"),
+     ("retained", "missing"), ("retained", "after_completion")],
+)
+def test_completed_turn_settles_inbox_ack_before_next_command(system, monkeypatch, mode, ack_proof):
+    """An input consumed through MCP shares the current provider turn's end."""
+
+    service = system["service"]
+    runtime = system["runtime"]
+    work = service.assign_work(
+        system["cao"],
+        WorkAssignment(
+            worker_id=system["worker"]["id"],
+            title="Inbox input within a provider turn",
+            objective="Continue the exact Worker after an acknowledged inbox input.",
+            acceptance=["The inbox receipt cannot strand a distinct later command."],
+            runtime_session_id=runtime["id"],
+        ),
+    )
+    attempt = work["current_attempt"]
+    inbox_message_id = successor_message_id = ""
+    adapter: EnrollmentHandshakeAdapter
+
+    def request_status(key):
+        service.request_status(
+            system["cao"],
+            work["id"],
+            StatusRequestInput(
+                expected_generation=work["generation"],
+                summary="Report the next observable checkpoint.",
+                response_due_seconds=60,
+                idempotency_key=key,
+            ),
+        )
+        return str(service.db.fetchone(
+            "SELECT id FROM messages WHERE attempt_id = ? AND kind = 'status_request' "
+            "ORDER BY sequence DESC LIMIT 1", (attempt["id"],),
+        )["id"])
+
+    def acknowledge_inbox(_runtime, message):
+        nonlocal inbox_message_id, successor_message_id
+        actor = adapter.actors[-1]
+        service.acknowledge(actor, AckInput(message_ids=[str(message["id"])]))
+        service.report(
+            actor, attempt["id"],
+            ReportInput(
+                kind="progress",
+                expected_goal_version=work["goal_version"],
+                expected_goal_packet_digest=attempt["goal_packet_digest"],
+                expected_task_packet_digest=attempt["task_packet_digest"],
+                expected_generation=work["generation"],
+                summary="The assignment was incorporated before the later inbox input.",
+                idempotency_key="initial-inbox-progress",
+            ),
+        )
+        inbox_message_id = request_status("consumed-inside-provider-turn")
+        service.acknowledge(actor, AckInput(message_ids=[inbox_message_id]))
+        if mode != "no_successor":
+            successor_message_id = request_status("distinct-successor-during-turn")
+
+    class InboxAdapter(EnrollmentHandshakeAdapter):
+        async def dispatch(self, runtime, message):
+            result = await super().dispatch(runtime, message)
+            for event in (
+                WorkerOutputEvent(
+                    native_thread_id="native-inbox-thread", turn_id="native-inbox-turn",
+                    item_id="inbox-answer", kind="message", text="The inbox input was incorporated.",
+                ),
+                WorkerOutputEvent(
+                    native_thread_id="native-inbox-thread", turn_id="native-inbox-turn",
+                    item_id="inbox-end", kind="turn_end", status="completed",
+                ),
+            ):
+                runtime["_worker_output_observer"](event)
+            return result.model_copy(update={
+                "native_session_id": "native-inbox-thread", "metadata": {"turn_status": "completed"},
+            })
+
+    adapter = InboxAdapter(service, after_handshake=acknowledge_inbox)
+    dispatcher = Dispatcher(service, system["settings"], registry=EnrollmentHandshakeRegistry(adapter))
+    advance = service._advance_completed_worker_delivery_lane_tx
+    if mode == "retained":
+        # An upgrade must repair durable facts left by the earlier implementation.
+        monkeypatch.setattr(service, "_advance_completed_worker_delivery_lane_tx", lambda *_a, **_k: False)
+    assert asyncio.run(dispatcher.run_once()) == 1
+    if mode == "retained":
+        monkeypatch.setattr(service, "_advance_completed_worker_delivery_lane_tx", advance)
+        if ack_proof != "valid":
+            # A receipt state alone, or a receipt from a later turn, is not proof.
+            with service.db.transaction() as connection:
+                connection.execute(
+                    "DELETE FROM events WHERE event_type = 'message.acknowledged' AND aggregate_id = ?",
+                    (inbox_message_id,),
+                )
+                if ack_proof == "after_completion":
+                    service._event(
+                        connection, "message.acknowledged", "message", inbox_message_id,
+                        system["worker"]["id"], {}, causation_id=inbox_message_id,
+                    )
+        assert service.reconcile_completed_worker_turns() == (1 if ack_proof == "valid" else 0)
+
+    receipt = service.db.fetchone(
+        "SELECT state FROM message_deliveries WHERE message_id = ? AND recipient_id = ?",
+        (inbox_message_id, system["worker"]["id"]),
+    )
+    if ack_proof != "valid":
+        assert receipt["state"] == "acknowledged"
+        assert dispatcher._claim_delivery() is None
+        return
+    assert receipt["state"] == "handled"
+    if successor_message_id:
+        assert service.get_work(work["id"])["open_boundaries"] == []
+        claimed = dispatcher._claim_delivery()
+        assert claimed is not None and claimed["message_id"] == successor_message_id
+    else:
+        observed = service.get_work(work["id"])
+        assert observed["state"] == "waiting_supervisor"
+        boundary = observed["open_boundaries"][0]
+        assert boundary["kind"] == "worker_output"
+        assert observed["worker_outputs"][-1]["boundary_id"] == boundary["id"]
+    assert service.reconcile_completed_worker_turns() == 0
+
+
+@pytest.mark.parametrize(
+    ("cancel_source", "newer_generation", "late_output"),
+    [(True, False, False), (False, False, False), (True, True, False),
+     (True, False, True), (True, True, True)],
+)
+def test_failed_provider_exit_is_scoped_to_its_source_work(
+    system, cancel_source, newer_generation, late_output,
+):
+    service = system["service"]
+    runtime = system["runtime"]
+    source = service.assign_work(system["cao"], WorkAssignment(
+        worker_id=system["worker"]["id"], runtime_session_id=runtime["id"],
+        title="Provider source", objective="Perform the first bounded task.", acceptance=["Report the first result."],
+    ))
+    successors = []
+    adapter: EnrollmentHandshakeAdapter
+
+    def after_handshake(_runtime, message):
+        actor = adapter.actors[-1]
+        service.acknowledge(actor, AckInput(message_ids=[str(message["id"])]))
+        current = service.get_work(str(message["work_item_id"]))
+        attempt = current["current_attempt"]
+        service.report(actor, attempt["id"], ReportInput(
+            kind="progress", expected_goal_version=current["goal_version"],
+            expected_goal_packet_digest=attempt["goal_packet_digest"],
+            expected_task_packet_digest=attempt["task_packet_digest"],
+            expected_generation=current["generation"], summary="The exact source input was incorporated.",
+        ))
+        if message["work_item_id"] != source["id"]:
+            return
+        if cancel_source:
+            service.cancel_work(system["cao"], source["id"], "End this finite Work without accepting it.")
+        for index in range(2):
+            successors.append(service.assign_work(system["cao"], WorkAssignment(
+                worker_id=system["worker"]["id"], runtime_session_id=runtime["id"],
+                title=f"Independent successor {index}", objective=f"Perform distinct outcome {index}.",
+                acceptance=["Keep the sealed input independent from the predecessor's result."],
+            )))
+        if newer_generation:
+            # An already replaced launch cannot be failed by the old callback.
+            service.db.execute("UPDATE worker_enrollments SET generation=generation+1 WHERE runtime_session_id=?",
+                (runtime["id"],))
+            service.db.execute("UPDATE runtime_sessions SET metadata_json=? WHERE id=?",
+                (json.dumps({"current_launch": "newer-generation"}), runtime["id"]))
+
+    class LateFailureAdapter(EnrollmentHandshakeAdapter, CodexAppServerAdapter):
+        async def dispatch(self, runtime, message):
+            result = await super().dispatch(runtime, message)
+            if message["work_item_id"] == source["id"]:
+                if late_output:
+                    # A real provider adapter tries to capture its final output
+                    # after cancellation. The strict capture fence rejects it;
+                    # its failure observer must not strand runtime settlement.
+                    runtime["_worker_output_observer"](WorkerOutputEvent(
+                        native_thread_id="source-native-thread", turn_id="source-turn",
+                        item_id="late-final", kind="message", phase="final",
+                        text="A retired source cannot publish this as current evidence.",
+                    ))
+                return RuntimeDispatchResult(
+                    success=False, state="failed", error="runtime_turn_failed",
+                    metadata={"turn_status": "completed"},
+                )
+            return result
+
+    adapter = LateFailureAdapter(service, after_handshake=after_handshake)
+    dispatcher = Dispatcher(service, system["settings"], registry=EnrollmentHandshakeRegistry(adapter))
+    assert asyncio.run(dispatcher.run_once()) == 1
+    for original in successors:
+        current = service.get_work(original["id"])
+        assert current["state"] == "active" and current["generation"] == original["generation"]
+        assert current["open_boundaries"] == []
+        for key in ["id", "runtime_session_id", "goal_version", "goal_packet_digest", "task_packet_digest"]:
+            assert current["current_attempt"][key] == original["current_attempt"][key]
+    if newer_generation:
+        current = service.get_runtime(runtime["id"])
+        assert current["state"] == "busy"
+        assert current["metadata"] == {"current_launch": "newer-generation"}
+    elif cancel_source:
+        assert service.get_runtime(runtime["id"])["state"] == "waiting"
+        assert asyncio.run(dispatcher.run_once()) == 1
+        assert len(adapter.deliveries) == 2
+        delivered = service.db.fetchone('SELECT work_item_id FROM messages WHERE id=?',
+            (adapter.deliveries[-1]["message_id"],))
+        assert delivered["work_item_id"] == successors[0]["id"]
+    else:
+        assert service.get_runtime(runtime["id"])["state"] == "failed"
+        assert service.get_work(source["id"])["open_boundaries"]
 
 
 def test_background_reconciliation_uses_persisted_provider_dispatch_lineage(system, monkeypatch):
@@ -1659,3 +1931,24 @@ def test_delivery_is_durably_dispatched_before_adapter_crosses_runtime_boundary(
         )["state"]
         == "delivered"
     )
+
+
+def test_cao_lifecycle_approval_is_scoped_to_the_owned_bridge_and_two_tools():
+    from cao_control_plane.runtime import _codex_thread_mcp_config
+
+    bridge = {
+        "mcpServers": {"cao_control_plane": {"command": "owned-cao-bridge", "args": []}}
+    }
+    ordinary = _codex_thread_mcp_config(bridge, server_name="cao_managed_worker")
+    assert "tools" not in ordinary["mcp_servers.cao_managed_worker"]
+    cao = _codex_thread_mcp_config(
+        bridge, server_name="cao_managed_conversation", approve_cao_lifecycle=True
+    )
+    assert set(cao) == {"mcp_servers.cao_managed_conversation"}
+    assert cao["mcp_servers.cao_managed_conversation"]["tools"] == {
+        "cao_delete_worker_thread": {"approval_mode": "approve"},
+        "cao_close_conversation": {"approval_mode": "approve"},
+    }
+    assert bridge == {
+        "mcpServers": {"cao_control_plane": {"command": "owned-cao-bridge", "args": []}}
+    }

@@ -9,6 +9,7 @@ tokens, and JSON payloads are never copied into the result.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import re
 import sqlite3
@@ -33,6 +34,7 @@ from .close_contract import (
 )
 from .close_inventory_edge import OwnerPrivateCloseInventory
 from .connection_contract import cao_automatic_wake_ready_tx
+from .dashboard_status import CURRENT_WORK_STATES, is_successful_completion
 from .database import (
     Database,
     terminal_disposition_supersessions_sql,
@@ -47,7 +49,8 @@ from .goal_packets import (
     task_packet_digest,
 )
 from .provider_models import model_identifier
-from .requester_escalation import requester_escalation_tx
+from .purpose_continuation import worker_summary_tx
+from .requester_escalation import requester_escalation_tx, system_recovery_tx
 from .security import canonical_json, matches, redact_control_plane_secrets
 from .supervision_control import pause_view_tx
 from .worker_purpose import (
@@ -298,6 +301,124 @@ def build_projection(database: Database, *, as_of: str | None = None) -> Project
     return _build_projection(database, as_of or _utc_now(), None)
 
 
+def build_operator_snapshot(
+    database: Database, *, as_of: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read visible operator state without running an unrelated global audit.
+
+    Work fields still use the canonical builder and close-proof checks. The
+    full integrity projection remains the readiness/verification contract;
+    this visibility read makes no assertion about database integrity.
+    """
+
+    comparison_time = as_of or _utc_now()
+    with database.connection_scope() as connection:
+        connection.execute("BEGIN")
+        try:
+            authority = _authority_projection(connection)
+            workers = _operator_workers_projection(connection)
+            worker_ids = [
+                worker["principal_id"] for worker in workers
+                if worker["operator_scope"] == "production"
+            ]
+            work_indexes = _operator_visible_work_ids(connection, worker_ids)
+            work_items = project_work_items_from_connection(
+                connection, work_ids=list(work_indexes), as_of=comparison_time
+            )
+            for item in work_items:
+                item["operator_display_index"] = work_indexes[item["id"]]
+            snapshot = {
+                "authority": authority,
+                "operator_workers": workers,
+                "work_items": work_items,
+                "operator_runtime_delivery": _operator_runtime_delivery_projection(
+                    connection, comparison_time
+                ),
+            }
+            return snapshot, _watermark(connection)
+        finally:
+            connection.rollback()
+
+
+def _operator_visible_work_ids(
+    connection: sqlite3.Connection, worker_ids: Sequence[str]
+) -> dict[str, int]:
+    """Select current candidates and 20 settled results from lightweight fields.
+
+    Share completion classification and requester-decision bindings with the
+    canonical projection. The selected rows still undergo all canonical
+    enrichment and close-proof checks. Retain original ordinals even when
+    canceled or older completed Work is omitted.
+    """
+    if not worker_ids:
+        return {}
+    placeholders = ",".join("?" for _ in worker_ids)
+    rows = connection.execute(
+        f"""
+        WITH valid_requester_decisions AS ({_VALID_REQUESTER_DECISIONS_SQL})
+        SELECT w.id, w.state, w.updated_at, a.state AS attempt_state,
+               (SELECT review.verdict
+                  FROM reviews review
+                  JOIN attempts reviewed_attempt ON reviewed_attempt.id = review.attempt_id
+                 WHERE review.work_item_id = w.id
+                   AND reviewed_attempt.work_item_id = w.id
+                   AND review.reviewer_role = 'cao'
+                   AND review.work_generation = w.generation
+                   AND review.goal_version = w.goal_version
+                 ORDER BY review.created_at DESC, review.id DESC
+                 LIMIT 1) AS latest_cao_review,
+               (SELECT review.verdict
+                  FROM valid_requester_decisions decision
+                  JOIN reviews review ON review.id = decision.review_id
+                 WHERE decision.work_item_id = w.id
+                 ORDER BY decision.id DESC LIMIT 1) AS requester_review,
+               EXISTS (
+                   SELECT 1 FROM boundaries b
+                   LEFT JOIN boundary_dispositions d ON d.boundary_id = b.id
+                   LEFT JOIN boundary_supersessions s ON s.boundary_id = b.id
+                   WHERE b.work_item_id = w.id
+                     AND d.id IS NULL AND s.boundary_id IS NULL
+               ) AS has_open_boundary
+        FROM work_items w
+        JOIN goal_revisions goal ON goal.work_item_id = w.id
+                               AND goal.version = w.goal_version
+        LEFT JOIN attempts a ON a.work_item_id = w.id
+                            AND a.attempt_number = (
+                                SELECT MAX(attempt_number) FROM attempts current_attempt
+                                WHERE current_attempt.work_item_id = w.id
+                            )
+        WHERE w.operator_scope = 'production'
+          AND w.assigned_worker_id IN ({placeholders})
+        ORDER BY w.id
+        """,
+        tuple(worker_ids),
+    )
+    selected: dict[str, int] = {}
+    recent: list[tuple[str, str, str, int]] = []
+    for ordinal, row in enumerate(rows, 1):
+        work_id = str(row["id"])
+        if is_successful_completion(
+            state=row["state"],
+            attempt_state=row["attempt_state"],
+            latest_cao_review=row["latest_cao_review"] or row["requester_review"],
+            pending_supervisor_boundary=bool(row["has_open_boundary"]),
+            # Recovery actions come only from open Boundaries, which already
+            # exclude this row from settled completions.
+            recovery_action=None,
+        ):
+            candidate = (str(row["updated_at"]), f"Work item {ordinal}", work_id, ordinal)
+            if len(recent) < 20:
+                heapq.heappush(recent, candidate)
+            else:
+                heapq.heappushpop(recent, candidate)
+        elif row["state"] in CURRENT_WORK_STATES:
+            # A potentially closed Work is verified by the canonical proof
+            # builder before presentation can exclude it from current Work.
+            selected[work_id] = ordinal
+    selected.update((work_id, ordinal) for _time, _label, work_id, ordinal in recent)
+    return {work_id: selected[work_id] for work_id in sorted(selected)}
+
+
 def _build_projection(
     database: Database,
     comparison_time: str,
@@ -541,24 +662,32 @@ def _close_receipt_semantics(
 
     verified: dict[str, str] = {}
     violations: list[ProjectionViolation] = []
-    receipts = connection.execute("SELECT * FROM work_close_receipts ORDER BY id").fetchall()
-    receipts_per_work: dict[str, int] = {}
-    receipts_per_decision: dict[str, int] = {}
-    # Count globally even for a selected read: a duplicate decision on another
-    # Work must still invalidate the selected receipt.
-    for receipt in receipts:
-        work_id = str(receipt["work_item_id"])
-        decision_id = str(receipt["requester_decision_id"])
-        receipts_per_work[work_id] = receipts_per_work.get(work_id, 0) + 1
-        receipts_per_decision[decision_id] = receipts_per_decision.get(decision_id, 0) + 1
+    if work_ids is not None and not work_ids:
+        return _CloseReceiptSemantics(verified, ())
+    # Only selected receipt bodies are read. Indexed identity counts remain
+    # global: a duplicate decision on an unselected Work invalidates this proof.
+    query = """
+        SELECT receipt.*,
+               (SELECT COUNT(*) FROM work_close_receipts duplicate
+                WHERE duplicate.work_item_id = receipt.work_item_id) AS work_receipt_count,
+               (SELECT COUNT(*) FROM work_close_receipts duplicate
+                WHERE duplicate.requester_decision_id = receipt.requester_decision_id)
+                   AS decision_receipt_count
+        FROM work_close_receipts receipt
+    """
+    params: tuple[str, ...] = ()
+    if work_ids is not None:
+        query += " WHERE receipt.work_item_id IN (" + ",".join("?" for _ in work_ids) + ")"
+        params = tuple(sorted(work_ids))
+    receipts = connection.execute(query + " ORDER BY receipt.id", params).fetchall()
     for receipt in receipts:
         receipt_id = str(receipt["id"])
         work_id = str(receipt["work_item_id"])
         if work_ids is not None and work_id not in work_ids:
             continue
         if (
-            receipts_per_work[work_id] == 1
-            and receipts_per_decision[str(receipt["requester_decision_id"])] == 1
+            int(receipt["work_receipt_count"]) == 1
+            and int(receipt["decision_receipt_count"]) == 1
             and _verify_close_receipt_semantics(
                 connection,
                 receipt,
@@ -1051,6 +1180,39 @@ def _destructive_grant_invalid(
     )
 
 
+_VALID_REQUESTER_DECISIONS_SQL = """
+    SELECT d.id, d.work_item_id, d.review_id, d.verdict
+    FROM requester_decisions d
+    JOIN work_items decision_work ON decision_work.id = d.work_item_id
+    JOIN attempts decision_attempt
+      ON decision_attempt.id = d.attempt_id
+     AND decision_attempt.work_item_id = decision_work.id
+    JOIN reviews decision_review ON decision_review.id = d.review_id
+                                  AND decision_review.work_item_id = decision_work.id
+                                  AND decision_review.attempt_id = decision_attempt.id
+    JOIN cao_session_attachments decision_attachment
+      ON decision_attachment.id = d.supervisor_attachment_id
+    WHERE decision_work.requester_id = d.requester_id
+      AND decision_work.supervisor_id = d.recorded_by
+      AND decision_work.supervisor_attachment_id = d.supervisor_attachment_id
+      AND decision_work.generation = d.work_generation
+      AND decision_attachment.principal_id = d.recorded_by
+      AND decision_attachment.generation >= d.supervisor_attachment_generation
+      AND decision_review.reviewer_role = 'cao'
+      AND decision_review.verdict = 'ok'
+      AND decision_review.supervisor_attachment_id = d.supervisor_attachment_id
+      AND decision_review.supervisor_attachment_generation
+          <= d.supervisor_attachment_generation
+      AND decision_review.work_generation <= d.work_generation
+      AND decision_attempt.goal_version = d.goal_version
+      AND decision_attempt.goal_packet_digest = d.goal_packet_digest
+      AND decision_attempt.task_packet_digest = d.task_packet_digest
+      AND decision_review.goal_version = d.goal_version
+      AND decision_review.goal_packet_digest = d.goal_packet_digest
+      AND decision_review.task_packet_digest = d.task_packet_digest
+"""
+
+
 def _work_items_projection(
     connection: sqlite3.Connection,
     comparison_time: str,
@@ -1059,37 +1221,9 @@ def _work_items_projection(
 ) -> list[dict[str, Any]]:
     if work_ids is not None and not work_ids:
         return []
-    query = """
+    query = f"""
         WITH valid_requester_decisions AS (
-            SELECT d.id, d.work_item_id, d.review_id, d.verdict
-            FROM requester_decisions d
-            JOIN work_items decision_work ON decision_work.id = d.work_item_id
-            JOIN attempts decision_attempt
-              ON decision_attempt.id = d.attempt_id
-             AND decision_attempt.work_item_id = decision_work.id
-            JOIN reviews decision_review ON decision_review.id = d.review_id
-                                          AND decision_review.work_item_id = decision_work.id
-                                          AND decision_review.attempt_id = decision_attempt.id
-            JOIN cao_session_attachments decision_attachment
-              ON decision_attachment.id = d.supervisor_attachment_id
-            WHERE decision_work.requester_id = d.requester_id
-              AND decision_work.supervisor_id = d.recorded_by
-              AND decision_work.supervisor_attachment_id = d.supervisor_attachment_id
-              AND decision_work.generation = d.work_generation
-              AND decision_attachment.principal_id = d.recorded_by
-              AND decision_attachment.generation >= d.supervisor_attachment_generation
-              AND decision_review.reviewer_role = 'cao'
-              AND decision_review.verdict = 'ok'
-              AND decision_review.supervisor_attachment_id = d.supervisor_attachment_id
-              AND decision_review.supervisor_attachment_generation
-                  <= d.supervisor_attachment_generation
-              AND decision_review.work_generation <= d.work_generation
-              AND decision_attempt.goal_version = d.goal_version
-              AND decision_attempt.goal_packet_digest = d.goal_packet_digest
-              AND decision_attempt.task_packet_digest = d.task_packet_digest
-              AND decision_review.goal_version = d.goal_version
-              AND decision_review.goal_packet_digest = d.goal_packet_digest
-              AND decision_review.task_packet_digest = d.task_packet_digest
+{_VALID_REQUESTER_DECISIONS_SQL}
         ), valid_close_receipts AS (
             SELECT c.id, c.work_item_id
             FROM work_close_receipts c
@@ -1133,7 +1267,7 @@ def _work_items_projection(
         SELECT w.id, w.goal_version, w.state, w.priority, w.assigned_worker_id,
                w.attention_owner, w.generation, w.operator_scope,
                w.paused_boundary_id, w.supervisor_id, w.suspended_by_work_item_id,
-               w.user_needed_boundary_id,
+               w.user_needed_boundary_id, w.supervisor_attachment_id,
                w.created_at AS work_created_at, w.updated_at AS work_updated_at,
                a.id AS current_attempt_id, a.state AS current_attempt_state,
                a.trajectory AS current_attempt_trajectory,
@@ -1452,6 +1586,7 @@ def _work_items_projection(
                 "generation": int(row["generation"]),
                 "supervision_pause": _supervision_pause_projection(connection, row),
                 "requester_escalation": _requester_escalation_projection(connection, row),
+                "system_recovery": _system_recovery_projection(connection, row),
                 "operator_scope": str(row["operator_scope"]),
                 "created_at": str(row["work_created_at"]),
                 "updated_at": str(row["work_updated_at"]),
@@ -1542,18 +1677,14 @@ def _work_items_projection(
     return work_items
 
 
-def _snapshot(
-    connection: sqlite3.Connection,
-    comparison_time: str,
-    semantic_receipts: Mapping[str, str],
-) -> dict[str, Any]:
+def _authority_projection(connection: sqlite3.Connection) -> dict[str, Any]:
     authority_row = connection.execute(
         """
         SELECT mode, generation, activated_at, updated_at
         FROM control_authority WHERE singleton = 1
         """
     ).fetchone()
-    authority = (
+    return (
         {
             "mode": str(authority_row["mode"]),
             "generation": int(authority_row["generation"]),
@@ -1563,6 +1694,14 @@ def _snapshot(
         if authority_row is not None
         else {"mode": "missing", "generation": 0}
     )
+
+
+def _snapshot(
+    connection: sqlite3.Connection,
+    comparison_time: str,
+    semantic_receipts: Mapping[str, str],
+) -> dict[str, Any]:
+    authority = _authority_projection(connection)
     work_items = _work_items_projection(connection, comparison_time, semantic_receipts)
     operator_workers = _operator_workers_projection(connection)
     operator_runtime_delivery = _operator_runtime_delivery_projection(
@@ -1769,6 +1908,7 @@ def _operator_workers_projection(connection: sqlite3.Connection) -> list[dict[st
                 "principal_id": str(row["principal_id"]),
                 "worker_purpose": purpose,
                 "purpose_status": purpose_status,
+                "purpose_supervision": worker_summary_tx(connection, str(row["worker_thread_id"] or "")),
                 "operator_scope": scope,
                 "operator_label": label,
                 "principal_enabled": bool(row["principal_enabled"]),
@@ -2006,7 +2146,9 @@ def _operator_recovery_notification_payload_valid(
             frozenset(common_payload_keys | packet_payload_keys),
         }
 
-    payload_keys = frozenset(payload)
+    # Display metadata is sealed by the payload digest below, but does not
+    # change the recovery notification's authority-bearing fields.
+    payload_keys = frozenset(payload) - {"notification_presentation"}
     generation = payload.get("generation")
     has_packet_binding = packet_payload_keys.issubset(payload_keys)
     return bool(
@@ -2500,6 +2642,21 @@ def _watermark(connection: sqlite3.Connection) -> dict[str, Any]:
         "event_sequence": int(row["sequence"]),
         "event_id_digest": _digest(str(row["id"])),
         "event_created_at": str(row["created_at"]),
+    }
+
+
+def _system_recovery_projection(
+    connection: sqlite3.Connection, work: sqlite3.Row
+) -> dict[str, Any] | None:
+    recovery = system_recovery_tx(connection, work)
+    if recovery is None:
+        return None
+    return {
+        "owner": "cao", "requester_action_required": False,
+        **{field: sanitize_operator_text(recovery[field]) for field in (
+            "reason", "recovery_plan", "resume_condition", "waiting_since", "notification_state",
+            "watch_kind", "diagnostic_state", "diagnostic_code",
+        )},
     }
 
 

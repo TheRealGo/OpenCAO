@@ -31,6 +31,11 @@ requester.
 
 ## Commands and authority
 
+Explicit Work cancellation can dispose a reviewed completion Boundary with
+either an `ok` or `needs_work` verdict. It preserves the review, unmet criteria
+and prior evidence; it does not accept the result, finish the Worker or complete
+its purpose. A cancellation does not require another Worker correction round.
+
 These internal attachment-scoped Work/effect commands require an
 attachment-bound CAO conversation credential (`csc_...`):
 
@@ -78,18 +83,36 @@ revalidated inside the close transaction before idempotent replay, so renewal
 of the CSC at the same attachment generation fences the older bearer without
 allowing any close mutation.
 
-Conversation close is one fail-before-mutation transaction. A leased CAO turn,
-ambiguous `dispatched` Delivery or unresolved external effect belonging to that
-conversation, interrupt chain, or completed Work that still lacks its formal
-Work close receipt blocks the entire operation. Work or runtime state belonging
-only to another same-project conversation does not block it. Queued or otherwise
-known non-dispatched Deliveries are terminalized, nonterminal Work is canceled,
+Conversation close is one fail-before-mutation transaction. Its own decision
+leases are abandoned atomically by the existing Work cancellation path; an
+explicit close does not wait for their expiration or require a separate release.
+Leases belonging to another attachment remain unchanged. A live autonomous CAO
+runtime, ambiguous `dispatched` Delivery or unresolved external effect belonging to that
+conversation or an interrupt chain blocks the entire operation. Completed Work
+and its existing acceptance, artifact and cleanup evidence are retained. A Work
+close receipt is not a prerequisite for conversation close, which neither performs
+nor claims Work cleanup. Work or runtime state belonging
+only to another same-project conversation does not block it. A Worker Delivery
+on an exclusively retired route with a terminal or `waiting_supervisor` Attempt
+is preserved as unknown history and does not block conversation close. This
+does not settle or replay it; ambiguous Deliveries on current routes and
+unresolved effects still block close.
+Queued or otherwise known non-dispatched Deliveries are terminalized,
+nonterminal Work is canceled,
 open Boundaries receive an explicit cancel disposition, the conversation wake
 runtime is stopped, and the CSC/ephemeral credentials are revoked. A terminal pre-MCP
 runtime-recovery assignment may be closed only under the same strict proof used
 by exact-target ensure; its old task packet is never replayed. Past consumed
 wake tickets are historical evidence and do not make a conversation permanently
 uncloseable.
+
+The synthetic cancel decision for each open Boundary uses the same packet-bound
+turn input and result digests as ordinary supervised decisions. Reopening the
+database after a close must preserve that decision without starting another wake.
+The earlier close writer's unwrapped input and decision-only result are accepted
+only with the exact cancel disposition, deterministic system seal, attachment
+lineage and canonical close-command receipt. Those historical bytes remain
+unchanged; missing receipts or arbitrary digest corruption still fail startup.
 
 ## Durable requester-decision record
 

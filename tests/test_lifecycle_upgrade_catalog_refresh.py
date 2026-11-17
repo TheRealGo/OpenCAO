@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from conftest import attach_cao_session_with_peer, current_cao_session_attachment
 from fastapi.testclient import TestClient
@@ -331,6 +332,7 @@ def test_stale_proxy_401_reenters_pending_and_reattaches_to_upgraded_catalog(
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:
@@ -512,6 +514,7 @@ def test_pending_catalog_is_visible_but_mismatched_daemon_catalog_stops(
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:

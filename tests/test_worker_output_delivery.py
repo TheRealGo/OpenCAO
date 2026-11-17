@@ -908,6 +908,97 @@ def test_exact_repeated_final_content_requires_only_one_complete_read(system) ->
     assert _review(service, actor, work)["reviews"][-1]["verdict"] == "ok"
 
 
+def test_empty_final_references_readable_commentary_without_claiming_completion(system) -> None:
+    service = system["service"]
+    actor, work, binding = _capture_fixture(system)
+    commentary = service.observe_worker_output(
+        **binding, event=_event(text="I will perform the requested work.", phase="commentary")
+    )
+    service.observe_worker_output(
+        **binding, event=_event(item_id="empty-final", text="", phase="final")
+    )
+    terminal = _terminal(service, binding)
+    notice = service.db.fetchone("SELECT payload_json FROM messages WHERE id=?",
+                                (terminal["notification_message_id"],))
+    refs = json.loads(notice["payload_json"])["output_refs"]
+    assert [item["output_id"] for item in refs] == [commentary["id"]]
+    assert all(item["digest"] and item["capture_state"] == "available" for item in refs)
+    assert service.read_worker_output(actor, _read_request(work, commentary))["content"] == (
+        "I will perform the requested work."
+    )
+    with pytest.raises(ConflictError):
+        _review(service, actor, work)
+    facts = service.get_work(work["id"])["provider_response"]["current"]
+    assert facts["record_availability"] == "recorded"
+    assert facts["final_output_state"] == "empty"
+    assert facts["readable_final_items"] == 0 and facts["readable_commentary_items"] == 1
+    assert facts["worker_reports"]["completion_claim"] == 0
+    assert facts["new_artifact_records_since_previous_response"] == 0
+    assert facts["business_progress"] == "not_judged"
+
+
+def test_response_facts_do_not_reuse_old_progress_for_a_later_input(system) -> None:
+    service = system["service"]
+    actor, work, binding = _capture_fixture(system)
+    attempt = work["current_attempt"]
+    service.report(system["worker"], attempt["id"], ReportInput(
+        kind="progress", expected_goal_version=work["goal_version"],
+        expected_goal_packet_digest=attempt["goal_packet_digest"],
+        expected_task_packet_digest=attempt["task_packet_digest"],
+        expected_generation=work["generation"], progress_event="execution_started",
+        summary="The first input has actual execution evidence.",
+        evidence=[{"check": "first-input-operation", "result": "observed"}],
+        idempotency_key="first-input-start",
+    ))
+    source = _queued_successor(system, actor, work, kind="instruction")
+    service.observe_worker_output(**binding, event=_event())
+    _terminal(service, binding)
+    first = service.get_work(work["id"])["provider_response"]["current"]
+    assert first["worker_reports"]["progress"] == 1 and first["execution_start_report_observed"]
+    successor = _begin_successor_capture(service, binding, source)
+    pending = service.get_work(work["id"])["provider_response"]
+    assert pending["current"]["record_availability"] == "pending"
+    assert pending["previous"] == first
+    service.observe_worker_output(**successor, event=_event(
+        turn_id="successor-provider-turn", text="", phase="final",
+    ))
+    _terminal(service, successor, turn_id="successor-provider-turn")
+    current = service.get_work(work["id"])
+    facts = current["provider_response"]["current"]
+    assert facts["source_message_id"] == source
+    assert facts["worker_reports"]["progress"] == 0
+    assert facts["execution_start_report_observed"] is False
+    assert current["provider_response"]["previous"] == first
+    assert current["current_attempt"]["activity"]["execution_start"]
+
+
+def test_legacy_response_does_not_invent_absent_worker_reports(system) -> None:
+    service = system["service"]
+    _, work, binding = _capture_fixture(system)
+    service.observe_worker_output(**binding, event=_event())
+    _terminal(service, binding)
+    service.db.execute("DELETE FROM events WHERE event_type='worker_output.settled'")
+    facts = service.get_work(work["id"])["provider_response"]["current"]
+    assert facts["record_availability"] == "legacy_unavailable"
+    assert facts["worker_reports"] is None and facts["execution_start_report_observed"] is None
+    assert facts["new_artifact_records_since_previous_response"] is None
+
+
+def test_response_projection_never_forwards_unknown_text_or_private_identity():
+    from cao_control_plane.response_evidence import public_response_evidence
+
+    projected = public_response_evidence({"current": {
+        "record_availability": "recorded", "final_output_state": {"unsafe": "value"},
+        "source_message_id": "/private/owner/source", "output_id": "cao.rtc_private.secret",
+        "worker_reports": {"progress": True, "completion_claim": -1, "private": "text"},
+        "arbitrary": "owner-private-data", "business_progress": "verified",
+    }, "previous": None})
+    assert projected["current"]["business_progress"] == "not_judged"
+    assert projected["current"]["worker_reports"]["progress"] is None
+    assert projected["current"]["worker_reports"]["completion_claim"] is None
+    assert not any(value in json.dumps(projected) for value in ("owner", "secret", "unsafe", "verified"))
+
+
 def test_identical_content_read_in_an_earlier_stream_does_not_satisfy_review(system) -> None:
     service = system["service"]
     actor, work, binding = _capture_fixture(system)
@@ -1371,7 +1462,7 @@ def test_restart_recovers_partial_capture_after_runtime_failure_without_terminal
 
 
 @pytest.mark.parametrize("status", ["failed", "interrupted"])
-def test_restart_preserves_escalation_without_reopening_failure_for_unsettled_output(
+def test_restart_preserves_cao_recovery_without_reopening_failure_for_unsettled_output(
     system, status: str
 ) -> None:
     service = system["service"]
@@ -1381,15 +1472,17 @@ def test_restart_preserves_escalation_without_reopening_failure_for_unsettled_ou
     service.fail_runtime_enrollment(binding["runtime_id"], reason="runtime_dispatch_failed")
     service.recover_terminal_worker_attempt(binding["runtime_id"], reason="runtime_dispatch_failed")
     _dispose(service, actor, work, kind="wait_user")
-    assert service.get_work(work["id"])["state"] == "user_needed"
+    assert service.get_work(work["id"])["state"] == "waiting_supervisor"
     before_messages = _row_count(service, "messages")
     before_boundaries = _row_count(service, "boundaries")
     restarted = ControlPlane(Database(system["settings"]), system["settings"])
     restarted.expire_runtime_leases()
     restarted.reconcile_abandoned_worker_output_captures()
     current = restarted.get_work(work["id"])
-    assert current["state"] == "user_needed"
-    assert current["requester_escalation"]["notification_state"] == "queued"
+    assert current["state"] == "waiting_supervisor"
+    assert current["attention_owner"] == "cao"
+    assert current["requester_escalation"] is None
+    assert current["system_recovery"]["notification_state"] == "queued"
     assert current["open_boundaries"] == []
     assert current["current_attempt"]["completion_claim"] == {}
     assert _row_count(restarted, "messages") == before_messages

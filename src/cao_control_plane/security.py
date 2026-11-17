@@ -41,7 +41,7 @@ _GENERIC_CREDENTIAL_PATTERN = re.compile(
     r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}|"
     r"\bAKIA[A-Z0-9]{16}\b|"
     r"\b(?:[A-Za-z0-9]+[_-])*(?:api[ _-]?key|access[ _-]?token|"
-    r"auth[ _-]?token|refresh[ _-]?token|client[ _-]?secret|private[ _-]?key|"
+    r"auth[ _-]?token|refresh[ _-]?token|proxy[ _-]?token|client[ _-]?secret|private[ _-]?key|"
     r"secret[ _-]?access[ _-]?key|password)"
     r"\s*[:=]\s*[^\s,;]{12,})",
     re.IGNORECASE,

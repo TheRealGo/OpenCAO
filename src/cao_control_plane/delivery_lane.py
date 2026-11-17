@@ -154,12 +154,30 @@ def cao_notification_dispatch_head_sql(
 
     A busy runtime's newest dispatch owner can outlive its transport lease.
     Preserve that execution fence consistently for every Dispatcher instance.
+    A completion awaiting its provider response has not entered transport FIFO;
+    other ready notifications need not wait for that response.
     """
 
     if not _SQL_ALIAS.fullmatch(message_alias) or not _SQL_ALIAS.fullmatch(delivery_alias):
         raise ValueError("delivery lane SQL aliases must be static identifiers")
+    awaiting_response = """
+        {message}.kind = 'completion_claim'
+        AND EXISTS (
+            SELECT 1 FROM worker_output_streams AS source_stream
+            JOIN runtime_sessions AS source_runtime
+              ON source_runtime.id = source_stream.runtime_session_id
+            JOIN messages AS source_input
+              ON source_input.id = source_stream.source_message_id
+            WHERE source_stream.work_item_id = {message}.work_item_id
+              AND source_stream.attempt_id = {message}.attempt_id
+              AND source_stream.settled_at = ''
+              AND source_input.sequence < {message}.sequence
+              AND source_runtime.state = 'busy'
+        )
+    """
     return f"""
         {delivery_alias}.recipient_attachment_id IS NOT NULL
+        AND NOT ({awaiting_response.format(message=message_alias)})
         AND NOT EXISTS (
             SELECT 1
             FROM message_deliveries AS notification_prior
@@ -169,6 +187,11 @@ def cao_notification_dispatch_head_sql(
               AND notification_prior.recipient_attachment_id =
                   {delivery_alias}.recipient_attachment_id
               AND notification_prior_message.sequence < {message_alias}.sequence
+              AND NOT (
+                notification_prior.state = 'queued'
+                AND notification_prior.owner_token = ''
+                AND ({awaiting_response.format(message='notification_prior_message')})
+              )
               AND (
                 notification_prior.state IN ('queued', 'leased')
                 OR (

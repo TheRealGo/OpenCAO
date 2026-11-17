@@ -276,7 +276,8 @@ def _upgrade_plan(
     settings = _settings(tmp_path)
     control_plane_config = tmp_path / "control-plane.toml"
     control_plane_config.write_text(
-        f"[server]\nstate_dir = {json.dumps(str(tmp_path))}\n",
+        f"[server]\nstate_dir = {json.dumps(str(tmp_path))}\n"
+        f"[runtime]\nruntime_launch_dir = {json.dumps(str(tmp_path / 'launches'))}\n",
         encoding="utf-8",
     )
     control_plane_config.chmod(0o600)
@@ -425,8 +426,8 @@ def _test_codex_app_server_executable(
     executable.write_bytes(b"signed-codex-test-double")
     executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        executable,
     )
     return executable
 
@@ -434,24 +435,16 @@ def _test_codex_app_server_executable(
 def test_canonical_codex_executable_supports_packaged_desktop_layout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    legacy = tmp_path / "ChatGPT.app" / "Contents" / "Resources" / "codex"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_bytes(b"signed-codex-test-double")
-    legacy.chmod(0o755)
+    legacy = _test_codex_app_server_executable(tmp_path, monkeypatch)
     packaged = legacy.parent / "codex-cli" / "CodexCLI.app" / "Contents" / "MacOS" / "codex"
     packaged.parent.mkdir(parents=True)
     packaged.write_bytes(b"signed-codex-test-double")
     packaged.chmod(0o755)
-    monkeypatch.setattr(
-        "cao_control_plane.runtime._BUNDLED_CODEX_EXECUTABLES", (legacy, packaged)
-    )
     assert canonical_codex_app_server_executable() == legacy
     legacy.unlink()
     assert canonical_codex_app_server_executable() == packaged
     packaged.unlink()
-    assert canonical_codex_app_server_executable() == Path(
-        "/Applications/Codex.app/Contents/Resources/codex"
-    )
+    assert canonical_codex_app_server_executable() == legacy
 
 
 def _codex_desktop_binding(
@@ -730,6 +723,8 @@ def test_plan_is_deterministic_loopback_only_and_never_persists_bearer(tmp_path:
     assert "127.0.0.1" in rendered
     for agent in (plan.control_plane, plan.edge):
         assert plistlib.loads(canonical_launchagent_plist(agent))["KeepAlive"] is True
+    assert plistlib.loads(canonical_launchagent_plist(plan.control_plane))["ProcessType"] == "Interactive"
+    assert plistlib.loads(canonical_launchagent_plist(plan.edge))["ProcessType"] == "Background"
 
 
 def test_apply_is_authorized_idempotent_and_only_serves_the_edge(tmp_path: Path) -> None:
@@ -821,6 +816,36 @@ def test_one_field_drift_from_previous_plist_is_not_migrated(tmp_path: Path) -> 
         apply_dashboard_lifecycle(plan, runner, execute=True, owner_confirmed=True)
     assert path.read_bytes() == rendered
     assert not any(command[1] in {"bootout", "bootstrap"} for command in runner.calls)
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_background_control_plane_migrates_only_its_exact_known_shape(tmp_path: Path, drift: bool) -> None:
+    plan = build_dashboard_lifecycle_plan(_settings(tmp_path))
+    path = Path(plan.control_plane.plist_path)
+    path.parent.mkdir(parents=True)
+    path.parent.parent.chmod(0o700)
+    path.parent.chmod(0o700)
+    prior = plistlib.loads(canonical_launchagent_plist(plan.control_plane))
+    prior["ProcessType"] = "Background"
+    if drift:
+        prior["EnvironmentVariables"] = {"UNREVIEWED_SETTING": "changed"}
+    rendered = plistlib.dumps(prior, fmt=plistlib.FMT_XML, sort_keys=True)
+    path.write_bytes(rendered)
+    path.chmod(0o644)
+    runner = _runner_for(plan, serve=_serve_payload(plan.tailscale.expected_edge_origin), loaded=True)
+
+    if drift:
+        with pytest.raises(RuntimeError, match="content-conflict"):
+            apply_dashboard_lifecycle(plan, runner, execute=True, owner_confirmed=True)
+        assert path.read_bytes() == rendered
+        assert not any(command[1] in {"bootout", "bootstrap"} for command in runner.calls)
+        return
+
+    apply_dashboard_lifecycle(plan, runner, execute=True, owner_confirmed=True)
+    assert path.read_bytes() == canonical_launchagent_plist(plan.control_plane)
+    bootout = ("launchctl", "bootout", f"gui/{os.getuid()}", plan.control_plane.plist_path)
+    bootstrap = ("launchctl", "bootstrap", f"gui/{os.getuid()}", plan.control_plane.plist_path)
+    assert runner.calls.index(bootout) < runner.calls.index(bootstrap)
 
 
 def test_status_checks_tailnet_url_health_and_safari_download_regression(tmp_path: Path) -> None:
@@ -1422,8 +1447,8 @@ def test_upgrade_broken_managed_host_preflight_fails_before_service_mutation(
     executable.write_bytes(b"signed-codex-test-double")
     executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        executable,
     )
     _settings_value, _lifecycle, plan = _upgrade_plan(tmp_path)
     socket_path = Path(plan.codex_app_server_socket)
@@ -1811,9 +1836,13 @@ def test_migration_preflight_migrates_only_disposable_copy_and_verifies_projecti
     [28, SCHEMA_VERSION],
     ids=["schema-upgrade", "same-release-restart"],
 )
+@pytest.mark.parametrize(
+    "completion", ["success", "edge_failure", "reload_unknown", "replaced_backup", "changed_backup", "retirement_failure"],
+)
 def test_upgrade_and_same_release_restart_use_the_exact_offline_backup_order(
     tmp_path: Path,
     source_schema_version: int,
+    completion: str,
 ) -> None:
     _settings_value, _lifecycle, plan = _upgrade_plan(tmp_path)
     source_identity = _database_identity(source_schema_version)
@@ -1853,31 +1882,86 @@ def test_upgrade_and_same_release_restart_use_the_exact_offline_backup_order(
         assert destination == Path(plan.backup_destination)
         assert replace is False
         trace.append("backup:final-offline")
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination.write_bytes(b"verified rollback snapshot")
+        destination.chmod(0o600)
         return SQLiteBackupResult(
             path=destination,
             source_identity=source_identity,
             backup_identity=source_identity,
-            sha256="c" * 64,
+            sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
         )
+
+    class ReadinessProbe(FakeUpgradeProbe):
+        def wait_for_edge(self, plan_value: object) -> None:
+            super().wait_for_edge(plan_value)
+            assert Path(plan.backup_destination).is_file()
+            if completion == "edge_failure":
+                raise LifecycleUnknownOutcome("edge readiness failed")
 
     def reload_mcp(socket_path: Path, release_id: str) -> None:
         assert socket_path == Path(plan.codex_app_server_socket)
         assert release_id == plan.target_identity.release_id
         trace.append("codex:mcp-reload-ack")
+        destination = Path(plan.backup_destination)
+        assert destination.is_file()
+        if completion == "reload_unknown":
+            raise LifecycleUnknownOutcome("reload outcome unknown")
+        if completion == "replaced_backup":
+            destination.rename(tmp_path / "preserved-original.sqlite3")
+            destination.write_bytes(b"other owner file")
+            destination.chmod(0o600)
+        elif completion == "changed_backup":
+            before = destination.stat()
+            destination.write_bytes(b"x" * before.st_size)
+            os.utime(destination, ns=(before.st_atime_ns, before.st_mtime_ns))
 
-    result = upgrade_dashboard_lifecycle(
-        plan,
-        runner,
-        probe=FakeUpgradeProbe(trace),
-        process_controller=FakeUpgradeProcessController(trace),
-        preflight=preflight,
-        backup_database=backup,
-        reload_codex_mcp=reload_mcp,
-        execute=True,
-        owner_confirmed=True,
-    )
+    def retire_connections(plan_value):
+        assert plan_value == plan
+        assert trace[-1] == "backup:final-offline"
+        assert Path(plan.backup_destination).is_file()
+        trace.append("runtime:retire-connections")
+        if completion == "retirement_failure":
+            raise RuntimeError("connection retirement failed")
+        return 2
+
+    def run_upgrade():
+        return upgrade_dashboard_lifecycle(
+            plan,
+            runner,
+            probe=ReadinessProbe(trace),
+            process_controller=FakeUpgradeProcessController(trace),
+            preflight=preflight,
+            backup_database=backup,
+            reload_codex_mcp=reload_mcp,
+            retire_worker_connections=retire_connections,
+            execute=True,
+            owner_confirmed=True,
+        )
+
+    if completion != "success":
+        expected = LifecycleUnknownOutcome if completion in {"edge_failure", "reload_unknown"} else RuntimeError
+        with pytest.raises(expected):
+            run_upgrade()
+        if completion == "retirement_failure":
+            assert not any("bootstrap" in item for item in trace)
+        destination = Path(plan.backup_destination)
+        assert destination.is_file()
+        if completion == "replaced_backup":
+            assert destination.read_bytes() == b"other owner file"
+            assert (tmp_path / "preserved-original.sqlite3").read_bytes() == b"verified rollback snapshot"
+        elif completion == "changed_backup":
+            assert destination.read_bytes() == b"x" * len(b"verified rollback snapshot")
+        else:
+            assert destination.read_bytes() == b"verified rollback snapshot"
+        return
+
+    result = run_upgrade()
 
     assert result.status == "ready"
+    assert result.backup_retained is False
+    assert result.worker_connections_retired == 2
+    assert not Path(plan.backup_destination).exists()
     assert result.codex_app_server_restart == "not_performed"
     assert result.codex_mcp_reload == "submitted_for_next_active_turn"
     assert result.codex_mcp_reload_scope == "all_loaded_codex_threads"
@@ -1895,6 +1979,7 @@ def test_upgrade_and_same_release_restart_use_the_exact_offline_backup_order(
         "process:fenced",
         "probe:stopped",
         "backup:final-offline",
+        "runtime:retire-connections",
         f"command:bootstrap {plan.control_plane.plist_path}",
         "probe:control-plane",
         f"command:bootstrap {plan.edge.plist_path}",
@@ -1902,6 +1987,19 @@ def test_upgrade_and_same_release_restart_use_the_exact_offline_backup_order(
         "codex:mcp-reload-ack",
     ]
     assert not any("tailscale" in " ".join(command) for command in runner.calls)
+
+
+def test_offline_connection_retirement_rejects_redirected_config_before_opening_database(tmp_path):
+    from cao_control_plane.dashboard_lifecycle import retire_stopped_worker_connections
+
+    _, _, plan = _upgrade_plan(tmp_path)
+    config = tmp_path / "control-plane.toml"
+    other = tmp_path / "other-state"
+    config.write_text(f"[server]\nstate_dir = {json.dumps(str(other))}\n")
+    with pytest.raises(RuntimeError, match="database binding changed"):
+        retire_stopped_worker_connections(plan)
+    assert not other.exists()
+    assert not Path(plan.database_path).exists()
 
 
 def test_exact_upgrade_process_controller_escalates_only_the_captured_generation() -> None:
@@ -2205,11 +2303,14 @@ def test_control_plane_readiness_failure_never_bootstraps_edge_or_reloads_codex(
 
     def backup(source: Path, destination: Path, *, replace: bool = True):
         del source, replace
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination.write_bytes(b"rollback after failed readiness")
+        destination.chmod(0o600)
         return SQLiteBackupResult(
             destination,
             _database_identity(),
             _database_identity(),
-            "c" * 64,
+            hashlib.sha256(destination.read_bytes()).hexdigest(),
         )
 
     with pytest.raises(LifecycleUnknownOutcome, match="did not become ready"):
@@ -2232,9 +2333,10 @@ def test_control_plane_readiness_failure_never_bootstraps_edge_or_reloads_codex(
         plan.edge.plist_path,
     )
     assert edge_bootstrap not in runner.calls
+    assert Path(plan.backup_destination).read_bytes() == b"rollback after failed readiness"
 
 
-@pytest.mark.parametrize("response_seconds", [9.5, 31.0])
+@pytest.mark.parametrize("response_seconds", [9.5, 48.5, 61.0])
 def test_upgrade_probe_admits_slow_healthy_readiness_but_keeps_a_deadline(
     response_seconds: float, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2249,8 +2351,8 @@ def test_upgrade_probe_admits_slow_healthy_readiness_but_keeps_a_deadline(
         return httpx.Response(200, json={"ready": True, "status": "ok"})
 
     monkeypatch.setattr("cao_control_plane.dashboard_lifecycle.httpx.get", get)
-    probe = HttpxDashboardUpgradeProbe(HttpxProbe(timeout_seconds=30.0))
-    if response_seconds > 30.0:
+    probe = HttpxDashboardUpgradeProbe(HttpxProbe(timeout_seconds=60.0))
+    if response_seconds > 60.0:
         with pytest.raises(RuntimeError, match="upgrade preflight requires"):
             probe.require_preflight_ready(plan, target_projection_verified=True)
     else:
@@ -2309,7 +2411,7 @@ def test_upgrade_probe_requires_exact_release_schema_catalog_and_edge_html(tmp_p
         ).wait_for_control_plane(plan)
 
 
-def test_upgrade_probe_allows_only_a_target_verified_source_projection_repair(
+def test_upgrade_probe_allows_target_verified_technical_repair_and_preserves_authority(
     tmp_path: Path,
 ) -> None:
     _settings_value, _lifecycle, plan = _upgrade_plan(tmp_path)
@@ -2366,8 +2468,6 @@ def test_upgrade_probe_allows_only_a_target_verified_source_projection_repair(
     for section, field, value in (
         ("database", "ok", False),
         ("authority", "mode", "legacy"),
-        ("dispatcher", "healthy", False),
-        ("projection", "violations", []),
     ):
         unsafe = json.loads(json.dumps(ready_body))
         assert isinstance(unsafe[section], dict)
@@ -2376,6 +2476,52 @@ def test_upgrade_probe_allows_only_a_target_verified_source_projection_repair(
     for unsafe in unsafe_bodies:
         with pytest.raises(RuntimeError, match="target-verified"):
             probe_for(unsafe).require_preflight_ready(plan, target_projection_verified=True)
+
+    technical_failure = json.loads(json.dumps(ready_body))
+    technical_failure['projection'] = {'healthy': True, 'violations': []}
+    technical_failure['dispatcher'] = {'healthy': False, 'running': True,
+        'issues': ['native_change_subscription_unavailable']}
+    probe_for(technical_failure).require_preflight_ready(plan, target_projection_verified=True)
+    technical_failure['dispatcher'] = {'healthy': False, 'running': False, 'issues': ['dispatcher_not_running']}
+    probe_for(technical_failure).require_preflight_ready(plan, target_projection_verified=True)
+    with pytest.raises(RuntimeError, match='target-verified'):
+        probe_for(technical_failure).require_preflight_ready(plan, target_projection_verified=False)
+    for field in ('release_id', 'mcp_catalog_digest', 'schema_version'):
+        invalid_identity = json.loads(json.dumps(technical_failure))
+        invalid_identity.pop(field)
+        with pytest.raises(RuntimeError, match='target-verified'):
+            probe_for(invalid_identity).require_preflight_ready(plan, target_projection_verified=True)
+
+
+def test_upgrade_can_repair_unavailable_readiness_after_independent_verification(tmp_path):
+    _settings_value, _lifecycle, plan = _upgrade_plan(tmp_path)
+    json_headers = {"content-type": "application/json"}
+    responses = {
+        plan.control_plane_origin+"/health": HttpResult(200, json_headers, {
+            "status": "ok", "release_id": "source-release", "mcp_catalog_digest": "source-catalog",
+            "schema_version": plan.source_identity.schema_version,
+        }),
+        plan.control_plane_origin+"/ready": HttpResult(0, {}),
+        plan.control_plane_origin+"/api/v1/dashboard/v1/snapshot": HttpResult(200, json_headers, {
+            "authority": {"mode": "canonical"},
+        }),
+        plan.edge_origin+"/dashboard/": HttpResult(200, {"content-type": "text/html"}),
+    }
+    probe = HttpxDashboardUpgradeProbe(FakeProbe(responses), sleeper=lambda _value: None)
+    probe.require_preflight_ready(plan, target_projection_verified=True)
+    with pytest.raises(RuntimeError, match="target-verified"):
+        probe.require_preflight_ready(plan, target_projection_verified=False)
+    for url, invalid in (
+        (plan.control_plane_origin+"/health", HttpResult(0, {})),
+        (plan.control_plane_origin+"/api/v1/dashboard/v1/snapshot", HttpResult(401, json_headers)),
+        (plan.control_plane_origin+"/api/v1/dashboard/v1/snapshot", HttpResult(200, json_headers, {"authority": {"mode": "legacy"}})),
+        (plan.edge_origin+"/dashboard/", HttpResult(503, {})),
+        (plan.control_plane_origin+"/ready", HttpResult(503, json_headers, {"database": {"ok": False}})),
+    ):
+        with pytest.raises(RuntimeError, match="target-verified"):
+            HttpxDashboardUpgradeProbe(FakeProbe({**responses, url: invalid})).require_preflight_ready(
+                plan, target_projection_verified=True,
+            )
 
 
 def test_codex_reload_uses_existing_bounded_websocket_client_and_exact_envelopes(
@@ -2476,8 +2622,8 @@ def test_codex_host_refresh_accepts_desktop_daemon_without_managed_install_and_r
     executable.write_bytes(b"signed-codex-test-double")
     executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        executable,
     )
     monkeypatch.setattr(
         "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_socket",
@@ -2589,8 +2735,8 @@ def test_codex_host_refresh_rejects_missing_mapped_image_evidence_before_kicksta
     executable.write_bytes(b"signed-codex-test-double")
     executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        executable,
     )
     binding = _codex_desktop_binding(
         tmp_path / "owner-job",
@@ -2667,9 +2813,11 @@ def test_codex_host_refresh_rejects_missing_mapped_image_evidence_before_kicksta
     assert not any(command[:3] == ("/bin/launchctl", "kickstart", "-kp") for command in commands)
 
 
+@pytest.mark.parametrize("socket_state", ["present", "missing", "dangling"])
 def test_codex_host_refresh_replaces_one_exact_stale_desktop_generation_then_reloads_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    socket_state: str,
 ) -> None:
     temporary_root = (
         Path("/private/tmp")
@@ -2686,14 +2834,20 @@ def test_codex_host_refresh_replaces_one_exact_stale_desktop_generation_then_rel
     old_listener.listen(1)
     socket_path.chmod(0o600)
     old_socket_identity = (socket_path.stat().st_dev, socket_path.stat().st_ino)
+    if socket_state != "present":
+        old_listener.close()
+        # Retain the old inode so Linux cannot reuse it for the replacement.
+        socket_path.replace(retired_socket_path)
+        if socket_state == "dangling":
+            socket_path.symlink_to(control / "missing-target.sock")
 
     executable = tmp_path / "ChatGPT.app" / "Contents" / "Resources" / "codex"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"signed-current-codex-test-double")
     executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        executable,
     )
     monkeypatch.setattr(
         "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_socket",
@@ -2707,6 +2861,10 @@ def test_codex_host_refresh_replaces_one_exact_stale_desktop_generation_then_rel
     old_pid = 1401
     new_pid = 1402
     asid = 2401
+    monkeypatch.setattr(
+        "cao_control_plane.dashboard_lifecycle._lifecycle_process_argv",
+        lambda pid: binding.program_arguments if pid == old_pid else (),
+    )
     old_process = DarwinAuditProcessIdentity(
         pid=old_pid,
         pgid=old_pid,
@@ -2799,7 +2957,10 @@ def test_codex_host_refresh_replaces_one_exact_stale_desktop_generation_then_rel
         if command[:3] == ("/bin/launchctl", "kickstart", "-kp"):
             assert inspector.stage == "old"
             old_listener.close()
-            socket_path.replace(retired_socket_path)
+            if socket_state == "present":
+                socket_path.replace(retired_socket_path)
+            else:
+                socket_path.unlink(missing_ok=True)
             replacement_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             replacement_listener.bind(os.fspath(socket_path))
             replacement_listener.listen(1)
@@ -2841,16 +3002,25 @@ def test_codex_host_refresh_replaces_one_exact_stale_desktop_generation_then_rel
         )
 
     reloads: list[tuple[Path, str]] = []
-    try:
-        restart_status = refresh_codex_app_server_mcp(
-            socket_path,
-            "b" * 64,
-            command_runner=run,
+    target = _release_identity()
+
+    def recover(path, release_id, **kwargs):
+        return refresh_codex_app_server_mcp(
+            path, release_id, command_runner=run,
             reload_codex_mcp=lambda path, release_id: reloads.append((path, release_id)),
-            desktop_launchagent=binding,
-            host_inspector=inspector,
-            sleeper=lambda _value: None,
-            restart_attempts=2,
+            host_inspector=inspector, sleeper=lambda _value: None, restart_attempts=2,
+            **kwargs,
+        )
+
+    monkeypatch.setattr("cao_control_plane.dashboard_lifecycle.refresh_codex_app_server_mcp", recover)
+    plan = build_codex_mcp_refresh_plan(
+        codex_app_server_socket=socket_path, codex_desktop_launchagent=binding,
+        target_identity=target,
+    )
+    try:
+        result = refresh_codex_mcp(
+            plan, reload_codex_mcp=recover, release_identity=lambda: target,
+            execute=True, owner_confirmed=True,
         )
         new_socket_identity = (socket_path.stat().st_dev, socket_path.stat().st_ino)
     finally:
@@ -2861,9 +3031,9 @@ def test_codex_host_refresh_replaces_one_exact_stale_desktop_generation_then_rel
         retired_socket_path.unlink(missing_ok=True)
         control_root.cleanup()
 
-    assert restart_status == "performed"
+    assert result.codex_app_server_restart == "performed"
     assert old_socket_identity != new_socket_identity
-    assert reloads == [(socket_path, "b" * 64)]
+    assert reloads == [(socket_path, target.release_id)]
     kickstarts = [
         command for command in commands if command[:3] == ("/bin/launchctl", "kickstart", "-kp")
     ]
@@ -2916,8 +3086,8 @@ def test_codex_host_preflight_accepts_signed_managed_pid_symlink_lineage(
     bundled_executable.write_bytes(b"signed-bundled-codex-test-double")
     bundled_executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: bundled_executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        bundled_executable,
     )
     monkeypatch.setattr(
         "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_socket",
@@ -2997,8 +3167,8 @@ def test_codex_reload_rejects_socket_replacement_after_classified_preflight(
     bundled_executable.write_bytes(b"signed-bundled-codex-test-double")
     bundled_executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: bundled_executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        bundled_executable,
     )
     monkeypatch.setattr(
         "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_socket",
@@ -3113,8 +3283,8 @@ def test_codex_host_preflight_rejects_broken_managed_daemon_before_reload(
     executable.write_bytes(b"signed-codex-test-double")
     executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        executable,
     )
     monkeypatch.setattr(
         "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_socket",
@@ -3174,8 +3344,8 @@ def test_codex_host_refresh_rejects_unsigned_executable_before_reload(
     executable.write_bytes(b"unsigned-codex-test-double")
     executable.chmod(0o755)
     monkeypatch.setattr(
-        "cao_control_plane.dashboard_lifecycle.canonical_codex_app_server_executable",
-        lambda: executable,
+        "cao_control_plane.dashboard_lifecycle._CODEX_APP_SERVER_EXECUTABLE",
+        executable,
     )
     commands: list[tuple[str, ...]] = []
 
@@ -3260,8 +3430,10 @@ def test_codex_reload_rejects_non_codex_initialize_before_sending_reload(
     assert [message["method"] for message in sent] == ["initialize"]
 
 
-def test_codex_reload_accepts_legacy_originator_only_after_attested_opt_in(
+@pytest.mark.parametrize("originator", ["cao-dashboard-lifecycle", "client-application"])
+def test_codex_reload_accepts_client_originator_only_after_host_attestation(
     monkeypatch: pytest.MonkeyPatch,
+    originator: str,
 ) -> None:
     from cao_control_plane.dashboard_lifecycle import (
         CodexAppServerMCPPreflight,
@@ -3279,9 +3451,9 @@ def test_codex_reload_accepts_legacy_originator_only_after_attested_opt_in(
                     "id": 1,
                     "result": {
                         "userAgent": (
-                            "cao-dashboard-lifecycle/0.148.0-alpha.15 "
+                            f"{originator}/0.148.0-alpha.15 "
                             "(Mac OS; arm64) unknown "
-                            "(cao-dashboard-lifecycle; prior-release)"
+                            f"({originator}; prior-release)"
                         ),
                         "codexHome": "/owner/codex",
                         "platformFamily": "unix",

@@ -56,6 +56,16 @@ REST, MCP, and A2A validation responses omit invalid submitted values and
 attacker-controlled nested locations; credential-shaped diagnostics are
 redacted again at the final protocol error serializer.
 
+The shared credential detector also recognizes concrete proxy-token assignments,
+including prefixed names in HTTP query strings. Command capture withholds a
+sensitive stream before writing its body, while retaining its byte count and
+digest. Verified artifact reads scan the full text before returning any chunk;
+descriptive credential words alone remain valid.
+
+Task packets reject concrete private locators. An explicit HTTP method and
+application route remain ordinary business text when they follow Japanese prose
+directly; private filesystem roots remain locators even after an HTTP method.
+
 ## Goal and evidence integrity
 
 Every Worker report includes the expected goal version. Stale reports fail closed. Completion claims remain `declared`; CAO review moves evidence to `verified`; user acceptance is separate.

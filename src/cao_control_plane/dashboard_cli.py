@@ -140,6 +140,10 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--readiness-attempts", type=int, default=30)
             command.add_argument("--readiness-interval-seconds", type=float, default=1.0)
             command.add_argument("--plan-only", action="store_true")
+            command.add_argument(
+                "--services-only", action="store_true",
+                help="Update CAO services without Codex reload; requires unchanged conversation MCP catalog and proxy ABI",
+            )
         if name in {"apply", "remove", "upgrade", "restart"}:
             command.add_argument("--effect-receipt-file", type=Path)
             command.add_argument("--execute", action="store_true")
@@ -309,9 +313,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 control_plane_plist_sha256=args.control_plane_plist_sha256,
                 edge_plist_path=args.edge_plist_path,
                 edge_plist_sha256=args.edge_plist_sha256,
-                codex_desktop_launchagent=discover_codex_desktop_launchagent_binding(),
+                codex_desktop_launchagent=(
+                    None if args.services_only else discover_codex_desktop_launchagent_binding()
+                ),
                 readiness_attempts=args.readiness_attempts,
                 readiness_interval_seconds=args.readiness_interval_seconds,
+                services_only=args.services_only,
             )
             if args.plan_only:
                 if receipt is not None or args.execute or args.owner_confirm:
@@ -331,7 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     runner,
                     # Full database/projection checks can exceed the short
                     # status budget on a healthy installation with history.
-                    probe=HttpxDashboardUpgradeProbe(HttpxProbe(timeout_seconds=30.0)),
+                    probe=HttpxDashboardUpgradeProbe(HttpxProbe(timeout_seconds=60.0)),
                     receipt=receipt,
                     execute=args.execute,
                     owner_confirmed=args.owner_confirm,
@@ -411,7 +418,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         allowed_private_upstream_hosts=credentials.allowed_private_upstream_hosts,
         cloudflare_access=credentials.cloudflare_access,
     )
-    uvicorn.run(create_dashboard_edge(settings), host=args.host, port=args.port)
+    uvicorn.run(
+        create_dashboard_edge(settings), host=args.host, port=args.port, access_log=False,
+    )
     return 0
 
 

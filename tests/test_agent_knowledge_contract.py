@@ -8,6 +8,7 @@ from cao_control_plane.mcp import (
     CONVERSATION_DELETE_WORKER_THREAD_TOOL,
     CONVERSATION_FINISH_WORKER_THREAD_TOOL,
     CONVERSATION_RESUME_WORKER_THREAD_TOOL,
+    MCPServer,
     conversation_server_tools,
 )
 
@@ -97,6 +98,19 @@ def test_verified_artifact_content_is_required_for_detail_level_review() -> None
     )
 
 
+def test_worker_artifact_guidance_distinguishes_reference_from_byte_preservation(system) -> None:
+    server = MCPServer(system["service"])
+    report = next(tool for tool in server.tools_for(system["worker"]) if tool["name"] == "cao_report")
+    artifact = report["inputSchema"]["properties"]["artifacts"]["items"]
+    properties = artifact["properties"]
+
+    assert "digest" not in artifact["required"]
+    assert "does not preserve source bytes" in properties["uri"]["description"]
+    assert "Optional for an unverified reference only" in properties["digest"]["description"]
+    assert "matching SHA-256" in properties["digest"]["description"]
+    assert "does not preserve source bytes" in _normalized_text(RUNBOOK)
+
+
 def test_task_packets_preserve_outcome_and_actor_responsibility() -> None:
     agent_text = _normalized_text(AGENT_MAP)
     runbook_text = _normalized_text(RUNBOOK)
@@ -109,6 +123,32 @@ def test_task_packets_preserve_outcome_and_actor_responsibility() -> None:
     assert "CAO owns delegation, evidence review, requester-facing synthesis" in runbook_text
 
 
+def test_allocation_judgment_is_visible_before_new_and_instruction(system) -> None:
+    server = MCPServer(system["service"])
+    tools = {tool["name"]: tool for tool in conversation_server_tools()}
+    surfaces = [server.discover(system["cao"])["instructions"]] + [
+        tools[name]["description"]
+        for name in ("cao_new_worker_thread", "cao_instruct_worker_thread")
+    ]
+    for text in surfaces:
+        assert "CAO chooses Worker allocation and serial or parallel execution" in text
+        assert "outcome dependencies, purpose, authority, cost and shared-resource conflicts" in text
+        assert "Independent work normally uses separate Workers" in text
+        assert "dependent checkpoints may retain the same Worker" in text
+        assert "shared files or authenticated sessions" in text
+        assert "either the same Worker or separate Workers" in text
+        assert "case by case" in text
+        assert "Keep a concise allocation reason in CAO supervision context" in text
+        assert "not a routing decision" in text
+    assert "CAO chooses Worker allocation" not in server.discover(system["worker"])["instructions"]
+
+    runbook = _normalized_text(RUNBOOK)
+    assert "### Choose Worker allocation before New or instruction" in runbook
+    assert "Neither choice is a universal rule" in runbook
+    assert "never a one-Task-per-Worker limit" in runbook
+    assert "not an extra requester approval gate" in runbook
+
+
 def test_unmet_purpose_requires_continuation_or_visible_escalation() -> None:
     agent_text = _normalized_text(AGENT_MAP)
     runbook_text = _normalized_text(RUNBOOK)
@@ -116,6 +156,8 @@ def test_unmet_purpose_requires_continuation_or_visible_escalation() -> None:
     assert "Missing knowledge, an unknown solution, and system failure" in runbook_text
     assert "ACK or handled records communication, never resolution" in runbook_text
     assert "Missing system recovery is not user-needed" not in runbook_text
+    assert "not an active quota-reset watch" in runbook_text
+    assert "choose a distinct inspect-first Work" in runbook_text
     tools = {tool["name"]: tool for tool in conversation_server_tools()}
     assert "fail" not in tools["cao_dispose_boundary"]["inputSchema"]["properties"]["kind"]["enum"]
 
@@ -361,6 +403,13 @@ def test_cao_judges_each_instruction_and_report_against_durable_worker_purpose()
     assert "A task is often a checkpoint toward the purpose" in purpose
     assert "stale or omitted confirmation cannot commit a new decision" in purpose
     tools = {tool["name"]: tool for tool in conversation_server_tools()}
+    setting = tools["cao_set_worker_purpose"]["description"]
+    assert "stable desired state and the background" in setting
+    assert "Keep current task details in the task context" in setting
+    decision = tools["cao_record_purpose_next_action"]["description"]
+    assert "CAO owns purpose waits, achievement and pause/resume judgments" in decision
+    assert "only an actual next Worker instruction" in decision
+    assert "purpose pause/resume receive independent" not in decision
     for name in ("cao_instruct_worker_thread", "cao_revise_task", "cao_reply", "cao_review",
                  "cao_dispose_boundary", "cao_resume_work", "cao_mark_handled", "cao_record_requester_decision"):
         assert "purpose" in tools[name]["description"]

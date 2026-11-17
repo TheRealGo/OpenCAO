@@ -36,7 +36,7 @@ def test_replay_reads_only_bounded_public_envelopes_and_skips_hidden_history(sys
     def forbidden(*args, **kwargs):
         pytest.fail("Replay reconstructed Work or ran a full projection audit")
 
-    monkeypatch.setattr(dashboard, "build_projection", forbidden)
+    monkeypatch.setattr(dashboard, "build_operator_snapshot", forbidden)
     monkeypatch.setattr(system["service"], "list_events", forbidden)
     original_connect = database.connect
     steps = 0

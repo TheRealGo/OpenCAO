@@ -23,18 +23,14 @@ from test_worker_mcp_live_e2e import _close_process, _request, _send, _structure
 
 from cao_control_plane.config import Settings
 from cao_control_plane.local_setup import local_dashboard_link, setup_local
-from cao_control_plane.runtime import _default_codex_app_server_command, _JsonRpcProcess
+from cao_control_plane.runtime import _JsonRpcDesktopSocket, codex_desktop_control_socket_path
 from cao_control_plane.security import CONTROL_PLANE_SECRET_PATTERN
 
 
 async def _archive_disposable_thread(thread_id: str) -> None:
-    process = await asyncio.create_subprocess_exec(
-        *_default_codex_app_server_command(),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+    rpc = await _JsonRpcDesktopSocket.connect(
+        codex_desktop_control_socket_path(), timeout=10.0
     )
-    rpc = _JsonRpcProcess(process, trusted_mcp_servers=frozenset())
     try:
         await rpc.request(
             "initialize", {"clientInfo": {"name": "cao-release-cleanup", "version": "1"}}
@@ -42,9 +38,7 @@ async def _archive_disposable_thread(thread_id: str) -> None:
         await rpc.send({"method": "initialized", "params": {}})
         await rpc.request("thread/archive", {"threadId": thread_id})
     finally:
-        if process.returncode is None:
-            process.terminate()
-        await process.wait()
+        await rpc.close()
 
 
 @pytest.mark.skipif(
@@ -65,7 +59,16 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
     workspace.mkdir()
     setup_local(config_path=config, state_dir=state, port=cp_port, dashboard_port=edge_port)
     settings = Settings.load(config)
-    native_thread = asyncio.run(_create_persisted_native_cao_thread(cwd=workspace))
+    native_thread = asyncio.run(_create_persisted_native_cao_thread(
+        cwd=workspace,
+        requester_prompt=(
+            "This is a disposable installation check. Authorize one Worker to reply exactly "
+            "PUBLIC_CODEX_INSTALL_OK without reading or writing files, running commands, or "
+            "accessing external services. Its purpose is to establish that the installation "
+            "delivers and preserves the exact response. Accept only that complete response. "
+            "Do not perform the check in this turn; reply exactly READY."
+        ),
+    ))
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -148,11 +151,35 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
                     },
                 )
                 worker_id = created["worker_thread_id"]
+                call(
+                    "cao_set_worker_purpose",
+                    {
+                        "worker_thread_id": worker_id,
+                        "purpose": "Establish that this disposable installation delivers and preserves the exact requested response.",
+                        "contract": {
+                            "outcome": "The complete requested response is available for independent review.",
+                            "scope": "One disposable no-effect installation check.",
+                            "criteria": [{
+                                "id": "exact_response",
+                                "condition": "The entire final answer is PUBLIC_CODEX_INSTALL_OK.",
+                                "evidence": "Digest-verified captured provider output.",
+                            }],
+                            "completion": "Independent readback matches the exact requested response.",
+                            "authority": "Only return the marker; no files, commands or external services.",
+                            "unmet_action": "Report the concrete failure without broadening scope.",
+                        },
+                        "expected_purpose_version": 0,
+                        "reason": "The fixture requester authorized this installation check.",
+                        "idempotency_key": "public-live-purpose",
+                    },
+                )
+                call("cao_list_managed_workers", {})
                 assigned = call(
                     "cao_instruct_worker_thread",
                     {
                         "worker_thread_id": worker_id,
-                        "objective": "Reply with exactly PUBLIC_CODEX_INSTALL_OK. Do not read or write files, run commands, or access external services.",
+                        "expected_purpose_version": 1,
+                        "instruction": "Reply with exactly PUBLIC_CODEX_INSTALL_OK. Do not read or write files, run commands, or access external services.",
                         "acceptance": ["The entire final answer is PUBLIC_CODEX_INSTALL_OK."],
                         "completion_contract": "no_artifact_expected",
                         "idempotency_key": "public-live-instruct",
@@ -200,8 +227,13 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
                     {
                         "attempt_id": work["current_attempt"]["id"],
                         "verdict": "ok",
+                        "expected_purpose_version": 1,
                         "summary": "The complete real Worker output matches the exact fixture marker.",
                         "evidence": [{"check": "real_codex_output", "result": "pass"}],
+                        "criterion_assessments": [{
+                            "criterion_id": "task_1", "verdict": "met",
+                            "evidence": "Complete digest-verified provider output equals PUBLIC_CODEX_INSTALL_OK.",
+                        }],
                         "idempotency_key": "public-live-review",
                     },
                 )
@@ -227,13 +259,24 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
                         "lease_token": turn["lease_token"],
                         "expected_generation": work["generation"],
                         "kind": "accept",
+                        "expected_purpose_version": 1,
                         "reason": "Exact fixture marker independently read and verified.",
+                        "next_action": {
+                            "kind": "achieved",
+                            "reason": "The disposable response check is satisfied.",
+                            "evidence": "Complete output matches the exact marker.",
+                            "criterion_assessments": [{
+                                "criterion_id": "exact_response",
+                                "evidence": "The digest-verified final response matches PUBLIC_CODEX_INSTALL_OK.",
+                            }],
+                        },
                     },
                 )
                 accepted = call(
                     "cao_record_requester_decision",
                     {
                         "review_id": reviewed["reviews"][-1]["id"],
+                        "expected_purpose_version": 1,
                         "verdict": "accepted",
                         "summary": "Apply the fixture's preauthorized exact-marker acceptance.",
                         "evidence": [{"check": "exact_fixture_marker", "result": "pass"}],
@@ -282,6 +325,8 @@ def test_fresh_install_real_codex_worker_report_review_and_dashboard(tmp_path: P
                         {"worker_thread_id": worker_id, "idempotency_key": "public-live-delete"},
                     )
                     assert call("cao_list_managed_workers", {})["workers"] == []
+                if bridge and bridge.poll() is None:
+                    call("cao_close_conversation", {"idempotency_key": "public-live-close"})
             finally:
                 _close_process(bridge)
                 _close_process(launcher)

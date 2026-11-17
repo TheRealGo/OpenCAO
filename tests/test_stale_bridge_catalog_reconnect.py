@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from conftest import current_cao_session_attachment
 from test_worker_thread_lifecycle_core import _prepare_runtime_recovery
@@ -276,6 +277,7 @@ def test_catalog_refresh_requires_same_conversation_start_before_delete(
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:
@@ -462,6 +464,7 @@ def test_foreign_uid_attachment_rejection_returns_one_bounded_stopped_result(
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.timeout = httpx.Timeout(kwargs.get("timeout", 120))
             del args, kwargs
 
         async def __aenter__(self) -> Client:

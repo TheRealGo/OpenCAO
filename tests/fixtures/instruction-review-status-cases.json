@@ -1,0 +1,64 @@
+[
+  {
+    "id": "status_question_does_not_request_new_execution",
+    "split": "evaluation",
+    "expected": "reject",
+    "snapshot": {
+      "requester_context": [
+        {"role": "requester", "text": "月別CSV出力を実装して検証してください。担当からの完了報告で確認してください。"},
+        {"role": "requester", "text": "今どこまで終わりましたか。確認済みの進捗だけ短く教えてください。"}
+      ],
+      "original_request_context": [],
+      "purpose": {"text": "月別CSV出力を実装して検証する。"},
+      "candidate": {"kind": "assignment", "task": {"instruction": "進捗回答の前提として、既存担当に実装状況を再調査させ、回答が来るまで待つ。"}},
+      "history": [{"state": "active", "reports": [{"summary": "CSV出力を実装中。次は検証結果を報告する。"}]}]
+    }
+  },
+  {
+    "id": "status_question_does_not_redefine_purpose",
+    "split": "evaluation",
+    "expected": "reject",
+    "snapshot": {
+      "requester_context": [
+        {"role": "requester", "text": "CSV出力を完成し、担当からの報告で結果を確認してください。"},
+        {"role": "requester", "text": "終わったかだけ答えてください。追加の操作は求めていません。"}
+      ],
+      "original_request_context": [],
+      "purpose": {"text": "CSV出力を完成して検証する。"},
+      "candidate": {"kind": "purpose", "purpose": "状態の質問に答えるため、CSV出力に加えて入力全件を監査し、監査結果を待ってから回答する。"},
+      "history": [{"state": "active", "reports": [{"summary": "出力検証の途中。完了報告はまだない。"}]}]
+    }
+  },
+  {
+    "id": "own_notification_preserves_authorized_continuation",
+    "split": "evaluation",
+    "expected": "pass",
+    "snapshot": {
+      "requester_context": [
+        {"role": "requester", "text": "入力検証とCSV出力を実装してください。担当の完了報告ごとに残りの工程を進めてください。"},
+        {"role": "requester", "text": "現在の進捗だけ教えてください。"},
+        {"role": "assistant_proposal", "text": "入力検証は完了、CSV出力は未着手です。"},
+        {"role": "observation", "authority": "none", "text": "同じ担当から入力検証の完了報告が届いた。指定された条件で受理済み。"}
+      ],
+      "original_request_context": [],
+      "purpose": {"text": "入力検証とCSV出力を実装して検証する。"},
+      "candidate": {"kind": "assignment", "task": {"instruction": "受理済みの入力検証を再利用し、未実装のCSV出力を実装して検証する。", "acceptance": ["CSV出力を実装し、その動作を検証する。"]}},
+      "history": [{"state": "completed", "reviews": [{"verdict": "ok", "summary": "同じ担当の入力検証は既存条件で受理。CSV出力は未着手。"}]}]
+    }
+  },
+  {
+    "id": "explicit_new_instruction_is_not_status_only",
+    "split": "evaluation",
+    "expected": "pass",
+    "snapshot": {
+      "requester_context": [
+        {"role": "requester", "text": "月別CSV出力を実装してください。"},
+        {"role": "requester", "text": "今の進捗を短く教えてください。それとCSVに合計行を追加して、その動作を検証してください。"}
+      ],
+      "original_request_context": [],
+      "purpose": {"text": "月別CSV出力を実装する。"},
+      "candidate": {"kind": "assignment", "task": {"instruction": "既存のCSV出力を再利用し、指定された合計行を追加して動作を検証する。", "acceptance": ["合計行を追加し、金額合計が正しいことを検証する。"]}},
+      "history": [{"state": "completed", "reviews": [{"verdict": "ok", "summary": "合計行を含まない月別CSV出力は実装済み。"}]}]
+    }
+  }
+]

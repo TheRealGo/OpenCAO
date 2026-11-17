@@ -5,7 +5,13 @@ from typing import Any
 
 import pytest
 from test_cao_notification_delivery_lane import _attached, _report
-from test_worker_output_delivery import _capture_fixture, _event, _read_request, _terminal
+from test_worker_output_delivery import (
+    _capture_fixture,
+    _event,
+    _finalize_successful_capture,
+    _read_request,
+    _terminal,
+)
 
 from cao_control_plane.errors import AuthenticationError, AuthorizationError, ConflictError
 from cao_control_plane.models import (
@@ -13,10 +19,101 @@ from cao_control_plane.models import (
     BoundaryDispositionInput,
     GoalRevision,
     MessageKind,
+    ReportInput,
     ReviewInput,
 )
+from cao_control_plane.runtime import Dispatcher
 
 _PAST = "2000-01-01T00:00:00Z"
+
+
+def test_explicit_completion_waits_for_its_provider_response(system) -> None:
+    service = system["service"]
+    actor, work, binding = _capture_fixture(system)
+    attempt = work["current_attempt"]
+    result = service.report(
+        system["worker"],
+        attempt["id"],
+        ReportInput(
+            kind="completion_claim",
+            expected_generation=work["generation"],
+            expected_goal_version=work["goal_version"],
+            expected_goal_packet_digest=attempt["goal_packet_digest"],
+            expected_task_packet_digest=attempt["task_packet_digest"],
+            summary="The bounded result is ready.",
+            idempotency_key="completion-before-provider-final",
+        ),
+    )
+    message_id = result["report_receipt"]["message_id"]
+    before = _delivery(service, message_id)
+    dispatcher = Dispatcher(service, system["settings"])
+    assert dispatcher._claim_delivery() is None
+    assert _delivery(service, message_id) == before
+
+    # This exact response must not delay an independent conversation event.
+    with service.db.transaction() as connection:
+        unrelated = service._message(
+            connection,
+            sender_id=system["worker"]["id"],
+            recipient_id=actor["id"],
+            kind=MessageKind.SYSTEM,
+            work_item_id=work["id"],
+            goal_version=work["goal_version"],
+            payload={"action": "cao_command_result_available",
+                     "summary": "An independent event is ready."},
+            idempotency_key="independent-during-provider-response",
+        )
+    assert dispatcher._claim_delivery()["message_id"] == unrelated["id"]
+
+    output = service.observe_worker_output(**binding, event=_event())
+    _terminal(service, binding, settle=False)
+    assert Dispatcher(service, system["settings"])._claim_delivery() is None
+    _finalize_successful_capture(service, binding)
+
+    claimed = dispatcher._claim_delivery()
+    assert claimed is not None and claimed["message_id"] == message_id
+    assert dispatcher._claim_delivery() is None
+    current = service.get_work(work["id"])
+    assert current["provider_response"]["current"]["record_availability"] == "recorded"
+    assert any(item["id"] == output["id"] for item in current["worker_outputs"])
+    assert service.db.fetchone(
+        "SELECT COUNT(*) FROM messages WHERE attempt_id = ? "
+        "AND json_extract(payload_json, '$.boundary_id') = ?",
+        (attempt["id"], current["open_boundaries"][0]["id"]),
+    )[0] == 1
+    _review_and_accept(service, actor, work)
+
+
+def test_completion_without_provider_capture_is_not_delayed(system) -> None:
+    service = system["service"]
+    actor = _attached(service, "uncaptured-completion")
+    work = _report(system, actor, "uncaptured-completion")
+    claim = Dispatcher(service, system["settings"])._claim_delivery()
+    assert claim is not None
+    assert claim["message_id"] == work["report_receipt"]["message_id"]
+
+
+@pytest.mark.parametrize("kind", ["question", "blocker"])
+def test_live_provider_questions_and_blockers_remain_deliverable(system, kind: str) -> None:
+    service = system["service"]
+    _, work, _ = _capture_fixture(system)
+    attempt = work["current_attempt"]
+    result = service.report(
+        system["worker"],
+        attempt["id"],
+        ReportInput(
+            kind=kind,
+            expected_generation=work["generation"],
+            expected_goal_version=work["goal_version"],
+            expected_goal_packet_digest=attempt["goal_packet_digest"],
+            expected_task_packet_digest=attempt["task_packet_digest"],
+            summary="An exact decision is needed.",
+            idempotency_key=f"live-provider-{kind}",
+        ),
+    )
+    claim = Dispatcher(service, system["settings"])._claim_delivery()
+    assert claim is not None
+    assert claim["message_id"] == result["report_receipt"]["message_id"]
 
 
 def _delivery(service: Any, message_id: str) -> dict[str, Any]:

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+import stat
 import subprocess
 import sys
 import zipfile
@@ -26,6 +27,39 @@ ROOT_FILES = frozenset(
 SOURCE_DIRS = frozenset({"src", "tests", "docs", "tools", ".github"})
 SOURCE_EXTENSIONS = frozenset(
     {".py", ".js", ".mjs", ".css", ".html", ".md", ".json", ".toml", ".yml", ".yaml", ".typed"}
+)
+RUNTIME_HOOKS = frozenset(
+    {
+        'src/cao_control_plane/runtime_hooks/bin/gh',
+        'src/cao_control_plane/runtime_hooks/git/applypatch-msg',
+        'src/cao_control_plane/runtime_hooks/git/commit-msg',
+        'src/cao_control_plane/runtime_hooks/git/fsmonitor-watchman',
+        'src/cao_control_plane/runtime_hooks/git/p4-changelist',
+        'src/cao_control_plane/runtime_hooks/git/p4-post-changelist',
+        'src/cao_control_plane/runtime_hooks/git/p4-pre-submit',
+        'src/cao_control_plane/runtime_hooks/git/p4-prepare-changelist',
+        'src/cao_control_plane/runtime_hooks/git/post-applypatch',
+        'src/cao_control_plane/runtime_hooks/git/post-checkout',
+        'src/cao_control_plane/runtime_hooks/git/post-commit',
+        'src/cao_control_plane/runtime_hooks/git/post-index-change',
+        'src/cao_control_plane/runtime_hooks/git/post-merge',
+        'src/cao_control_plane/runtime_hooks/git/post-receive',
+        'src/cao_control_plane/runtime_hooks/git/post-rewrite',
+        'src/cao_control_plane/runtime_hooks/git/post-update',
+        'src/cao_control_plane/runtime_hooks/git/pre-applypatch',
+        'src/cao_control_plane/runtime_hooks/git/pre-auto-gc',
+        'src/cao_control_plane/runtime_hooks/git/pre-commit',
+        'src/cao_control_plane/runtime_hooks/git/pre-merge-commit',
+        'src/cao_control_plane/runtime_hooks/git/pre-push',
+        'src/cao_control_plane/runtime_hooks/git/pre-rebase',
+        'src/cao_control_plane/runtime_hooks/git/pre-receive',
+        'src/cao_control_plane/runtime_hooks/git/prepare-commit-msg',
+        'src/cao_control_plane/runtime_hooks/git/proc-receive',
+        'src/cao_control_plane/runtime_hooks/git/push-to-checkout',
+        'src/cao_control_plane/runtime_hooks/git/reference-transaction',
+        'src/cao_control_plane/runtime_hooks/git/sendemail-validate',
+        'src/cao_control_plane/runtime_hooks/git/update',
+    }
 )
 FORBIDDEN_NAME = re.compile(
     r"(?i)(?:^\.env(?:\.|$)|\.sqlite(?:3)?(?:-|$)|\.db$|\.log$|\.pid$|"
@@ -82,7 +116,8 @@ def checked_source(root: Path) -> tuple[dict[str, bytes], list[str]]:
             or (
                 name not in ROOT_FILES
                 and (
-                    relative.parts[0] not in SOURCE_DIRS or relative.suffix not in SOURCE_EXTENSIONS
+                    relative.parts[0] not in SOURCE_DIRS
+                    or (relative.suffix not in SOURCE_EXTENSIONS and name not in RUNTIME_HOOKS)
                 )
             )
         ):
@@ -116,7 +151,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.archive:
         with zipfile.ZipFile(args.archive, "x", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, data in payloads.items():
-                archive.writestr(f"OpenCAO/{name}", data)
+                entry = zipfile.ZipInfo(f"OpenCAO/{name}")
+                entry.create_system = 3
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                entry.external_attr = (stat.S_IFREG | stat.S_IMODE((ROOT / name).stat().st_mode)) << 16
+                archive.writestr(entry, data)
             archive.writestr("OpenCAO/PUBLICATION-MANIFEST.json", json.dumps(manifest, indent=2) + "\n")
     print(
         f"Publication source check passed: {len(payloads)} files; no runtime or Git data included."

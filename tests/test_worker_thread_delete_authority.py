@@ -5,7 +5,11 @@ from contextlib import contextmanager
 from typing import Any
 
 import pytest
-from conftest import attach_cao_session_with_peer, current_cao_session_attachment
+from conftest import (
+    attach_cao_session_with_peer,
+    current_cao_session_attachment,
+    seed_pre_review_worker_message,
+)
 from test_worker_thread_lifecycle_core import (
     _attached as _lifecycle_attached,
 )
@@ -387,7 +391,7 @@ def test_delete_active_work_preserves_claimed_delivery_and_unknown_effects(
                 assignment["recipient_id"],
             ),
         )
-        queued = service._message(
+        queued = seed_pre_review_worker_message(service,
             connection,
             sender_id=str(actor["id"]),
             recipient_id=ids["principal_id"],
@@ -398,7 +402,7 @@ def test_delete_active_work_preserves_claimed_delivery_and_unknown_effects(
             goal_version=work["goal_version"],
             idempotency_key="queued-before-delete",
         )
-        claimed_queued = service._message(
+        claimed_queued = seed_pre_review_worker_message(service,
             connection,
             sender_id=str(actor["id"]),
             recipient_id=ids["principal_id"],
@@ -417,7 +421,7 @@ def test_delete_active_work_preserves_claimed_delivery_and_unknown_effects(
             """,
             (utc_after(300), now, claimed_queued["id"], ids["principal_id"]),
         )
-        leased = service._message(
+        leased = seed_pre_review_worker_message(service,
             connection,
             sender_id=str(actor["id"]),
             recipient_id=ids["principal_id"],

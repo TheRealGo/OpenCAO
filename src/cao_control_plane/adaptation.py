@@ -464,6 +464,7 @@ def cao_hook_source(event: Mapping[str, Any], config: Path | None) -> str:
     Control Plane. An absent or unavailable attachment cannot become authority.
     """
     from .config import Settings
+    from .notifications import notification_message_id
     from .runtime import render_message
 
     session = _identity(event.get("session_id"))
@@ -485,14 +486,14 @@ def cao_hook_source(event: Mapping[str, Any], config: Path | None) -> str:
             # message and exact attachment Delivery must both match to skip it.
             prompt = event.get("prompt")
             if isinstance(prompt, str):
-                match = re.search(r"(?m)^Delivery message ID: (msg_[a-zA-Z0-9]+)$", prompt)
-                if match:
+                message_id = notification_message_id(prompt)
+                if message_id:
                     message = connection.execute(
                         "SELECT m.*, b.recovery_action FROM messages m "
                         "JOIN message_deliveries d ON d.message_id=m.id "
                         "LEFT JOIN boundaries b ON b.id=json_extract(m.payload_json,'$.boundary_id') "
                         "WHERE m.id=? AND d.recipient_attachment_id=? AND d.delivered_at IS NOT NULL",
-                        (match.group(1), attachment["id"]),
+                        (message_id, attachment["id"]),
                     ).fetchone()
                     if message is not None:
                         value = dict(message)
@@ -509,12 +510,11 @@ def cao_hook_allowed(event: Mapping[str, Any], config: Path | None) -> bool:
 def notification_recall_query(event: Mapping[str, Any], config: Path | None) -> str:
     """Recall for automatic judgments without classifying Worker output as feedback."""
     from .config import Settings
+    from .notifications import notification_message_id
 
     query = "CAO Workerの報告を検証して判断する review evidence"
-    match = re.search(
-        r"(?m)^Delivery message ID: (msg_[a-zA-Z0-9]+)$", str(event.get("prompt", ""))
-    )
-    if match is None:
+    message_id = notification_message_id(str(event.get("prompt", "")))
+    if message_id is None:
         return query
     settings = Settings.load(config)
     with closing(
@@ -528,7 +528,7 @@ def notification_recall_query(event: Mapping[str, Any], config: Path | None) -> 
             "JOIN work_items w ON w.id=m.work_item_id AND w.supervisor_attachment_id=a.id "
             "JOIN goal_revisions g ON g.work_item_id=w.id AND g.version=w.goal_version "
             "WHERE a.native_thread_id=? AND a.state='active' AND m.id=?",
-            (_identity(event.get("session_id")), match.group(1)),
+            (_identity(event.get("session_id")), message_id),
         ).fetchone()
         if row is not None:
             query += " " + str(row[0]) + " " + str(row[1])

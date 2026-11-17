@@ -33,3 +33,6 @@ callback-credentials.key
 
 # Owner-local operational incident records must never enter the public tree.
 ops-log/
+
+# Local artifact review copies are not distributable source.
+.cao-review/

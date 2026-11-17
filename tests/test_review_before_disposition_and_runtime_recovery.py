@@ -15,6 +15,7 @@ from cao_control_plane.models import (
     RuntimeHeartbeat,
     WorkAssignment,
 )
+from cao_control_plane.projection import verify_projection
 from cao_control_plane.service import WORKER_MCP_REQUIRED_TOOLS, ControlPlane
 
 
@@ -184,6 +185,31 @@ def test_open_completion_boundary_review_precedes_matching_disposition(
         assert payload["action"] == "correct"
         assert payload["instruction"] == instruction
         assert instruction_message["runtime_session_id"] == system["runtime"]["id"]
+
+
+@pytest.mark.parametrize("verdict", ["ok", "needs_work"])
+def test_reviewed_completion_can_be_cancelled_without_accepting_or_correcting(system, verdict):
+    key = f"reviewed-cancellation:{verdict}"
+    cao, work, boundary = _completion_boundary(system, key=key)
+    mcp, review, turn = _review_open_boundary(
+        system, cao=cao, work=work, boundary=boundary, verdict=verdict, key=key,
+    )
+    mcp.call_tool(cao, "cao_dispose_boundary", {
+        "work_item_id": work["id"], "boundary_id": boundary["id"],
+        "turn_id": turn["id"], "lease_token": turn["lease_token"],
+        "expected_generation": work["generation"], "kind": "cancel",
+        "reason": "Retain this review and end the finite Work without accepting it.",
+    })
+    current = system["service"].get_work(work["id"])
+    assert current["state"] == "canceled"
+    assert current["current_attempt"]["state"] == "canceled"
+    assert current["reviews"][-1]["id"] == review["id"]
+    assert current["reviews"][-1]["verdict"] == verdict
+    assert current["open_boundaries"] == []
+    assert system["service"].db.fetchone(
+        "SELECT 1 FROM messages WHERE work_item_id=? AND kind='instruction'", (work["id"],),
+    ) is None
+    assert verify_projection(system["service"].db).healthy
 
 
 @pytest.mark.parametrize(

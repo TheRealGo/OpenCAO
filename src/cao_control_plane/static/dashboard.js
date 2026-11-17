@@ -258,6 +258,11 @@
         appendKnown(current, "続行に必要なこと", item.requester_escalation.resume_condition);
         appendKnown(current, "相談通知の配送", recoveryNotificationLabel(item.requester_escalation.notification_state));
       }
+      if (item.system_recovery) {
+        appendKnown(current, "復旧担当", "CAO（利用者の判断は不要）");
+        appendKnown(current, "復旧を待っている理由", item.system_recovery.reason);
+        appendKnown(current, "復旧の条件", item.system_recovery.resume_condition);
+      }
     }
     if (["ready", "delivery_missing"].includes(item.delivery_state)) {
       appendKnown(current, "成果物", deliveryStateLabel(item.delivery_state));
@@ -322,6 +327,20 @@
     appendReadable(row, "業務の目的", item.purpose_text || (item.purpose_status === "invalid"
       ? "業務の目的の記録を確認できません。" : "業務の目的は未登録です。"),
       `worker:${item.worker_label}:purpose`);
+    const purposeNext = {
+      pending: "次の作業をCAOが判断する必要があります。",
+      waiting: "目的の継続は、記録された観測時刻を待っています。",
+      user_needed: "目的の継続には、具体的な入力・権限・予算の確認が必要です。",
+      achieved: "固定した目的の達成条件を検証済みです。",
+      paused: "依頼者の明示指示により、目的の継続を休止しています。",
+      invalid: "目的の継続記録を確認できません。CAOの対応が必要です。",
+    }[item.purpose_supervision_state];
+    if (purposeNext) appendReadable(row, "次の作業", purposeNext,
+      `worker:${item.worker_label}:purpose-next`);
+    if (item.purpose_supervision_state === "waiting" && item.purpose_resume_at) {
+      appendReadable(row, "次の観測時刻", localTimestamp(item.purpose_resume_at),
+        `worker:${item.worker_label}:purpose-resume`);
+    }
     const attentionText = attentionReasonLabel(item.attention_reason);
     if (attentionText) {
       const attention = document.createElement("p");
@@ -684,14 +703,15 @@
     state.updateQueue = state.updateQueue
       .then(async () => {
         if (revision <= state.completedRevision) return;
+        const targetRevision = state.pendingRevision;
         const shouldReconnect = state.reconnectAfterRefresh;
         if (!await refresh(shouldReconnect)) {
-          state.completedRevision = Math.max(state.completedRevision, revision);
+          state.completedRevision = Math.max(state.completedRevision, targetRevision);
           state.reconnectAfterRefresh = false;
           clearRetry();
           return;
         }
-        state.completedRevision = Math.max(state.completedRevision, revision);
+        state.completedRevision = Math.max(state.completedRevision, targetRevision);
         if (state.completedRevision < state.pendingRevision) {
           return;
         }

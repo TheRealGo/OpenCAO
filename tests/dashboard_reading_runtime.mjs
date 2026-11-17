@@ -82,6 +82,14 @@ const connectionWait = api.workerCard({ worker_label: "Waiting Supervisor",
     state: "waiting_supervisor", attention_owner: "cao", cao_supervision_state: "connection_required" }] });
 assert.match(text(connectionWait, true), /CAOの接続更新待ち/);
 assert.doesNotMatch(text(connectionWait, true), /CAOが確認・判断中|CAOが自動処理中|あなたの回答・判断が必要/);
+const recovering = new Element();
+api.appendWork(recovering, { ...work, state: "waiting_supervisor", attention_owner: "cao",
+  system_recovery: { owner: "cao", requester_action_required: false,
+    reason: "An exact execution outcome remains unsettled.",
+    resume_condition: "Authoritative target evidence clears the blocker." } });
+assert.match(text(recovering, true), /CAO（利用者の判断は不要）/);
+assert.match(text(recovering, true), /Authoritative target evidence/);
+assert.doesNotMatch(text(recovering, true), /あなたの回答・判断が必要|指示者への相談/);
 assert.doesNotMatch(text(container, true), /停滞検出|Runtime生存信号|依頼者の受理記録|復旧待ち開始/);
 assert.match(text(container, true), /CAOレビュー済み/);
 assert.doesNotMatch(text(container, true), /あなたの回答・判断が必要/);

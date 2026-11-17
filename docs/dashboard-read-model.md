@@ -66,6 +66,16 @@ The snapshot and history share the same Work and close-proof builder, including
 cross-Work duplicate-receipt checks; faster reads do not relax completion or
 recovery semantics. Regression checks enforce bounded projection work, fresh
 reads and exact canonical DTO equivalence independently of machine timing.
+The live snapshot first reads lightweight state fields for visible production
+Workers. It uses the shared completion classifier and canonical requester-review
+bindings to select current Work candidates and the 20 most recent settled
+completions before detailed Work reconstruction. Older completed and canceled
+Work retains its original ordinal position, so omitting it cannot renumber a
+visible card or change timestamp tie ordering. Current candidates still undergo
+canonical close-proof verification. Only selected receipt bodies are loaded;
+indexed identity counts include unselected Work to reject duplicate proofs.
+All selection, detailed state and the event watermark share the same fresh read
+transaction. No retained snapshot cache or Worker activity gate is involved.
 Finite Dashboard and readiness reads use the HTTP framework's worker pool;
 SSE replay also moves its synchronous database read off the event loop. An
 in-progress full snapshot or integrity check must not hold up an independent
@@ -107,7 +117,7 @@ is rejected from generic REST, dispatcher, A2A, tools, all non-Dashboard MCP
 resources, and mutation surfaces; the four versioned routes plus the one
 MCP snapshot resource are its only authenticated contracts.
 The read model contains a strict `operator` DTO with format
-`cao-dashboard-operator/v1`, a locator-free integrity summary, and event
+`cao-dashboard-operator/v1`, a locator-free diagnostic summary, and event
 envelopes with only event type, aggregate type, timestamp, and opaque cursor.
 It never includes event payloads, actor identifiers, correlations, raw task packets,
 metadata, artifact locations, commands, credentials, endpoints, or internal
@@ -376,8 +386,20 @@ hidden history directly; when no visible events remain, the replay barrier
 advances to that transaction's last durable sequence. Concurrent commits are
 observed by the next read, including authority-generation resynchronization.
 
-Snapshot and readiness retain the complete canonical projection and integrity
-checks. Indexed Attempt activity, artifact and causation lookups avoid scanning
+Live snapshots read Worker inventory, only production Work belonging to visible
+Workers, runtime aggregates and the cursor in one fresh SQLite transaction.
+They reuse the canonical Work and close-proof builders without reconstructing
+hidden or archived Workers' Work or running a whole-database integrity audit.
+Zero visible Workers is a normal empty snapshot and does not require an active
+CAO conversation or Worker runtime. Services remain supervised independently
+of conversation activity and browser presence.
+
+The snapshot's diagnostic projection explicitly reports
+`integrity_check: "not-performed"` and `healthy: null`; this visibility read is
+not a health certification. Invalid authority is still reported as unhealthy.
+Readiness and explicit verification retain the complete canonical projection,
+database integrity checks and all existing invariant checks. Indexed Attempt
+activity, artifact and causation lookups avoid scanning
 all message history separately for each Work. These indexes are installed for
 both new databases and upgrades without changing retained evidence or the
 operator DTO. Regression checks bound SQLite execution work independently of

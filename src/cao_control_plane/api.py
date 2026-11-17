@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypeVar
@@ -156,7 +156,9 @@ def _dispatcher_readiness(dispatcher: Dispatcher, settings: Settings) -> dict[st
         issues.append("dispatcher_not_running")
     if error_code:
         issues.append("dispatcher_cycle_error")
-    if cycle_stale:
+    if raw.get("native_change_error"):
+        issues.append("native_change_subscription_unavailable")
+    if cycle_stale and not raw.get("waiting_for_event"):
         issues.append("dispatcher_cycle_stale")
     return {
         "healthy": not issues,
@@ -508,7 +510,9 @@ def create_app(
             **error.extras,
         )
 
-    async def actor(request: Request) -> dict[str, Any]:
+    # Authentication uses blocking SQLite and credential checks. FastAPI runs
+    # synchronous dependencies in its worker pool, keeping the event loop free.
+    def actor(request: Request) -> dict[str, Any]:
         current = service.authenticate(_bearer_token(request))
         if current.get("_cao_attachment_bootstrap_credential_id") and not (
             request.method == "POST" and request.url.path == "/api/v1/cao-session-attachments"
@@ -527,7 +531,7 @@ def create_app(
             )
         return current
 
-    async def a2a_actor(request: Request) -> dict[str, Any]:
+    def a2a_actor(request: Request) -> dict[str, Any]:
         _require_a2a_version(request)
         current = service.authenticate(_bearer_token(request))
         if (
@@ -796,7 +800,17 @@ def create_app(
                     "X-Accel-Buffering": "no",
                 },
             )
-        result = await asyncio.to_thread(mcp.handle_modern, current, body)
+        job = asyncio.create_task(asyncio.to_thread(mcp.handle_modern, current, body))
+        try:
+            result = await asyncio.shield(job)
+        except asyncio.CancelledError:
+            def completed(value: asyncio.Task[Any]) -> None:
+                with suppress(Exception):
+                    mcp.record_disconnected_result(current, body, value.result())
+            job.add_done_callback(completed)
+            raise
+        if await request.is_disconnected():
+            mcp.record_disconnected_result(current, body, result)
         if result is None:
             return Response(status_code=202, headers=headers)
         if method in {"server/discover", "tools/list", "resources/list"}:
@@ -868,7 +882,7 @@ def create_app(
                     )
                 if method == "SendStreamingMessage":
                     try:
-                        task = a2a.send_message(current, dict(params))
+                        task = await asyncio.to_thread(a2a.send_message, current, dict(params))
                     except A2AProtocolError as error:
                         return JSONResponse(
                             A2AServer._error(
@@ -946,7 +960,7 @@ def create_app(
         ) -> JSONResponse:
             _require_media(request, A2A_MEDIA_TYPE)
             body = await request.json()
-            task = _a2a_call(lambda: a2a.send_message(current, body))
+            task = await asyncio.to_thread(_a2a_call, lambda: a2a.send_message(current, body))
             if not a2a.return_immediately(body):
                 task = await a2a.wait_for_settled(str(task["id"]), actor=current)
             return JSONResponse(
@@ -968,7 +982,7 @@ def create_app(
                     {},
                 )
             body = await request.json()
-            task = _a2a_call(lambda: a2a.send_message(current, body))
+            task = await asyncio.to_thread(_a2a_call, lambda: a2a.send_message(current, body))
 
             async def stream() -> AsyncIterator[bytes]:
                 async for item in a2a.task_event_stream(str(task["id"]), actor=current):
@@ -1209,7 +1223,7 @@ def create_app(
         body: WorkAssignment,
         current: dict[str, Any] = Depends(actor),
     ) -> dict[str, Any]:
-        return service.assign_work(current, body)
+        return await asyncio.to_thread(service.assign_work, current, body)
 
     @app.post("/api/v1/cao-session-attachments", tags=["runtime"])
     async def cao_session_attach(
@@ -1258,7 +1272,7 @@ def create_app(
         body: GoalRevision,
         current: dict[str, Any] = Depends(actor),
     ) -> dict[str, Any]:
-        return service.revise_goal(current, work_id, body)
+        return await asyncio.to_thread(service.revise_goal, current, work_id, body)
 
     @app.post("/api/v1/work/{work_id}:reply", tags=["admin"])
     async def work_reply(
@@ -1266,7 +1280,7 @@ def create_app(
         body: dict[str, Any],
         current: dict[str, Any] = Depends(actor),
     ) -> dict[str, Any]:
-        return service.reply(
+        return await asyncio.to_thread(service.reply,
             current,
             work_id,
             str(body.get("message", "")),
@@ -1295,7 +1309,7 @@ def create_app(
         current: dict[str, Any] = Depends(actor),
     ) -> dict[str, Any]:
         require_role(current, "cao")
-        return service.resume_work(current, work_id, body)
+        return await asyncio.to_thread(service.resume_work, current, work_id, body)
 
     @app.post("/api/v1/memories:search", tags=["supervision"])
     async def memories_search(
@@ -1335,7 +1349,7 @@ def create_app(
         body: dict[str, Any],
         current: dict[str, Any] = Depends(actor),
     ) -> dict[str, Any]:
-        return service.create_attempt(
+        return await asyncio.to_thread(service.create_attempt,
             current,
             work_id,
             body.get("worker_id"),
@@ -1369,7 +1383,7 @@ def create_app(
         body: BoundaryDispositionInput,
         current: dict[str, Any] = Depends(actor),
     ) -> dict[str, Any]:
-        return service.dispose_boundary(current, boundary_id, body)
+        return await asyncio.to_thread(service.dispose_boundary, current, boundary_id, body)
 
     @app.get("/api/v1/worker/context", tags=["worker"])
     async def worker_context(

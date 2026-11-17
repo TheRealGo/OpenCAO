@@ -20,3 +20,27 @@ ATTENTION_REASONS = frozenset(
         "runner-stopped",
     }
 )
+
+CURRENT_WORK_STATES = frozenset(
+    {"open", "active", "suspended", "waiting_supervisor", "waiting_review",
+     "waiting_user", "user_needed", "completed"}
+)
+
+
+def is_successful_completion(
+    *,
+    state: object,
+    attempt_state: object,
+    latest_cao_review: object,
+    pending_supervisor_boundary: bool,
+    recovery_action: object,
+) -> bool:
+    """Classify a settled result identically during selection and presentation."""
+
+    return bool(
+        state in {"waiting_user", "completed"}
+        and attempt_state == "completed"
+        and latest_cao_review == "ok"
+        and not pending_supervisor_boundary
+        and recovery_action is None
+    )

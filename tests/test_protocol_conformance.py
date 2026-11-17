@@ -943,6 +943,8 @@ def test_stdio_proxy_keeps_reading_until_a_long_lived_subscription_is_cancelled(
 
     class Client:
         def __init__(self, *args, **kwargs):
+            import httpx
+            self.timeout = httpx.Timeout(kwargs.get('timeout', 120))
             del args, kwargs
 
         async def __aenter__(self):
@@ -1038,6 +1040,8 @@ def test_stdio_proxy_progress_request_can_be_cancelled_without_blocking_input(
 
     class Client:
         def __init__(self, *args, **kwargs):
+            import httpx
+            self.timeout = httpx.Timeout(kwargs.get('timeout', 120))
             del args, kwargs
 
         async def __aenter__(self):

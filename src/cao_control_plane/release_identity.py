@@ -30,9 +30,11 @@ def _release_files(package_root: Path) -> tuple[Path, ...]:
         relative = candidate.relative_to(package_root)
         if "__pycache__" in relative.parts:
             continue
-        if candidate.name != "py.typed" and candidate.suffix not in _TRACKED_SUFFIXES:
-            continue
         info = candidate.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if candidate.name != "py.typed" and candidate.suffix not in _TRACKED_SUFFIXES and relative.parts[0] != "runtime_hooks":
+            continue
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise RuntimeError("release content contains an unsupported file identity")
         files.append(candidate)

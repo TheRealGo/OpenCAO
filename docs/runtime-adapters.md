@@ -1,5 +1,34 @@
 # Managed Worker transport
 
+## Owner-local publication constraints
+
+`runtime.worker_publication_forbidden_terms` is an optional owner-local array
+of private names. It is not forwarded into purposes or task packets. For managed
+Claude launches, a session-local Git hook path checks actual staged additions,
+commit messages and all newly pushed commits, including an intermediate commit
+whose text was removed at the tip. Deleted lines do not block a correction.
+Existing executable repository hooks still run; no repository or user-level
+configuration is edited. Diagnostic reads and private evidence remain available.
+
+The launch-local `gh` command checks actual public-text arguments, body files
+and stdin, including calls from scripts. Body files are forwarded as the same
+checked bytes, rather than reopened after validation. Claude's native
+`PreToolUse` checks GitHub/Slack MCP text parameters and ordinary Git bypass
+options. Its native Bash filter is best-effort, so the handler only parses
+commands containing a possible explicit Git hook override, including quote-joined
+spellings. Unrelated local shell preparation is not publication input; quoted
+heredoc contents must not fail a general shell parse before the command runs.
+Actual publication bytes remain checked by the Git hooks and `gh` command.
+Missing or unreadable publication input is
+rejected before submission with a generic explanation and no approval prompt.
+Automatic title/body generation is not a checked payload: use explicit text.
+The native hook uses `onFailure: block` and requires Claude Code 2.1.295 or newer.
+These boundaries prevent accidental disclosure on those supported paths; they
+are not a sandbox for arbitrary scripts/network clients or protection against
+deliberate hook bypass. Empty configuration leaves launch behavior unchanged.
+Post-update E2E must prove both rejection and clean continuation on the installed
+provider; a saved setting or a clean assignment alone proves neither.
+
 Normal operation is `user ↔ existing CAO conversation ↔ cao_control_plane
 MCP/A2A ↔ Worker`. This page documents only the managed Worker transports on
 that path. A runtime registration binds one principal to its scoped delivery
@@ -22,14 +51,40 @@ database state change. MCP, A2A, and CAO service commits use the Database's
 canonical commit generation, so idle operation does not repeatedly inspect
 deliveries, terminals, panes, process trees, composers, or silence.
 
-`dispatcher_recovery_scan_seconds` is a bounded recovery deadline for
-cross-process SQLite writers and time-based lease/expiry recovery; it is not a
-worker or terminal polling interval. Its default is 30 seconds and its
-environment form is `CAO_A2A_DISPATCHER_RECOVERY_SCAN_SECONDS`.
+The owner-local native adapter consumes the official `thread/status/changed`
+stream after a read-only attachment. Token streaming does not cause repeated
+head reads. The adapter never resumes a writer or reads transcript bytes.
+One real status transition renews the relevant recovery observation; the supported
+native history API must still prove exact input identity and terminal chronology.
+A conversation owned by another native host uses OS filesystem change events
+on its provider-issued path; these are only hints and never transcript reads.
+The supported history API verifies a changed terminal head with chronology before
+renewing supervision. Native `kqueue` on macOS and `inotify` on Linux also report
+cross-process database writes; SQLite `data_version` verifies an actual commit
+before waking the Dispatcher. There is no filesystem polling fallback.
+Connection loss triggers connection recovery with backoff; it does not create a
+new requester grant or repeat an unknown effect.
 
-SQLite exposes no portable cross-process commit subscription. A separate
-process modifying the same database may therefore wait until the bounded
-recovery deadline; same-process service commits wake the Dispatcher promptly.
+There is no scheduled recovery scan. The Dispatcher waits for a commit, a native
+head transition, a claimed job's completion, or the next actual persisted retry,
+lease or observation deadline. `dispatcher_recovery_scan_seconds` remains accepted
+in older configuration files for compatibility and no longer schedules scans.
+A healthy idle subscription may wait indefinitely; old cycle timestamps alone do
+not make that wait unhealthy. Subscription failure is diagnosed separately from
+ordinary command and lifecycle authority.
+Native subscription connection and replies use the configured
+`runtime_mcp_startup_timeout_seconds`; initialization is covered with real
+Settings in addition to isolated transition tests.
+
+Instruction review reports real source/model progress through request-scoped MCP
+progress notifications. HTTP relay reads have no independent model-computation
+wall timeout; connection and write deadlines still apply. Managed native MCP
+bridges use the existing Worker inactivity allowance for tool calls. A lost
+client response does not cancel or replay an admitted canonical command. Once
+its actual result exists, one deduplicated notice targets only the exact active
+originating conversation attachment. It requests canonical readback and
+continuation; it never claims that an error proves no effect occurred.
+
 Long-running Worker turns occupy only their own concurrency slots. The
 background Dispatcher retains those active jobs and immediately refills free
 slots after a database commit, so a milestone report or later assignment does
@@ -60,11 +115,13 @@ queue. Recovery later reads the exact thread plus every page of that queue and
 matches only the Delivery's stable client-message identity. A matching queued
 item on `notLoaded` resumes that same thread; a missing item on `active` is the
 running turn. A missing item on `idle` or `notLoaded` means Codex consumed the
-item but no Control Plane reasoner turn incorporated it. The first such
-observation is recorded durably, and only a second observation after the
-bounded recovery interval supersedes that Delivery and creates one successor
-wake. This separates an actual lost turn from the non-atomic queue/start edge,
-without resubmitting raw input or producing periodic messages. An unsupported
+item but no Control Plane reasoner turn incorporated it only when an exact
+persisted terminal turn also proves the input identity, terminal status and
+completion chronology. One such authoritative observation records that proof and
+atomically supersedes the consumed Delivery with one successor wake, after the
+transaction rechecks current attachment/Delivery generations and incorporation.
+Idle alone, missing timestamps, silence or a second unchanged read adds no proof.
+An unsupported
 queue response is a bounded delivery failure and never
 falls back to resume or a direct turn. Failure before queue submission leaves
 the attachment active and retries the exact Delivery with bounded backoff;
@@ -95,11 +152,20 @@ capture fencing, explicit failure/partial states, audited content reads and
 CAO Review authority. Legacy adapters without capture still use the typed
 completed-turn reconciliation boundary; no adapter persists raw output into
 runtime diagnostics.
+Later structured reports may reference the same incorporated instruction after
+its first report handles it. The exact task packet, Attempt, runtime lane and
+acknowledgement receipt still match; the original handling timestamp and event
+remain unchanged. Repeating that reference never reapplies the instruction.
 The authoritative origin of that completed provider turn is the runtime's
 allowlisted `last_dispatch_message_id` plus its single matching
 `runtime.message_delivered` event, never whichever Delivery happens to have the
 greatest sequence. A later settled status request cannot hide that turn; a later
 unsettled Worker command still blocks reconciliation until its outcome is known.
+An inbox input acknowledged during that exact provider turn is settled when
+its ACK event precedes the provider's completion event in durable event order.
+This also repairs retained receipts after an upgrade. It does not replay the
+consumed input or claim Work completion. Later queued inputs keep their own
+turn; missing or post-completion ACK evidence keeps its existing fence.
 
 An existing CAO conversation is attached idempotently by its exact principal,
 native thread, project digest, model, and sandbox. Repeating that exact request
@@ -131,7 +197,24 @@ Worker heartbeats renew only the generation-bound lease and runtime state;
 they cannot add or rewrite durable runtime metadata, launch commands, or
 environment values.
 
-MCP/app-server startup has its own short deadline. After a managed Worker has
+MCP/app-server startup has its own short deadline. The managed server receives
+that same configured startup budget; an implicit provider default cannot impose
+a shorter hidden timeout. Only `ready` for the exact thread/server establishes
+readiness. An exact `failed` state stops before input submission with
+`mcp_startup_failed`; transient cancellation may still progress to ready within
+the deadline. Failures retain only the bounded last startup state and supported
+authentication reason, never arbitrary provider errors or native locators.
+When a retained thread has no matching ready transition, the adapter also makes
+one bounded `mcpServerStatus/list` request for that exact thread and managed
+server. Only a current `connected` runtime with a usable tool catalog and no
+discovery error establishes readiness. A cached catalog with null runtime state,
+another server, an empty catalog, or a Control Plane heartbeat is insufficient.
+The read shares the existing startup deadline and does not poll or reset it.
+Unavailable status reads retain the notification path. Failure diagnostics keep
+only fixed probe status/catalog enums; successful retained dispatch records its readiness
+source. Release E2E must cover later inputs on the same retained Worker and native
+history across new process/broker launches, as well as initial activation.
+After a managed Worker has
 authenticated, its turn has no global 120-second wall-clock limit by default.
 Ordered heartbeat sequence changes and the exact Attempt's durable structured
 report sequence renew an in-memory activity lease; unchanged activity beyond
@@ -151,6 +234,19 @@ new launch generation. `waiting` therefore means a previously verified but
 currently quiescent runner, not a live connection. A new delivery is not exposed
 to the runner until the replacement bridge has authenticated and heartbeated.
 
+A late failed provider exit belongs to its exact input, Work and Attempt. If
+that input was durably received and its Work or Attempt has already ended,
+retire only the ended launch credential and return the verified route to
+`waiting`. Preserve the failed result without failing independently queued
+Work or rewriting its sealed packets. Its next launch performs normal MCP
+enrollment. Current execution failures and typed provider capacity limits
+retain their usual recovery paths; a stale enrollment generation cannot
+overwrite a newer launch.
+Output capture still rejects a retired Work or dispatch generation. If that
+rejection also prevents recording the provider's failure terminal, continue
+with the exact dispatch result settlement; do not leave the ended launch
+`busy`, publish stale output as current evidence, or fail another queued Work.
+
 This is a durable logical Worker lifecycle, not a requirement to retain an
 idle OS process. For Codex, a replacement launch resumes the recorded native
 thread and injects the scoped MCP server only for that thread. The Worker
@@ -160,35 +256,123 @@ daemon restart, crash, explicit stop, or lease expiry cannot be mistaken for a
 completion report. Stop/revocation fences the credential, and a new launch is
 allowed only through a fresh ticket, discovery, and heartbeat.
 
+Before loading a retained Codex thread, the adapter reads its persistent queue.
+Any prior input remains untouched and produces `runtime_thread_queue_blocked`
+before the new Assignment is submitted. After scoped MCP authentication, the
+exclusive headless Worker uses the official `turn/start` request with the exact
+stable Delivery client identity, model and effort. The Control Plane already
+owns its durable ordered inbox. Worker dispatch never submits through
+`thread/queue/add` or `thread/queue/start`, and has no queue fallback. The shared
+Desktop CAO notification queue has its separate transport contract above.
+
+The successful response to that exact `turn/start` request names the created
+Turn and is provider activation evidence. A matching streamed `userMessage`
+may also bind the same Turn; contradictory identities are refused. Input
+preparation, hooks or compaction may delay that item event after activation.
+The bounded startup deadline applies until activation is established, rather
+than interrupting an already started Turn while waiting for that later event.
+A heartbeat or empty ACK cannot establish activation. Activation remains
+separate from the Worker's evidence-bearing `execution_started` report and
+business completion. The [official App Server contract](https://learn.chatgpt.com/docs/app-server)
+describes the `turn/start` response and streamed lifecycle separately.
+
+Lost or ambiguous submission responses preserve the unknown Delivery without
+resubmission. After Dispatcher replacement, an overdue assigned dispatch with
+no observed start/report/output receives one CAO notice. A retained live bridge
+with an expired dispatch lease leaves Work/Attempt generations, runtime authority
+and native input unchanged; a late authenticated report remains admissible.
+An authoritatively terminal enrollment uses its separate reconciliation Boundary.
+The Dispatcher maintains bounded read-only diagnosis after a notice is handled.
+It correlates the exact Assignment's opaque client identity with the persistent
+queue and paginated persisted user-message turn identities. Historical queue
+receipts remain evidence, never a reason to replay their input through the new
+Worker transport. `cao_get_work.current_attempt.activity.provider_start_diagnosis`
+exposes the fixed diagnosis, input state, presence of other pending input and
+whether bounded history completed. Absence or a partial scan never proves
+non-execution. Terminal input observation requires actual completion chronology.
+Diagnosis never activates, resumes, removes or resubmits input. Changed evidence
+wakes CAO once; unchanged evidence remains quiet across restart. Finish, a newer
+Attempt or an authenticated Worker report makes stale probe results inert.
+
+An idle desktop view may retain a native thread's writer after the managed
+process exits. A structured writer-conflict response admits one provider-handle
+repair only after an empty native queue, one exact persisted terminal turn with
+completion chronology, and the dispatch's current Work/Worker/generation/effect
+fences are verified. The adapter forks history through that terminal turn with
+goal continuation deferred, injects the fresh scoped MCP, and commits the new
+private handle before submitting the current instruction. The logical Worker,
+purpose, Work, packets, model, effort and verified Directory stay bound. The
+source writer is never killed and its history stays intact. Running or unknown
+turns, pending input, an accepted current input, a competing execution, or an
+unknown effect forbid this repair. The failed unbound fork alone is disposable.
+Ordinary same-thread reconciliation never grants permission to fork an unknown
+execution or replay its effects.
+
+A failure proven before input submission retains its native-handle observation
+only as audit evidence, without binding an unpersisted `thread/start` handle as
+the runtime's resumable thread. Submitted or unknown input still retains its
+native context even when no Turn ID was observed. For retained records, a subsequent
+authoritative `runtime_thread_not_found` before input submission may replace
+that handle in the next fenced connection epoch only when normal managed
+creation and exact non-submission receipts cover every historical Attempt.
+Any accepted/unknown input, Worker report, provider Turn, substantive output,
+effect, active credential or pending launch ticket refuses this repair. It
+preserves the logical Worker, purpose, packets and old runtime/delivery records;
+it never reconstructs used history, replays an old Assignment or bypasses the
+current command's admission.
+
+`wait_system` retains both admission supervision and bounded read-only provider
+diagnosis, including non-empty `worker_command_outcome_unsettled` fences and
+legacy empty-blocker records. An execution fence must never exclude the very
+diagnosis needed to resolve it. Only actual admission changes re-arm an exact
+Worker-command Boundary. Changed provider evidence can independently deliver
+one non-blocking diagnostic notice to CAO while that command remains forbidden;
+it does not change the held Boundary, Work generation or unknown outcomes.
+CAO must choose an admitted concrete recovery operation or separately authorized
+lifecycle/handoff, rather than wait for the same unknown input to resolve itself.
+
+Read-only diagnosis distinguishes launch/transport failure, timeout, RPC
+rejection, missing/archived/unloaded native threads and the exact failed probe
+stage. An unloaded thread is a blocked observation, not proof that its input
+never executed and not permission to resume it while diagnosing. A diagnosis
+that remains unavailable updates bounded evidence quietly; it never re-arms a
+Worker decision or changes the held Work/Boundary generation. Changed usable
+provider observations still allow the existing generation-fenced CAO decision.
+
+Only fixed codes and an opaque fingerprint of release, exact client identity,
+provider, queue and terminal-turn evidence are durable. The fingerprint and
+public diagnosis are scoped to the exact Work and Attempt, so one Work's earlier
+diagnosis cannot suppress another Work's recovery. Unchanged evidence stays
+quiet across restart and repeated holds. Candidate pagination prevents older
+holds from starving later ones. Technical recovery needs no renewed requester
+approval, and diagnosis never establishes execution or business completion.
+
+Provider stderr is discarded at the adapter boundary instead of being left
+in an unread pipe. JSON-RPC errors become fixed operational codes immediately;
+provider bodies, prompts, native locators and credentials cannot enter runtime
+diagnostics, the Dashboard or recovery notifications.
+
 ## Live vendor acceptance
 
-The ordinary suite uses HTTP, SQLite, stdio MCP, and process boundaries without
-model inference. The public macOS + Codex release additionally uses this actual
-opt-in test (Codex Desktop must be running and signed in):
+The normal suite uses real HTTP, SQLite, the stdio MCP bridge, and real runner
+process boundaries without spending model-plan capacity. Release acceptance for
+the managed runner path additionally requires the opt-in live test:
 
 ```bash
 env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY \
   CAO_RUN_LIVE_VENDOR_E2E=1 \
-  python -m pytest -s tests/test_public_codex_install.py
+  CAO_LIVE_CLAUDE_ROOT=/absolute/allowed/claude/root \
+  CAO_LIVE_CLAUDE_CWD=/absolute/allowed/claude/root/empty-test-workspace \
+  uv run --extra dev pytest -q tests/test_vendor_model_mcp_e2e.py
 ```
 
-The test refuses API-key authentication and verifies ChatGPT subscription
-login. It creates fresh private configuration, launches the local Control Plane
-and Dashboard, attaches a disposable native Codex conversation via the real
-stdio bridge, and instructs a real managed Codex Worker through New/Instruct.
-The model receives only a bounded no-effect exact-marker objective; it must
-enroll through managed MCP and produce provider-captured output.
-
-A deterministic supervisor fixture reads the full captured result, compares the
-marker, records review before completion disposition, and then records the
-fixture's separately preauthorized requester decision. The authenticated
-Dashboard must show the result. Worker deletion and native fixture archival run
-in cleanup. This verifies the integration and acceptance transitions; it does
-not claim to evaluate a CAO model's independent judgment. Claude is not required
-for this public target. Without explicit opt-in this test is skipped, not passed.
-
-The Desktop-bundled executable takes precedence over an unrelated `codex` on
-PATH, keeping Worker transport aligned with the installed Desktop queue API.
+The test refuses API-key authentication. It requires the installed Codex CLI
+to report ChatGPT subscription authentication and Claude Code to report a
+`claude.ai` subscription, then gives each real model one tiny task. Each model
+must discover the managed MCP server, read and acknowledge its assignment,
+submit an exact completion claim, and reach CAO review plus requester
+acceptance. The resulting runtime credential must remain absent from durable
+state and captured output.
 
 ## Codex App Server
 
@@ -260,11 +444,19 @@ adapter does not call `config/read` to reconstruct the table, because effective
 MCP configuration can contain credential values, and it does not edit global
 or project Codex configuration. App Server therefore continues to enforce each
 preserved server's `enabled_tools`, `disabled_tools`, OAuth state, and tool
-approval policy. CAO auto-approves only its generation-bound managed alias; an
-interactive approval from another server is still declined rather than silently
-granting a remote effect. This also prevents another app-server scope from
-consuming the one-shot enrollment capability before the assigned thread starts
-its bridge.
+approval policy. For an owned CAO conversation bridge, its additive override
+explicitly approves only `cao_delete_worker_thread` and `cao_close_conversation`.
+These local lifecycle calls retain the Control Plane's authentication, scope and
+exact-intent checks; their MCP client policy must not require an interactive
+approval when execution uses `approval_policy=never`. An existing native CAO
+conversation uses the equivalent owner-local project tool policies. This changes
+no Worker bridge, shell/file permission, other server, or external-effect grant.
+The [Codex MCP tool policy](https://learn.chatgpt.com/docs/extend/mcp#other-configuration-options)
+supports these per-tool approval overrides. CAO auto-approves only its
+generation-bound managed alias; an interactive approval from another server is
+still declined rather than silently granting a remote effect. This also prevents
+another app-server scope from consuming the one-shot enrollment capability before
+the assigned thread starts its bridge.
 
 Command, file, permission, and unknown approval requests are declined. The
 adapter accepts only the MCP-tool approval emitted for the exact injected
@@ -345,3 +537,20 @@ ticket exchange route; exchange is confined to the process-bound local broker.
 The broker uses process identity only to authenticate the one-time launch
 handoff. It does not monitor the Worker, infer progress from processes, inspect
 terminal output, or replace MCP reports as the supervision source of truth.
+
+
+### Recovery capability across diagnostic holds
+
+A diagnostic `wait_system` and its automatic successor preserve the original
+runtime-recovery class and failure reason. Re-arming a decision does not replace
+a proven pre-submission continuation with generic reconciliation. Older generic
+successors can recover that class only through the exact server-recorded causal
+chain, with the same Work, Attempt and packet and an earlier wait-system decision.
+All current runtime, enrollment, Delivery and effect fences are checked again;
+restoring the recovery class never submits input or makes an unknown outcome safe.
+
+Exact versioned non-submission evidence is distinct from an unmatched input.
+The read-only provider diagnosis reports `runtime_assignment_not_submitted` only
+when the canonical Message/runtime/Delivery-generation proof agrees with the
+queue and complete structured history. A matching queued or historical input is
+a conflict, not permission to replay. CAO owns any subsequent correction.

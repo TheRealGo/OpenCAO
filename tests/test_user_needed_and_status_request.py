@@ -165,6 +165,87 @@ def test_later_worker_report_handles_acknowledged_instruction_and_unblocks_lane(
     ]
 
 
+@pytest.mark.parametrize("first_kind", ["progress", "artifact"])
+@pytest.mark.parametrize("later_kind", ["progress", "blocker"])
+def test_later_report_can_reference_the_same_handled_instruction(
+    system: dict, first_kind: str, later_kind: str,
+) -> None:
+    service = system["service"]
+    suffix = f"handled-reference-{first_kind}-{later_kind}"
+    work, instruction = _correct_with_worker_instruction(system, suffix)
+    attempt = work["current_attempt"]
+    first = ReportInput(
+        kind=first_kind,
+        expected_goal_version=work["goal_version"],
+        expected_goal_packet_digest=attempt["goal_packet_digest"],
+        expected_task_packet_digest=attempt["task_packet_digest"],
+        expected_generation=work["generation"],
+        summary="The correction is incorporated in this saved result.",
+        incorporated_message_ids=[str(instruction["id"])],
+        idempotency_key=f"{suffix}:first",
+    )
+    service.report(system["worker"], attempt["id"], first)
+    before = dict(service.db.fetchone(
+        "SELECT * FROM message_deliveries WHERE message_id = ? AND recipient_id = ?",
+        (instruction["id"], system["worker"]["id"]),
+    ))
+    assert before["state"] == "handled" and before["acknowledged_at"]
+
+    service.report(system["worker"], attempt["id"], ReportInput.model_validate({
+        **first.model_dump(),
+        "kind": later_kind,
+        "summary": "A later report retains the same incorporated correction.",
+        "idempotency_key": f"{suffix}:later",
+    }))
+
+    after = dict(service.db.fetchone(
+        "SELECT * FROM message_deliveries WHERE message_id = ? AND recipient_id = ?",
+        (instruction["id"], system["worker"]["id"]),
+    ))
+    assert after == before
+    events = service.db.fetchall(
+        "SELECT id FROM events WHERE aggregate_id = ? AND event_type = 'message.handled'",
+        (instruction["id"],),
+    )
+    assert len(events) == 1
+    reports = service.db.fetchall(
+        "SELECT payload_json FROM messages WHERE attempt_id = ? AND sender_id = ? "
+        "AND kind IN ('progress', 'artifact', 'blocker') ORDER BY sequence",
+        (attempt["id"], system["worker"]["id"]),
+    )
+    assert all(json.loads(row["payload_json"])["incorporated_message_ids"] == [instruction["id"]]
+               for row in reports)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("runtime_session_id", None),
+    ("acknowledged_at", None),
+    ("state", "queued"),
+    ("state", "dead"),
+])
+def test_repeated_instruction_reference_keeps_receipt_and_lane_fences(
+    system: dict, field: str, value: str | None,
+) -> None:
+    service = system["service"]
+    suffix = f"handled-fence-{field}-{value}"
+    work, instruction = _correct_with_worker_instruction(system, suffix)
+    _report_corrected_progress(system, work, suffix,
+                               incorporated_message_ids=[str(instruction["id"])])
+    service.db.execute(f"UPDATE message_deliveries SET {field} = ? WHERE message_id = ?",
+                       (value, instruction["id"]))
+    before = service.db.fetchone("SELECT COUNT(*) AS count FROM messages")["count"]
+
+    with pytest.raises(ConflictError, match="acknowledged on this runtime lane"):
+        _report_corrected_progress(system, work, suffix + ":later",
+                                   incorporated_message_ids=[str(instruction["id"])])
+
+    assert service.db.fetchone("SELECT COUNT(*) AS count FROM messages")["count"] == before
+    assert len(service.db.fetchall(
+        "SELECT id FROM events WHERE aggregate_id = ? AND event_type = 'message.handled'",
+        (instruction["id"],),
+    )) == 1
+
+
 @pytest.mark.parametrize("report_kind", ["progress", "artifact"])
 def test_unrelated_report_does_not_handle_acknowledged_instruction(
     system: dict,
@@ -434,6 +515,7 @@ def test_non_wait_boundary_disposition_replays_a_pre_resume_condition_digest(
     disposed = service.dispose_boundary(system["cao"], boundary["id"], request)
     legacy_fields = request.model_dump(mode="json")
     legacy_fields.pop("resume_condition", None)
+    legacy_fields.pop("requester_input_kind", None)
     legacy_digest = hashlib.sha256(
         json.dumps(
             legacy_fields,
@@ -822,8 +904,8 @@ def test_overdue_unclaimed_assignment_opens_one_runtime_recovery_boundary(
             reason="The unclaimed Assignment exceeded its bounded delivery deadline.",
         ),
     )
-    assert disposition["kind"] == "wait_user"
-    assert service.get_work(work["id"])["state"] == "user_needed"
+    assert disposition["kind"] == "wait_system"
+    assert service.get_work(work["id"])["state"] == "waiting_supervisor"
 
     # Defense in depth: even if a stale database writer re-queues the old
     # Assignment after recovery, the Dispatcher must bind launchability to the

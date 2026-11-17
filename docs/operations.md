@@ -50,7 +50,21 @@ pending push deliveries. Those counts support unauthenticated readiness
 diagnosis; they reveal no owner capability and do not, by themselves, make the
 Dispatcher cycle unhealthy. Use `cao-a2a doctor` for the deeper outcome gate.
 
+A live idle Dispatcher waits for an actual commit, native event, or persisted
+deadline without periodic scans. That wait remains healthy even when the last
+cycle is old. Resuming it updates `last_cycle_at` before cancellation cleanup
+and the next scan, so those steps receive the same existing stale-time budget.
+A stalled resumed cycle still becomes unhealthy when that budget expires;
+stopped Dispatchers and recorded errors remain unhealthy independently.
+
 ### `cao-a2a doctor` outcome contract
+
+Doctor reads one committed SQLite snapshot through the existing read-only
+connection path. It remains usable while another WAL writer is active and
+never initializes or migrates the database, creates missing state, repairs
+permissions, expires runtime leases, or schedules recovery. Permission faults
+are reported as observed; lease expiration remains the Dispatcher/runtime
+lifecycle's responsibility. A missing database is a diagnostic failure.
 
 `ok=false` and exit status 1 mean at least one blocking condition, integrity
 failure, or permission failure exists. `ok=true` returns exit status 0, but
@@ -78,9 +92,17 @@ green diagnostic.
 never creates or migrates the source schema. It validates the owner-only CAO
 application/schema identity and integrity, uses SQLite online backup into a
 private temporary file, verifies the backup identity, fsyncs it, atomically
-replaces the destination and fsyncs the containing directory. The controlled
-Dashboard lifecycle upgrade uses the same primitive with replacement disabled
-for its plan-bound final backup. Upgrade preflight also requires the loaded
+replaces the destination and fsyncs the containing directory. The
+default destination is `backups/control-plane-latest.sqlite3`: an explicit
+backup replaces that one file instead of accumulating timestamped copies.
+An explicitly supplied destination remains an operator-selected backup.
+The controlled Dashboard lifecycle upgrade uses the same primitive with replacement disabled
+for its plan-bound temporary rollback copy. After all service readiness gates
+and any requested Codex reload succeed, it verifies the exact file identity
+and SHA-256, deletes only that copy, and returns `backup_retained=false`.
+A failure or unknown outcome before that point preserves the copy for an
+explicitly reviewed recovery. Unrelated or replaced files are never removed.
+Upgrade preflight also requires the loaded
 Control Plane arguments to match the reviewed plist and its single explicit
 owner-only config to contain an absolute `state_dir` resolving to that same
 plan-bound database; defaults, tilde-relative values, and environment
@@ -101,6 +123,14 @@ Restore only while the daemon is stopped:
 5. start the daemon and check `/ready`.
 
 ## Retention
+
+Retain the minimum state required for current authority, exact replay fences,
+unfinished work, and concise failure diagnosis. Prefer a targeted read from
+the canonical source to an additional transcript, report dump, or database
+copy. Development evidence must not retain whole database snapshots after a
+successful update or copy logs into multiple evidence directories. Do not
+export organization records to cloud storage without explicit authority for
+the exact data and organization. Provider selection alone is not export authority.
 
 `cao-a2a prune` removes handled old messages and old events only after excluding
 durable authority that remains executable. The exclusions are deliberately
@@ -165,7 +195,13 @@ unchanged notification input must all match before it uses the official
 Handled and terminal-dead Deliveries retain all their recorded state; only
 their obsolete native wake is removed. An accepted informational wake may be
 superseded only after the provider confirms deletion and a later Boundary
-notification for the same sealed task still exists. Worker output receipts,
+notification for the same sealed task still exists. An accepted purpose wake
+may also be superseded when its exact durable continuation has advanced to a
+recorded next action, observation/input wait, pause, achievement, or revised
+purpose. This includes an older-generation wake while a newer decision is
+pending; the current-generation pending wake remains actionable. The same
+queue admission, unchanged input, exact identity and confirmed-deletion rules
+apply. Worker output receipts,
 message payloads, purpose, Review and disposition records remain intact; queue
 cleanup never manufactures a read, ACK, handled receipt or acceptance. Current
 unread output, actionable boundaries, unknown dispatches, other attachments,
@@ -185,6 +221,18 @@ text and private locators are never returned. A later scan with no obsolete
 notifications clears the transient diagnostic; durable unknown removal evidence
 remains intact. Cleanup failure does not block ordinary Worker delivery,
 attachment, or lifecycle authority.
+
+An exact provider response that a historical native thread is archived or has
+no retained rollout means its queue cannot currently be reconciled. The
+Dispatcher preserves that Delivery and any unknown removal outcome without
+reporting a live provider failure, restoring the thread, or replaying input.
+Other provider failures retain their bounded diagnostic. Only an actual queue
+deletion response can record a cancellation receipt.
+
+HTTP authentication runs in FastAPI's worker pool, as do integrity and
+projection reads. A database wait in one authenticated request must not hold
+the event loop or delay an independent health request. Credential validation
+and protocol, role and conversation-scope restrictions remain per request.
 
 `cao-a2a effect run` computes the exact argv and working-directory digests,
 reserves authority, executes without a shell, and records only an exit code and
@@ -231,4 +279,7 @@ that the running system can enter.
 
 ## Logging and audit
 
-Uvicorn logs process and HTTP failures. Domain history, message delivery, task transitions and effect authority are durable database records and should be inspected there rather than reconstructed from log text.
+The Control Plane and Dashboard disable routine Uvicorn HTTP access logging.
+Process and application error logging remains enabled. Domain history, message
+delivery, task transitions and effect authority are durable database records
+and should be inspected there rather than duplicated in log text.

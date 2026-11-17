@@ -58,7 +58,7 @@ def test_fresh_v36_schema_exposes_one_peer_identity_and_no_host_aliases(
 ) -> None:
     database = Database(settings)
     database.initialize()
-    assert SCHEMA_VERSION == 49
+    assert database.fetchone("PRAGMA user_version")[0] == SCHEMA_VERSION
     expected = {
         "cao_session_attachments": set(),
         "cao_attachment_connections": {"peer_pid", "peer_start_signature"},

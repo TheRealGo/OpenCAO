@@ -198,11 +198,16 @@ def test_augment_creates_a_directive_without_rewriting_the_goal(system):
         evidence="base assignment incorporated before its augment",
     )
     messages = service.get_inbox(system["worker"], include_acknowledged=True)["items"]
-    assert any(
-        message["payload"].get("directive_id") == result["directive"]["id"]
-        and message["payload"].get("instruction") == "Include edge-case evidence"
-        for message in messages
+    instruction = next(
+        message for message in messages
+        if message["payload"].get("instruction") == "Include edge-case evidence"
     )
+    assert "directive_id" not in instruction["payload"]
+    persisted = service.db.fetchone(
+        "SELECT json_extract(payload_json, '$.directive_id') AS directive_id "
+        "FROM messages WHERE id = ?", (instruction["id"],)
+    )
+    assert persisted["directive_id"] == result["directive"]["id"]
 
 
 def test_independent_interrupt_and_replace_have_distinct_effects(system):
@@ -605,7 +610,7 @@ def test_expired_reasoner_turn_rearms_exact_boundary_once(system):
 @pytest.mark.parametrize("receipt", [
     "current", "legacy", "corrupt_input", "ordinary_marker", "real_lease", "wrong_kind", "corrupt_result",
 ])
-def test_failed_reasoner_recovery_escalates_without_abandoning_the_objective(system, receipt):
+def test_reasoner_recovery_receipts_preserve_owner_and_validate_integrity(system, receipt):
     service = system["service"]
     work = _create_task(system, "client:reasoner-recovery-exhausted", "Recovery task")
     boundary = service.record_boundary(
@@ -630,6 +635,42 @@ def test_failed_reasoner_recovery_escalates_without_abandoning_the_objective(sys
         expected_generation=work["generation"],
         idempotency_key="first-expiring-reasoner-turn",
     )
+    if receipt == "legacy":
+        # Construct the exact historical system WAIT_USER representation.
+        # New WAIT_SYSTEM receipts must never admit this unwrapped digest.
+        from cao_control_plane.goal_packets import canonical_digest
+
+        decision = service.dispose_boundary(system["cao"], boundary["id"], BoundaryDispositionInput(
+            turn_id=first_turn["id"], lease_token=first_turn["lease_token"],
+            expected_generation=work["generation"], kind="wait_user", reason="Legacy supervision recovery.",
+            instruction="Supply the missing source.", resume_condition="The requested source is available.",
+        ))
+        row = service.db.fetchone("SELECT * FROM boundaries WHERE id=?", (boundary["id"],))
+        request_digest = canonical_digest({
+            "boundary_id": boundary["id"], "reason_code": "supervision_recovery_incomplete",
+            "kind": "wait_user", "origin": "system_supervision_recovery",
+        })
+        result_digest = canonical_digest({
+            "boundary_id": boundary["id"], "disposition_id": decision["id"],
+            "request_digest": request_digest, "goal_packet_digest": row["goal_packet_digest"],
+            "task_packet_digest": row["task_packet_digest"],
+        })
+        with service.db.transaction() as connection:
+            connection.execute("UPDATE boundary_dispositions SET request_digest=? WHERE id=?",
+                (request_digest, decision["id"]))
+            connection.execute(
+                "UPDATE reasoner_turns SET input_digest=?, result_digest=?, idempotency_key=?, "
+                "lease_token_digest=?, completed_at=created_at, lease_expires_at=created_at WHERE id=?",
+                (row["input_digest"], result_digest, f"system-escalation:{boundary['id']}",
+                 canonical_digest(f"system-escalation:{first_turn['id']}"), first_turn["id"]),
+            )
+        prior = dict(service.db.fetchone("SELECT * FROM reasoner_turns WHERE id=?", (first_turn["id"],)))
+        for _ in range(2):
+            reopened = Database(system["settings"])
+            assert dict(reopened.fetchone("SELECT * FROM reasoner_turns WHERE id=?", (first_turn["id"],))) == prior
+        assert service.get_work(work["id"])["state"] == "user_needed"
+        return
+
     with service.db.transaction() as connection:
         connection.execute(
             "UPDATE reasoner_turns SET lease_expires_at = ? WHERE id = ?",
@@ -675,16 +716,17 @@ def test_failed_reasoner_recovery_escalates_without_abandoning_the_objective(sys
         ("recover_expired_reasoner_turn", "dead"),
     ]
     current = service.get_work(work["id"])
-    assert current["state"] == "user_needed"
-    assert current["attention_owner"] == "user"
+    assert current["state"] == "waiting_supervisor"
+    assert current["attention_owner"] == "cao"
     assert current["generation"] == work["generation"]
-    assert current["requester_escalation"]["notification_state"] == "queued"
+    assert current["requester_escalation"] is None
+    assert current["system_recovery"]["notification_state"] == "queued"
     assert current["current_attempt"]["completion_claim"] == {}
     assert service.reconcile_cao_supervision_obligations() == 0
     decision = service.db.fetchone(
         "SELECT kind FROM boundary_dispositions WHERE boundary_id = ?", (boundary["id"],),
     )
-    assert decision["kind"] == "wait_user"
+    assert decision["kind"] == "wait_system"
     assert service.db.fetchone(
         "SELECT 1 FROM boundary_supersessions WHERE boundary_id = ?", (boundary["id"],),
     ) is None

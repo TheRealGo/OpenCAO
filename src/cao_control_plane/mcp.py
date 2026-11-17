@@ -10,7 +10,6 @@ import re
 import sys
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
@@ -31,6 +30,7 @@ from .connection_contract import CAO_CONVERSATION_PROXY_ABI_VERSION
 from .dashboard import DashboardReadModel
 from .dashboard_access import DashboardAccessResult
 from .dashboard_presentation import native_dashboard_snapshot
+from .decision_reports import REPORT_GUIDANCE, REVIEW_GUIDANCE
 from .directory_identity import directory_identity
 from .errors import ControlPlaneError, ValidationError
 from .models import (
@@ -55,6 +55,7 @@ from .models import (
     NewWorkerThreadInput,
     PrincipalCreate,
     PrincipalRole,
+    PurposeNextActionInput,
     QueryInput,
     ReasonerTurnAcquireInput,
     ReportInput,
@@ -78,6 +79,7 @@ from .models import (
 from .projection import sanitize_operator_text
 from .provider_models import model_identifier
 from .release_identity import catalog_digest
+from .response_evidence import public_response_evidence
 from .runtime_enrollment import (
     EnrollmentCapabilityError,
     receive_enrollment_capability,
@@ -88,15 +90,9 @@ from .security import (
     safe_validation_details,
 )
 from .service import ControlPlane
-from .state_read_admission import (
-    READINESS_PROOF_META_KEY,
-    StateReadAdmission,
-    authenticate_readiness_probe,
-    readiness_proof,
-)
 from .supervision_control import evidence_text
 from .supervision_memory import require_memory_safe_payload
-from .worker_purpose import PURPOSE_GUIDANCE
+from .worker_purpose import ALLOCATION_GUIDANCE, PURPOSE_GUIDANCE
 
 MCP_LATEST_VERSION = "2026-07-28"
 MCP_STDIO_VERSION = "2025-11-25"
@@ -109,6 +105,14 @@ _DASHBOARD_SNAPSHOT_RESOURCE = {
 }
 
 HeartbeatTickWaiter = Callable[[asyncio.Event, float], Awaitable[bool]]
+
+SUPERVISION_TRIGGER_GUIDANCE = (
+    "On a notification-only turn, normally process its exact Message and Work. "
+    "A notification does not revoke existing requester direction or conversation authority. "
+    "Answer status-only questions from confirmed information first, without issuing new "
+    "instructions, purpose changes or status requests as a prerequisite. "
+    "After the notified action is settled, end the turn and await the next notification."
+)
 
 
 class DashboardAccessCoordinatorProtocol(Protocol):
@@ -435,6 +439,8 @@ def _instruct_worker_thread_schema() -> dict[str, Any]:
                 "deprecated": True,
             },
             "expected_purpose_version": _integer(minimum=0),
+            "purpose_continuation_id": _string(description="Exact pending purpose continuation to satisfy atomically with this next Work."),
+            "expected_continuation_generation": _integer(minimum=1),
             "maturity": {
                 **_string(enum=["unset", "exploring", "defined"]),
                 "default": "unset",
@@ -519,13 +525,30 @@ def _boundary_disposition_contract(
     """
 
     properties = schema["properties"]
+    checkpoint = BoundaryDispositionInput.model_json_schema()
+    properties["next_action"] = checkpoint["properties"]["next_action"]
+    schema.setdefault("$defs", {}).update(checkpoint.get("$defs", {}))
+    properties["next_action"]["description"] = (
+        "Required with accept for a registered Worker purpose. Commit the next sealed instruction, "
+        "an existing successor, verified purpose achievement, concrete wait or requester-directed pause "
+        "in the same transaction as acceptance. Do not postpone the Next decision."
+    )
     properties["instruction"]["description"] = (
         "The concrete requester advice or decision needed for wait_user; must be empty for pause; "
         "optional otherwise."
     )
     properties["resume_condition"]["description"] = (
-        "Required and non-blank when kind is wait_user or pause; must be empty otherwise."
+        "Required and non-blank when kind is wait_user, wait_system or pause; must be empty otherwise."
     )
+    properties["requester_input_kind"] = {
+        "type": ["string", "null"],
+        "enum": ["new_authority", "budget", "business_direction", "private_information", None],
+        "description": (
+            "For wait_user on a technical recovery only: the concrete new requester input required. "
+            "Routine diagnosis, reconnecting and safe recovery never require approval. "
+            "Omitting this on a recovery commits wait_system under CAO ownership instead."
+        ),
+    }
     properties["reason"]["description"] = (
         "Reason for the exact decision. Pause requires a concrete non-blank reason."
     )
@@ -631,7 +654,7 @@ CONVERSATION_NEW_WORKER_THREAD_TOOL = _tool(
     "existing Directory without inventing a Goal or first Work. The Directory is "
     "owner-private and is never returned or placed in Control Plane task state. "
     "Use cao_instruct_worker_thread as a separate task operation when the requester "
-    "later assigns bounded Work.",
+    "later assigns bounded Work. " + ALLOCATION_GUIDANCE,
     _new_worker_thread_schema(),
     annotations=_local_tool_annotations(read_only=False, idempotent=True),
 )
@@ -645,7 +668,7 @@ CONVERSATION_INSTRUCT_WORKER_THREAD_TOOL = _tool(
     "Worker. Read its business purpose in cao_list_managed_workers before each "
     "instruction and confirm expected_purpose_version. Define an unset business purpose "
     "with cao_set_worker_purpose from the requester direction. A task or constraint "
-    "cannot define or revise business purpose.",
+    "cannot define or revise business purpose. " + ALLOCATION_GUIDANCE,
     _instruct_worker_thread_schema(),
     annotations=_local_tool_annotations(read_only=False, idempotent=True),
 )
@@ -654,12 +677,33 @@ CONVERSATION_SET_WORKER_PURPOSE_TOOL = _tool(
     "cao_set_worker_purpose",
     "Define or explicitly revise the enduring business purpose entrusted to one exact Worker. "
     "Use requester business direction, never an immediate task, output format, or handoff. "
+    "Explain the stable desired state and the background that makes it needed, within the "
+    "entrusted scope. A method change, checkpoint or fulfillment of an existing approval "
+    "condition does not change that state. Keep current task details in the task context. "
     "Read current purpose before revision and confirm its version (0 only for initial definition). "
     "Require contract.outcome, scope, criteria (stable id, condition, evidence), completion, "
     "authority and unmet_action. Fix them before delegation; criterion changes require requester "
     "direction and a new version. This does not instruct the Worker, rewrite old tasks, change "
     "lifecycle, or mark purpose achieved. Read affected tasks' purpose_alignment afterward.",
     _memory_request_schema(SetWorkerPurposeInput),
+    annotations=_local_tool_annotations(read_only=False, idempotent=True),
+)
+
+CONVERSATION_PURPOSE_NEXT_ACTION_TOOL = _tool(
+    "cao_record_purpose_next_action",
+    "Record the next decision for an accepted checkpoint's enduring purpose. Read "
+    "cao_get_work.purpose_continuations and confirm its generation and current purpose version. "
+    "Continue with an exact committed unsettled Work, record purpose achievement with evidence "
+    "for every fixed criterion, or save a concrete observation time or missing requester input. "
+    "Ordinary next Work needs no repeated requester approval. Technical recovery remains CAO-owned. "
+    "This does not revise purpose, accept for the requester, or Finish a Worker. Prefer passing "
+    "purpose_continuation_id and expected_continuation_generation to cao_instruct_worker_thread "
+    "to commit the next sealed Work and this decision atomically. CAO owns purpose waits, "
+    "achievement and pause/resume judgments; only an actual next Worker instruction receives "
+    "independent purpose alignment review. Pause/resume require "
+    "observed requester direction; Worker Finish/Delete is separate and cannot silently pause "
+    "or complete the purpose.",
+    _memory_request_schema(PurposeNextActionInput),
     annotations=_local_tool_annotations(read_only=False, idempotent=True),
 )
 
@@ -724,13 +768,13 @@ CONVERSATION_BOUNDARY_DISPOSITION_TOOL = _tool(
     "dispose_continue_or_correct or reconcile_continue_same_thread. The first covers "
     "proven launch failures and a proven pre-MCP provider limit; the second preserves "
     "an unknown post-MCP outcome and appends an inspect-first continuation to the exact "
-    "provider-native thread. A non-executable system_reconciliation requires wait_user, "
-    "preserving unfinished Work and unknown-effect fences while asking the requester "
-    "for concrete advice. Fail cannot terminate unfinished work. Missing knowledge, "
-    "an unknown solution and system failure are valid escalation reasons. "
-    "A Continue/Correct blocked by unsettled execution commits and returns wait_user "
-    "instead of sending a Worker command; inspect the returned kind and present the "
-    "consultation rather than repeating the refused command. "
+    "provider-native thread. For system_reconciliation CAO owns diagnosis and safe continuation. "
+    "Continue/Correct uses ordinary exact-lane admission and requires inspect-first continuation. "
+    "An unsettled execution commits and returns wait_system, preserving unfinished Work and "
+    "unknown-effect fences under CAO ownership. The Dispatcher re-arms supervision only when "
+    "the recorded admission blocker clears. Report impact without asking recovery permission. "
+    "wait_user requires concrete requester input; on recovery name its requester_input_kind. "
+    "Fail cannot terminate unfinished work. Inspect the returned kind instead of repeating a denial. "
     "Where the current safe-boundary contract admits pause, "
     "record a reason and concrete resume_condition to suspend this Work under CAO ownership "
     "without sending a Worker instruction or closing the Worker. Both wait_user and pause "
@@ -753,7 +797,7 @@ CONVERSATION_BOUNDARY_DISPOSITION_TOOL = _tool(
                 "expected_generation": _integer(minimum=1),
                 "expected_purpose_version": _integer(minimum=0),
                 "kind": _string(
-                    enum=["continue", "correct", "wait_user", "pause", "accept", "cancel"]
+                    enum=["continue", "correct", "wait_user", "wait_system", "pause", "accept", "cancel"]
                 ),
                 "reason": _string(),
                 "instruction": _string(),
@@ -908,6 +952,9 @@ def _conversation_completion_claim_projection(
         "source": str(value.get("source", "worker_completion_claim")),
         "output_id": str(value.get("output_id", "")),
         "summary": sanitize_operator_text(value.get("summary")),
+        **({"decision_report": _conversation_task_projection(value["decision_report"]),
+            "report_checks": _conversation_task_projection(value.get("report_checks", {}))}
+           if isinstance(value.get("decision_report"), Mapping) else {}),
         "evidence": (_conversation_task_projection(evidence) if isinstance(evidence, list) else []),
         "artifacts": [
             _conversation_artifact_projection(item)
@@ -1381,7 +1428,10 @@ def _conversation_work_projection(value: Mapping[str, Any]) -> dict[str, Any]:
             {"id": str(item["id"]), "condition": sanitize_operator_text(item["condition"], limit=None, collapse_whitespace=False)}
             for item in value.get("review_criteria", [])
         ],
-        "supervision_guidance": PURPOSE_GUIDANCE,
+        "supervision_guidance": PURPOSE_GUIDANCE + " " + SUPERVISION_TRIGGER_GUIDANCE,
+        "latest_instruction_review": value.get("latest_instruction_review"),
+        "provider_response": public_response_evidence(value.get("provider_response")),
+        "purpose_continuations": value.get("purpose_continuations", []),
         "maturity": str(value.get("maturity", "")),
         "acceptance": [
             text
@@ -1448,6 +1498,22 @@ def _conversation_work_projection(value: Mapping[str, Any]) -> dict[str, Any]:
                 ),
             }
         execution_start = activity.get("execution_start") if isinstance(activity, Mapping) else None
+        if isinstance(activity, Mapping):
+            for field in ("provider_queue_acceptance", "provider_turn_start", "provider_start_watch"):
+                observation = activity.get(field)
+                if isinstance(observation, Mapping):
+                    result["current_attempt"]["activity"][field] = {
+                        key: observation.get(key) for key in ("observed_at", "message_id", "source")
+                    }
+                    if observation.get("activation_source") in {"turn_start_reply", "user_message_event"}:
+                        result["current_attempt"]["activity"][field]["activation_source"] = observation["activation_source"]
+            diagnosis = activity.get("provider_start_diagnosis")
+            if isinstance(diagnosis, Mapping):
+                result["current_attempt"]["activity"]["provider_start_diagnosis"] = {
+                    key: diagnosis.get(key) for key in
+                    ("observed_at", "message_id", "source", "state", "reason_code", "input_state",
+                     "other_pending_input", "history_complete", "watch_active", "probe_stage")
+                }
         if isinstance(execution_start, Mapping):
             result["current_attempt"]["activity"]["execution_start"] = {
                 key: execution_start.get(key) for key in ("reported_at", "message_id", "source")
@@ -1468,6 +1534,12 @@ def _conversation_work_projection(value: Mapping[str, Any]) -> dict[str, Any]:
                 "assignment_delivery_boundary": str(
                     assignment_delivery.get("assignment_delivery_boundary", "")
                 ),
+                "failure_code": assignment_delivery.get("failure_code"),
+                **{key: assignment_delivery[key] for key in (
+                    "mcp_startup_status", "mcp_startup_failure_reason",
+                    "mcp_startup_probe_status", "mcp_startup_probe_catalog",
+                )
+                   if key in assignment_delivery},
                 "safe_to_redeliver": bool(assignment_delivery.get("safe_to_redeliver")),
                 "safe_to_reconcile": bool(assignment_delivery.get("safe_to_reconcile")),
                 "recovery_action": (
@@ -1547,6 +1619,20 @@ def _conversation_work_projection(value: Mapping[str, Any]) -> dict[str, Any]:
                 "requested_at", "notification_state",
             )
         }
+        if escalation.get("requester_input_kind"):
+            result["requester_escalation"]["requester_input_kind"] = sanitize_operator_text(
+                escalation["requester_input_kind"]
+            )
+    recovery = value.get("system_recovery")
+    if isinstance(recovery, Mapping):
+        result["system_recovery"] = {
+            "owner": "cao", "requester_action_required": False,
+            **{field: sanitize_operator_text(recovery.get(field)) for field in (
+                "boundary_id", "message_id", "reason", "recovery_plan", "resume_condition",
+                "waiting_since", "notification_state",
+                "watch_kind", "diagnostic_state", "diagnostic_code", "admission_blocker",
+            )},
+        }
     context = _conversation_supervision_memory_projection(
         value.get("supervision_memory"), work_item_id=value.get("id")
     )
@@ -1557,12 +1643,17 @@ def _conversation_work_projection(value: Mapping[str, Any]) -> dict[str, Any]:
 
 _CONVERSATION_MESSAGE_PAYLOAD_KEYS = frozenset(
     {
+        "decision_report", "report_checks",
         "acceptance",
         "artifacts",
         "boundary_id",
         "boundary_kind",
         "evidence",
         "expected_generation",
+        "purpose_continuation_id",
+        "continuation_generation",
+        "purpose_version",
+        "worker_thread_id",
         "goal_packet_digest",
         "goal_version",
         "instruction",
@@ -1612,6 +1703,8 @@ def _conversation_message_projection(value: Mapping[str, Any]) -> dict[str, Any]
         if isinstance(payload, Mapping)
         else {}
     )
+    if isinstance(payload, Mapping) and payload.get("action") == "purpose_continuation":
+        safe_payload["action"] = "purpose_continuation"
     if isinstance(payload, Mapping) and payload.get("action") == "worker_output":
         safe_payload["action"] = "worker_output"
         output_id = _supervision_public_id(payload.get("output_id"))
@@ -1636,7 +1729,7 @@ def _conversation_message_projection(value: Mapping[str, Any]) -> dict[str, Any]
             {
                 key: sanitize_operator_text(str(payload.get(key) or ""))
                 for key in (
-                    "action", "source_boundary_id", "decision", "resume_condition",
+                    "action", "source_boundary_id", "decision", "resume_condition", "disposition",
                 )
             }
         )
@@ -1652,6 +1745,8 @@ def _conversation_message_projection(value: Mapping[str, Any]) -> dict[str, Any]
         "created_at": str(value.get("created_at", "")),
         "acknowledged": bool(value.get("acknowledged", False)),
         "delivery_state": str(value.get("delivery_state", "")),
+        **({"processing_instructions": value["processing_instructions"]}
+           if isinstance(value.get("processing_instructions"), str) else {}),
         **_conversation_recovery_projection(value),
     }
 
@@ -1663,6 +1758,7 @@ def _conversation_inbox_projection(value: Mapping[str, Any]) -> dict[str, Any]:
             _conversation_message_projection(item) for item in items if isinstance(item, Mapping)
         ],
         "next_cursor": value.get("next_cursor"),
+        "supervision_guidance": SUPERVISION_TRIGGER_GUIDANCE,
     }
 
 
@@ -1751,6 +1847,7 @@ def _conversation_managed_worker_projection(value: Mapping[str, Any]) -> dict[st
     }
     result["worker_thread_id"] = thread_id
     result["worker_purpose"] = _conversation_purpose_projection(value.get("worker_purpose"))
+    result["purpose_supervision"] = value.get("purpose_supervision", {"state": "none", "count": 0, "resume_at": None})
     result["supervision_guidance"] = PURPOSE_GUIDANCE
     purpose_status = value.get("purpose_status")
     if purpose_status == "invalid":
@@ -1868,6 +1965,43 @@ def _conversation_worker_thread_error(
     """Bound lifecycle failures without revealing hidden Worker identities."""
 
     reason_code = str((error.details or {}).get("reason_code") or "")
+    if action == "instruction" and reason_code in {
+        "instruction_review_reject", "instruction_review_needs_evidence",
+        "instruction_review_unavailable", "instruction_review_required",
+        "instruction_review_stale", "instruction_review_evidence_limit",
+        "instruction_review_evidence_missing", "instruction_review_attachment_invalid",
+        "instruction_review_source_integrity_invalid",
+    }:
+        from .instruction_review import public_review_assessment
+
+        public_details: dict[str, Any] = {"reason_code": reason_code, "retryable": False}
+        raw_details = error.details or {}
+        review_id = raw_details.get("review_id")
+        if isinstance(review_id, str) and re.fullmatch(r"irv_[0-9a-f]{32}", review_id):
+            public_details["review_id"] = review_id
+        assessment = public_review_assessment(raw_details.get("assessment"))
+        if assessment is not None:
+            public_details["assessment"] = assessment
+        failure_code = raw_details.get("failure_code")
+        if failure_code in {"requester_evidence_unavailable", "requester_evidence_changed",
+                            "review_timeout", "invalid_or_unavailable_review", "review_process_failed"}:
+            public_details["failure_code"] = failure_code
+        public_details["next_action"] = "correct_proposal_or_supply_missing_evidence"
+        return ControlPlaneError(error.code, "Independent review did not authorize this instruction; no instruction was sent",
+                                 error.status_code, public_details)
+    purpose_refusals = {
+        "worker_purpose_paused": (
+            "Worker purpose is paused; record requester-directed resumption before issuing another instruction"
+        ),
+        "worker_purpose_achieved": (
+            "Worker purpose is achieved; record a requester-directed new purpose before issuing another instruction"
+        ),
+    }
+    if action == "instruction" and reason_code in purpose_refusals:
+        return ControlPlaneError(
+            error.code, purpose_refusals[reason_code], error.status_code,
+            {"reason_code": reason_code, "retryable": False},
+        )
     safe_reason_codes = {
         "worker_purpose_unset",
         "worker_purpose_contract_required",
@@ -2094,9 +2228,12 @@ WORKER_TOOLS: dict[str, dict[str, Any]] = {
                                 description=(
                                     "An absolute local file/file URI, a bounded data URI, or "
                                     "workspace:<relative-path> for the exact managed Worker "
-                                    "Directory. The Control Plane resolves it through the "
+                                    "Directory. With a matching SHA-256 digest, the Control Plane "
+                                    "resolves it through the "
                                     "owner-private placement registry, verifies content, and "
                                     "replaces it with an opaque reference before persistence. "
+                                    "Omitting digest registers an unverified reference and "
+                                    "does not preserve source bytes. "
                                     "Network and unresolved schemes remain unverified and "
                                     "cannot satisfy completion_required."
                                 )
@@ -2105,10 +2242,12 @@ WORKER_TOOLS: dict[str, dict[str, Any]] = {
                             "digest": _string(
                                 pattern=r"^(?:sha256:)?[0-9a-f]{64}$",
                                 description=(
-                                    "Optional SHA-256 content digest. Both 64 hexadecimal "
+                                    "Optional for an unverified reference only. Supply a "
+                                    "matching SHA-256 to preserve verified content or satisfy "
+                                    "completion_required. Both 64 hexadecimal "
                                     "lowercase digits and sha256:<64 lowercase digits> are accepted "
-                                    "and stored canonically. A successful artifact report "
-                                    "registers content without sending a separate approval. "
+                                    "and stored canonically. An artifact report is a registration "
+                                    "acknowledgment, not an approval wait. "
                                     "Continue to a completion claim; that claim snapshots "
                                     "the verified artifact manifest and derives readiness."
                                 ),
@@ -2283,7 +2422,7 @@ CAO_TOOLS: dict[str, dict[str, Any]] = {
     "cao_dispose_boundary": _tool(
         "cao_dispose_boundary",
         "Apply exactly one generation-fenced disposition to an unresolved boundary. "
-        "Unfinished work must continue or escalate with wait_user; fail is not admitted. "
+        "Unfinished work must continue, retain technical recovery with wait_system, or request concrete input with wait_user; fail is not admitted. "
         "Pause records a CAO-owned reason and concrete resume condition without sending "
         "a Worker instruction. Wait_user and pause queue a requester-facing escalation "
         "notification in the same transaction. Retrieve targeted history only when needed; "
@@ -2304,6 +2443,7 @@ CAO_TOOLS: dict[str, dict[str, Any]] = {
                             "correct",
                             "retry",
                             "wait_user",
+                            "wait_system",
                             "pause",
                             "accept",
                             "cancel",
@@ -2457,6 +2597,7 @@ CAO_TOOLS: dict[str, dict[str, Any]] = {
     "cao_review": _tool(
         "cao_review",
         "Record the CAO's evidence review of a completion claim or provider-captured Worker output. "
+        "When accepting without a separate completion boundary, supply next_action to commit the next purpose state atomically. "
         "An OK review of automatic output requires scoped reading of every complete final output; "
         "capturing an answer alone never approves or completes the Work.",
         _object_schema(
@@ -2940,10 +3081,26 @@ CAO_TOOLS["cao_revise_task"] = {
 }
 CONVERSATION_BOUNDARY_DISPOSITION_TOOL["description"] += " " + PURPOSE_GUIDANCE
 
+_checkpoint_schema = ReviewInput.model_json_schema()
+for _field in ("next_action", "review_basis", "audit_reason", "audit_scopes"):
+    CAO_TOOLS["cao_review"]["inputSchema"]["properties"][_field] = _checkpoint_schema["properties"][_field]
+CAO_TOOLS["cao_review"]["inputSchema"].setdefault("$defs", {}).update(_checkpoint_schema.get("$defs", {}))
+CAO_TOOLS["cao_review"]["description"] += " " + REVIEW_GUIDANCE
+_report_schema = ReportInput.model_json_schema()
+WORKER_TOOLS["cao_report"]["inputSchema"]["properties"]["decision_report"] = _report_schema["properties"]["decision_report"]
+WORKER_TOOLS["cao_report"]["inputSchema"].setdefault("$defs", {}).update({
+    key: value for key, value in _report_schema.get("$defs", {}).items()
+    if key in {"WorkerDecisionReport", "WorkerVerification", "CriterionAssessment"}
+})
+WORKER_TOOLS["cao_report"]["description"] += " " + REPORT_GUIDANCE
+
+CAO_TOOLS["cao_record_purpose_next_action"] = CONVERSATION_PURPOSE_NEXT_ACTION_TOOL
+
 CONVERSATION_TOOL_NAMES = frozenset(
     {
         "cao_new_worker_thread",
         "cao_set_worker_purpose",
+        "cao_record_purpose_next_action",
         "cao_revise_task",
         "cao_instruct_worker_thread",
         "cao_finish_worker_thread",
@@ -2975,16 +3132,32 @@ CONVERSATION_TOOL_NAMES = frozenset(
 )
 
 _STATE_READ_GUIDANCE = (
-    " For attached CAO conversations, do not poll while waiting. Read each state "
-    "resource once per new native input, notification or committed relevant command; "
-    "only issued forward cursors continue pagination. A cao_state_polling_prohibited "
-    "result is non-retryable: end this turn and resume from the next notification."
+    " For attached conversations, use notifications rather than polling while waiting. "
+    "Bounded state reads may be repeated to recover a lost result or confirm a change. "
+    "A read does not authorize instructions or external effects."
 )
 for _state_read_tool in (
     COMMON_TOOLS["cao_get_inbox"], CAO_TOOLS["cao_get_work"],
     CAO_TOOLS["cao_query"], CONVERSATION_QUERY_TOOL, CONVERSATION_WORKER_LIST_TOOL,
 ):
     _state_read_tool["description"] += _STATE_READ_GUIDANCE
+
+CAO_TOOLS["cao_get_inbox"] = {
+    **COMMON_TOOLS["cao_get_inbox"],
+    "description": COMMON_TOOLS["cao_get_inbox"]["description"] + (
+        " Specify message_id from a notification to retrieve only that exact Message, "
+        "including its report or output references and full processing_instructions. "
+        "Read those instructions before acting; the lookup does not acknowledge or handle "
+        "the notification."
+    ),
+    "inputSchema": {
+        **COMMON_TOOLS["cao_get_inbox"]["inputSchema"],
+        "properties": {
+            **COMMON_TOOLS["cao_get_inbox"]["inputSchema"]["properties"],
+            "message_id": _string(),
+        },
+    },
+}
 
 CAO_START_TOOL = _tool(
     "cao_start",
@@ -3321,30 +3494,11 @@ class MCPServer:
     The wire surface is the stateless 2026-07-28 protocol.
     """
 
-    def __init__(self, service: ControlPlane, *, state_read_input_reader: Callable[[str], str | None] | None = None) -> None:
+    def __init__(self, service: ControlPlane) -> None:
         self.service = service
         self.settings = service.settings
-        self._state_reads = StateReadAdmission(service, state_read_input_reader or self._read_state_input)
         self._progress_claims: set[ProgressClaim] = set()
         self._progress_claims_lock = threading.Lock()
-
-    def _read_state_input(self, native_thread_id: str) -> str | None:
-        from .runtime import read_cao_state_read_input
-
-        def observe() -> str | None:
-            # Own this probe's loop without replacing an embedded host's idle
-            # loop. asyncio.run() clears the thread's current loop on exit.
-            with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
-                return runner.run(read_cao_state_read_input(self.settings, native_thread_id))
-
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return observe()
-        # The public MCP façade is synchronous and is also used by embedded
-        # async clients. Keep the owner-side RPC on its own loop in that case.
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(observe).result()
 
     @property
     def server_info(self) -> dict[str, Any]:
@@ -3609,8 +3763,6 @@ class MCPServer:
                     ),
                 )
             if method == "tools/call":
-                if authenticate_readiness_probe(actor, params, request_id):
-                    actor = {**actor, "_cao_authenticated_readiness_probe": True}
                 return self._handle_tool_call(
                     actor,
                     application_params,
@@ -3890,6 +4042,23 @@ class MCPServer:
 
         return _subscription_cancelled_notification(request_id, reason)
 
+    def record_disconnected_result(
+        self, actor: dict[str, Any], request: Mapping[str, Any], response: Mapping[str, Any] | None,
+    ) -> None:
+        params = request.get("params", {})
+        if response is None or request.get("method") != "tools/call" or not isinstance(params, Mapping):
+            return
+        name = params.get("name")
+        tool = CAO_TOOLS.get(str(name))
+        if tool is None or tool.get("annotations", {}).get("readOnlyHint") is True:
+            return
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            return
+        result = response.get("result", {}) if isinstance(response, Mapping) else {}
+        succeeded = bool("error" not in response and isinstance(result, Mapping) and not result.get("isError"))
+        self.service.record_disconnected_command_result(actor, operation=str(name), arguments=arguments, succeeded=succeeded)
+
     async def progress_messages(
         self,
         actor: dict[str, Any],
@@ -3911,13 +4080,50 @@ class MCPServer:
             if claim_error is not None:
                 yield claim_error
                 return
+        from .instruction_review import review_activity_observer
+        loop = asyncio.get_running_loop()
+        events: asyncio.Queue[str] = asyncio.Queue()
+        closed = threading.Event()
+        def changed(stage: str) -> None:
+            if not closed.is_set():
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(events.put_nowait, stage)
+        with review_activity_observer(changed):
+            task = asyncio.create_task(asyncio.to_thread(self.handle_modern, actor, request))
+        event: asyncio.Task[str] | None = None
+        count = 0
+        result_delivered = False
         try:
-            yield self.progress_notification(token, progress=0, total=1, message="started")
-            response = await asyncio.to_thread(self.handle_modern, actor, request)
-            yield self.progress_notification(token, progress=1, total=1, message="finished")
+            yield self.progress_notification(token, progress=0, message="started")
+            while not task.done():
+                event = asyncio.create_task(events.get())
+                done, _ = await asyncio.wait({task, event}, return_when=asyncio.FIRST_COMPLETED)
+                if event in done:
+                    count += 1
+                    yield self.progress_notification(token, progress=count, message=event.result())
+                else:
+                    event.cancel()
+                    await asyncio.gather(event, return_exceptions=True)
+            response = await task
+            yield self.progress_notification(token, progress=count + 1, total=count + 1, message="finished")
             if response is not None:
                 yield response
+            result_delivered = True
         finally:
+            closed.set()
+            if event is not None and not event.done():
+                event.cancel()
+                await asyncio.gather(event, return_exceptions=True)
+            if not result_delivered:
+                # The canonical command continues; its exact receipt, not a
+                # duplicate request, restores the original conversation.
+                def completed(value: asyncio.Task[Any]) -> None:
+                    with contextlib.suppress(Exception):
+                        self.record_disconnected_result(actor, request, value.result())
+                if task.done():
+                    completed(task)
+                else:
+                    task.add_done_callback(completed)
             self.release_progress_token(claim)
 
     def subscribable_resource_uris(self, actor: Mapping[str, Any]) -> tuple[str, ...]:
@@ -4030,18 +4236,17 @@ class MCPServer:
             return
 
         heartbeat = heartbeat_seconds or self.settings.sse_heartbeat_seconds
-        poll = max(0.01, min(poll_seconds, heartbeat))
+        del poll_seconds
         last_heartbeat = asyncio.get_running_loop().time()
         cancelled = threading.Event()
         try:
             while True:
+                before = commit_generation
+                remaining = max(0.0, heartbeat - (asyncio.get_running_loop().time() - last_heartbeat))
                 commit_generation = await asyncio.to_thread(
-                    self.service.db.wait_for_commit,
-                    commit_generation,
-                    poll,
-                    cancelled=cancelled,
+                    self.service.db.wait_for_commit, commit_generation, remaining, cancelled=cancelled,
                 )
-                for uri in resources:
+                for uri in resources if commit_generation != before else ():
                     revision = self._resource_revision(actor, uri)
                     if revision == revisions[uri]:
                         continue
@@ -4070,23 +4275,6 @@ class MCPServer:
         tool = next((tool for tool in self.tools_for(actor) if tool["name"] == name), None)
         if tool is None:
             raise ValidationError("tool is not available to this principal", tool=name)
-        schema = tool.get("inputSchema")
-        if not isinstance(schema, Mapping):
-            raise ValidationError("tool input schema is unavailable", tool=name)
-        _validate_tool_input_schema(schema, arguments)
-        reservation = self._state_reads.reserve(actor, name, arguments)
-        try:
-            result = self._call_tool(actor, name, arguments)
-        except Exception:
-            self._state_reads.finish(reservation, failed=True)
-            raise
-        self._state_reads.finish(reservation, result)
-        return result
-
-    def _call_tool(self, actor: dict[str, Any], name: str, arguments: dict[str, Any]) -> Any:
-        tool = next((tool for tool in self.tools_for(actor) if tool["name"] == name), None)
-        if tool is None:
-            raise ValidationError("tool is not available to this principal", tool=name)
         values = dict(arguments)
         schema = tool.get("inputSchema")
         if not isinstance(schema, Mapping):
@@ -4104,6 +4292,7 @@ class MCPServer:
                 limit=int(values.get("limit", 100)),
                 attempt_id=values.get("attempt_id") or None,
                 include_acknowledged=bool(values.get("include_acknowledged", False)),
+                message_id=values.get("message_id") or None,
             )
             return _conversation_inbox_projection(result) if task_scoped_cao else result
         if name == "cao_ack":
@@ -4119,7 +4308,15 @@ class MCPServer:
             return _conversation_task_projection(result) if task_scoped_cao else result
         if name == "cao_report":
             attempt_id = str(values.pop("attempt_id"))
-            return self.service.report(actor, attempt_id, ReportInput.model_validate(values))
+            result = self.service.report(actor, attempt_id, ReportInput.model_validate(values))
+            # A report is a mutation acknowledgment. Full Work history can hide
+            # the new receipt behind an older or not-yet-finalized manifest.
+            return {
+                "report_receipt": result.get("report_receipt"),
+                **{key: result[key] for key in (
+                    "id", "state", "goal_version", "generation", "attention_owner", "current_attempt", "open_boundaries",
+                )},
+            }
         if name == "cao_runtime_heartbeat":
             runtime_id = str(values.pop("runtime_id"))
             return self.service.heartbeat_runtime(
@@ -4188,6 +4385,10 @@ class MCPServer:
                 "worker_purpose": _conversation_purpose_projection(result["worker_purpose"]),
                 "supervision_guidance": PURPOSE_GUIDANCE,
             }
+        if name == "cao_record_purpose_next_action":
+            return self.service.record_purpose_next_action(
+                actor, PurposeNextActionInput.model_validate(values)
+            )
         if name == "cao_instruct_worker_thread":
             if "requester_id" in values:
                 raise ValidationError(
@@ -5236,11 +5437,6 @@ async def _verify_attached_cao_start(
         raise CAOStartStopped("attachment_catalog_refresh_required", retryable=False)
 
     workers_request = _attached_start_probe_request(request)
-    workers_params = workers_request["params"]
-    workers_params["_meta"] = {
-        **workers_params.get("_meta", {}),
-        READINESS_PROOF_META_KEY: readiness_proof(hashlib.sha256(bearer.encode()).hexdigest(), workers_request["id"]),
-    }
     modern = is_modern_request(workers_request)
     workers_http_response = await _post_proxy_request(
         client,
@@ -6279,6 +6475,7 @@ async def _post_proxy_progress_request(
             modern=True,
         ),
         json=canonical_request,
+        timeout=httpx.Timeout(client.timeout.connect, read=None, write=client.timeout.write, pool=client.timeout.pool),
     ) as response:
         if not response.headers.get("content-type", "").lower().startswith("text/event-stream"):
             await response.aread()
@@ -6347,6 +6544,7 @@ async def _post_proxy_request(
             modern=True,
         ),
         json=canonical_request,
+        timeout=httpx.Timeout(client.timeout.connect, read=None, write=client.timeout.write, pool=client.timeout.pool),
     )
 
 

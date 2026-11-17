@@ -31,8 +31,13 @@ active thread. It requires the thread, bounded `instruction`, current
 `expected_purpose_version`, and idempotency key. Title is optional and maturity defaults
 to the explicitly stored `unset`; `defined` alone requires an acceptance
 condition. The instruction is durably queued even when its Worker connection
-is unavailable or the Worker already has unsettled Work. Every call creates an
-independent Work record; it never ends or replaces the Worker. The current CAO
+is unavailable or the Worker already has unsettled Work. Every call creates a
+separate Work record; it never ends or replaces the Worker. Record independence
+does not establish that the outcomes are independent or should share a Worker.
+CAO first makes the [allocation judgment](cao-operator-runbook.md#choose-worker-allocation-before-new-or-instruction)
+from actual dependencies and resources, including whether shared-asset conflicts
+favor the same Worker or separate Workers with ordering or isolation. Queue
+admission never selects that policy or imposes a task-count limit. The current CAO
 attachment becomes that Work's report/review destination. New and instruction
 remain separate commands so neither lifecycle nor task state is inferred.
 
@@ -59,6 +64,44 @@ approval on each choice; scope, authority, resource and unresolved blocker
 boundaries still require supervision. A task is often a checkpoint toward the
 purpose. Accepting a satisfied task does not complete or revise the purpose;
 delegate the next outcome without moving the current acceptance conditions.
+
+### Writing a stable purpose
+
+CAO writes the purpose as the state the requester needs to achieve, together with
+the background that explains why that state matters. Keep it within the entrusted
+responsibility and make achievement recognizable. A broader slogan loses the
+decision boundary; a list of immediate tasks loses the reason for doing them.
+An issue's title, WHAT or WHY can supply evidence, but does not determine the right
+purpose by itself. Planning vocabularies and analogies are optional aids.
+
+Use the existing `purpose` text for background, need and desired state. Use the
+structured contract below for observable conditions and boundaries. The current
+task explains which unmet condition it addresses and what evidence it should
+produce. Methods, intermediate deliverables, approved message payloads and
+unrelated operating rules belong in their task or authority context, not in the
+business-direction statement. No extra field, hierarchy, purpose-quality AI or
+approval step is required.
+
+For example, a purpose can be that users can recover saved work after an
+interruption without losing confirmed changes, because interruptions currently
+prevent reliable use. Reproducing the loss, comparing recovery methods and
+verifying a repair are possible tasks serving that same state. A failed method
+changes the next investigation, not the desired state.
+
+Before revising purpose, distinguish a real change in the entrusted need or
+desired state from progress, a new method, a checkpoint or fulfillment of an
+existing approval condition. Retain the purpose in the latter cases. A correction
+to sealed scope or authority still uses the explicit versioned contract; preserve
+unchanged background and outcome, and identify the exact correction. Do not
+rewrite business direction to accommodate a rejected instruction. A genuinely
+new requester responsibility may justify a new direction; related work is not
+permission to enlarge the existing purpose.
+
+When a task meets an unexpected obstacle, CAO and Worker should be able to explain
+the same chain: the required state, the condition still unmet, the observed
+evidence and uncertainty, the check or condition needed next, and why the proposed
+authorized action can close that gap. CAO reviews that reasoning rather than
+replacing purpose with the obstacle or insisting on a method that no longer works.
 
 ### Fixed purpose contract and task review
 
@@ -136,7 +179,159 @@ purpose means for that task. The public `instruction` field and
 `cao_revise_task` name describe the task contract. `objective` and
 `cao_revise_goal` remain compatible names for that same task data; they do not
 control Worker business purpose. No additional task/execution hierarchy,
-purpose scheduler or automatic purpose-completion state is introduced.
+automatic business-purpose planner is introduced.
+
+### Continuing after an accepted checkpoint
+
+For a registered Worker purpose, checkpoint acceptance requires `next_action`
+in the same command. It commits one of: a distinct sealed `next_instruction`, an
+exact existing successor Work, verified purpose achievement, a concrete timed or
+requester-input wait, or a requester-directed pause. The accepted checkpoint,
+new Work when requested, and purpose decision commit together. Failure in any
+part rolls back all of them. Replaying the same command returns the same result.
+There is no intermediate Next notification for a decision already made in that
+transaction. Requester acceptance remains separate from both checkpoint review
+and purpose achievement.
+
+`cao_dispose_boundary(kind=accept)` carries this decision when a completion
+Boundary exists. An OK `cao_review` carries it when that review directly accepts
+the Work without a separate Boundary. A review recorded ahead of Boundary
+acceptance does not prematurely assign a successor.
+
+Pre-upgrade accepted checkpoints retain their durable purpose-continuation
+obligations in the existing event ledger. `cao_get_work.purpose_continuations`
+exposes their identity, generation, purpose version and next action. The existing
+Dispatcher delivers those unresolved handoffs to the originating conversation;
+it never replays their accepted Work. An accepted pre-upgrade checkpoint with
+no continuation record is restored once when its purpose has neither active
+Work nor a pending decision. A recorded achievement, explicit purpose pause or
+closed originating attachment prevents that recovery. Missing fixed legacy
+contract fields are completed from existing requester direction by CAO; they
+never justify asking for routine recovery approval.
+
+An older-purpose checkpoint is recovered for a revised purpose only in the
+conversation that defined that revision. A checkpoint from another conversation
+remains eligible when its frozen assignment already carries the current purpose
+version. Recovery does not enlist a former conversation to observe a new direction.
+
+Within the existing purpose, authority and budget, CAO delegates the next bounded
+outcome without repeated requester approval or an invented iteration/time cap.
+Passing `purpose_continuation_id` and `expected_continuation_generation` to
+`cao_instruct_worker_thread` commits that distinct Work and the continuation
+decision atomically. If a suitable successor already committed, link its exact
+Work with `cao_record_purpose_next_action(kind=continue)` instead of duplicating it.
+The Control Plane checks its current sealed purpose, attachment and unsettled
+execution; an unrelated or already accepted Work cannot discharge the obligation.
+An explicit handoff may link another Worker only when its current sealed purpose
+and complete fixed contract preserve the source purpose. Ordinary allocation
+remains CAO's judgment.
+
+Assignment transfers supervision to the exact successor Work; it does not prove
+purpose achievement. If that successor ends before an accepted checkpoint, the
+same continuation advances to a new pending generation and wakes CAO. Its unknown
+Delivery/effect evidence stays untouched, and a closed Worker is never revived.
+An accepted successor already owns its own continuation and is not duplicated.
+
+The same decision tool admits `achieved` only with evidence for every fixed
+purpose criterion, `wait_until` with an explicit future observation time and
+condition, or `wait_user` with the exact missing requester-owned input and its
+kind. A scheduled observation re-arms the same obligation once when due. Technical
+recovery remains CAO-owned. These records do not revise purpose, accept for the
+requester, Finish a Worker or authorize external effects.
+CAO must ground observation and requester-input waits in that concrete missing
+condition. A CAO-only decision does not invoke independent alignment review.
+
+`pause` and `resume` record observed requester direction for the business purpose.
+CAO records the observed direction; ordinary continuation never requires a
+fresh requester grant. A purpose pause applies to every pending continuation of
+that exact Worker purpose version and fences new assignments until an explicit
+resumption or requester-directed purpose revision. It does not itself cancel an
+already executing Work: its separately authorized lifecycle remains explicit.
+CAO judges `achieved` against the fixed purpose completion boundary; satisfying
+the current task alone cannot end an ongoing responsibility.
+Verified achievement applies to every pending checkpoint of that exact Worker
+purpose version and fences further assignments until a requester-directed new
+purpose is defined. Other Worker purposes and existing unknown outcomes remain
+independent.
+
+A wake cannot be marked handled while its exact continuation generation is still
+pending. Missing transport is re-armed; accepted or unknown deliveries are never
+blindly replayed. A proven incomplete native turn uses the exact persisted
+terminal-turn recovery path. Recovery records the genuine requester-input,
+review-policy and executable-release digests for that exact continuation generation.
+A completed turn with the same condition cannot recursively create another wake.
+The unresolved purpose remains visible with Control Plane technical recovery
+ownership. A genuine native head change renews the authenticated source read outside
+database transactions; a restored/changed source or corrected release admits the
+next wake once. The latest verified source observation is shared by reconciliation
+and recovery so an older review snapshot cannot flip the condition back. Delivery IDs, assistant status, timestamps and repeated
+rejected proposals are not changed conditions. Unknown handoffs are never replayed. Worker Finish/Delete fences that Worker's future
+authority while retaining an unmet purpose's next decision for CAO. CAO chooses a
+purpose-preserving handoff or records the requester's explicit purpose pause;
+Worker Resume alone never resumes a paused purpose. Conversation Close fences its
+attachment's wakes without claiming purpose achievement. Purpose revision
+supersedes old pending decisions and carries unresolved responsibility to the
+new purpose version. Historical accepted tasks are not replayed
+during upgrade.
+
+Native requester observation retains every in-turn correction through full native
+items and, for an oversized turn, complete item pagination rather than display
+summaries. Automatic input is identified by its exact recorded Delivery identity
+(or exact legacy frame), not by a text prefix a requester could quote. This
+observation is separate from instruction alignment and is not a reading list for
+its checker.
+
+Model progress renews only the exact validated decision lease. Starting an active
+alignment review extends that lease before the model call; completion restores
+the original idle window. A superseded or expired lease cannot be revived.
+
+### Independent review before instruction commit
+
+The independent Codex reviewer checks one responsibility: whether the effective
+Worker instruction aligns with CAO's registered purpose and structured contract.
+It receives only that purpose and the task/message fields to be sent. It checks
+outcome, scope, fixed criteria, completion boundary and authority against the
+purpose as given. A bounded prerequisite need not complete the whole purpose.
+Read the retained task and its corrective message together. A correction may
+inspect existing execution records, clarify provenance or repair a report to
+resolve one unmet acceptance condition without repeating completed execution.
+This does not replace the purpose with documentation or waive the remaining
+criteria. A correction label grants no exemption: instructions that cancel
+required work, claim purpose completion from paperwork or exceed authority still
+contradict the purpose.
+
+CAO owns defining and updating precise purposes, judging the user's actual intent,
+permissions and approved content, reviewing Worker evidence, and choosing next
+actions. Purpose registration/revision and a CAO-only checkpoint/next-action
+decision do not invoke another AI. An actual next Worker instruction still passes
+alignment review. The checker does not audit original requester conversations,
+approval records, previous results or artifacts, and does not judge purpose quality
+or invent new criteria. It has no evidence MCP, search, shell, browser or other tools.
+
+The normal command prepares its effective instruction and rolls back before the
+model call; no SQLite writer lock is held while waiting. A private approval admits
+only the same purpose and effective instruction on re-execution. Purpose version,
+attachment, current execution, replay and unknown-effect fences remain kernel
+responsibilities. An unchanged idempotent replay returns its committed result
+without another model call or delivery. A review never grants external authority.
+
+Use `tools/evaluate_instruction_review.py` with fixed synthetic purpose/instruction
+cases to record verdicts, latency and token usage. These evaluations create no
+Worker and grant no external effect authority.
+
+The reviewer uses the configured Codex model and owner's selected effort in a
+fresh isolated session. It returns only a verdict and concise reason. New records
+have scope `purpose_alignment` and one alignment assessment. Historical five-check
+reviews retain their original content and meaning; they are not reinterpreted as
+new business judgments. Model, elapsed time, safe diagnostics and usage remain
+available. Provider failure blocks only this proposed instruction, preserving
+listing, New, Finish/Delete and unrelated lifecycle operations.
+
+Native conversation observation is a separate capability. Its v4 coverage contract
+preserves a final assistant proposal completed after a notification-only checkpoint
+when a newer requester input refers to it. It forces one fresh source capture
+instead of inheriting an older checkpoint that may already omit that proposal.
+New alignment checks never invoke that observation or reread conversation archives.
 
 Recording later Work while the first Assignment starts preserves the current
 connection and enrollment; it never retires an in-flight bootstrap. Worker
@@ -253,6 +448,10 @@ Likewise, a Work awaiting requester acceptance normally has a completed latest
 Attempt and no mutable Attempt to cancel. Cleanup validates the Work/Attempt
 state pair instead of requiring one nonterminal Attempt for every unsettled
 Work.
+Each Attempt is audited against its own immutable Goal revision. A legitimate
+older revision is retained as normal history, including after task replacement;
+it is not an anomaly merely because the Work now uses a newer revision. A missing
+revision or mismatched historical packet digest remains an anomaly.
 
 Schema migration creates an active thread for each existing enabled managed
 specification, even when its historical runtime is missing or its enrollment

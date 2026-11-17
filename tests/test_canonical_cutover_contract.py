@@ -101,6 +101,6 @@ def test_historical_removed_recovery_value_is_inert_evidence() -> None:
         }
     )
 
-    assert "non-executable system recovery Boundary requires a CAO disposition" in rendered
+    assert "system recovery Boundary requires CAO-owned reconciliation" in rendered
     assert "same logical Worker thread to a fresh fenced epoch" not in rendered
     assert "same provider-native Worker thread" not in rendered

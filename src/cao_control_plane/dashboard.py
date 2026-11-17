@@ -19,9 +19,10 @@ from typing import Any
 from .canonical import canonical_json as _canonical_json
 from .canonical import canonical_sha256 as _digest
 from .dashboard_history import full_operator_text, history_reference, work_exchanges
-from .dashboard_status import ATTENTION_REASONS, CAO_SUPERVISION_STATES
+from .dashboard_status import ATTENTION_REASONS, CAO_SUPERVISION_STATES, CURRENT_WORK_STATES
+from .dashboard_status import is_successful_completion as _is_successful_completion_fields
 from .projection import (
-    build_projection,
+    build_operator_snapshot,
     project_work_items_from_connection,
     sanitize_operator_text,
 )
@@ -198,12 +199,12 @@ class DashboardReadModel:
         self.service = service
 
     def snapshot(self) -> dict[str, Any]:
-        projection = build_projection(self.service.db)
-        authority = projection.snapshot["authority"]
-        operator = build_operator_view(projection.snapshot)
+        snapshot, watermark = build_operator_snapshot(self.service.db)
+        authority = snapshot["authority"]
+        operator = build_operator_view(snapshot)
         cursor = DashboardCursor(
             authority_generation=int(authority["generation"]),
-            sequence=int(projection.watermark["event_sequence"]),
+            sequence=int(watermark["event_sequence"]),
         ).encode()
         payload = {
             "format": DASHBOARD_FORMAT,
@@ -216,7 +217,7 @@ class DashboardReadModel:
             # deliberately starts from the canonical projection rather than
             # database tables, event payloads, or service query methods.
             "operator": operator,
-            "projection": _dashboard_projection(projection.as_dict(), operator=operator),
+            "projection": _dashboard_projection(snapshot, operator=operator),
         }
         return {**payload, "snapshot_digest": _digest(payload)}
 
@@ -511,9 +512,12 @@ def build_operator_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(worker_id, str) or worker_id not in labels:
             continue
         work_index += 1
+        display_index = raw.get("operator_display_index")
+        if type(display_index) is not int or display_index < 1:
+            display_index = work_index
         item = _work_item_view(
             raw,
-            display_label=f"Work item {work_index}",
+            display_label=f"Work item {display_index}",
             worker_label=labels[worker_id],
         )
         if not scoped_contract:
@@ -711,6 +715,7 @@ def _work_item_view(
         "attention_owner": attention_owner,
         "supervision_pause": _supervision_pause_view(raw.get("supervision_pause")),
         "requester_escalation": _requester_escalation_view(raw.get("requester_escalation")),
+        "system_recovery": _system_recovery_view(raw.get("system_recovery")),
         "next_boundary_summary": next_boundary,
         "pending_supervisor_boundary": boundaries > 0,
         "recovery_action": recovery_action,
@@ -803,6 +808,23 @@ def _work_item_view(
     }
 
 
+def _system_recovery_view(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or value.get("owner") != "cao":
+        return None
+    return {
+        "owner": "cao", "requester_action_required": False,
+        **{field: sanitize_operator_text(value.get(field)) for field in (
+            "reason", "recovery_plan", "resume_condition",
+        )},
+        "waiting_since": _timestamp(value.get("waiting_since")),
+        "notification_state": _enum(
+            value.get("notification_state"), _RECOVERY_NOTIFICATION_STATES | {"unavailable"}
+        ),
+        "watch_kind": _enum(value.get("watch_kind"), frozenset({"runtime_admission", "runtime_diagnostics"})),
+        "diagnostic_state": _enum(value.get("diagnostic_state"), frozenset({"ready", "blocked", "unavailable", "pending"})),
+    }
+
+
 def _requester_escalation_view(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
@@ -845,6 +867,14 @@ def _worker_view(
     return {
         "worker_label": worker_label,
         "purpose_status": raw.get("purpose_status", "unset"),
+        "purpose_supervision_state": (
+            raw["purpose_supervision"].get("state")
+            if isinstance(raw.get("purpose_supervision"), Mapping) else "none"
+        ),
+        "purpose_resume_at": (
+            _timestamp(raw["purpose_supervision"].get("resume_at"))
+            if isinstance(raw.get("purpose_supervision"), Mapping) else None
+        ),
         "purpose_text": full_operator_text(
             purpose_display_text(raw.get("worker_purpose"))
             if isinstance(raw.get("worker_purpose"), Mapping)
@@ -880,6 +910,9 @@ def _worker_attention_reason(
 ) -> str | None:
     """Return one server-owned, bounded reason for an actionable Worker card."""
 
+    purpose = raw.get("purpose_supervision")
+    if isinstance(purpose, Mapping) and purpose.get("state") in {"pending", "invalid"}:
+        return "cao-action-required"
     if any(
         item.get("state") in {"waiting_user", "user_needed"}
         or item.get("attempt_state") == "input_required"
@@ -949,17 +982,7 @@ def _is_current_work(item: Mapping[str, Any]) -> bool:
     return (
         not _is_supervisor_settled_completion(item)
         and item.get("closure_state") != "closed"
-        and item.get("state")
-        in {
-            "open",
-            "active",
-            "suspended",
-            "waiting_supervisor",
-            "waiting_review",
-            "waiting_user",
-            "user_needed",
-            "completed",
-        }
+        and item.get("state") in CURRENT_WORK_STATES
     )
 
 
@@ -983,28 +1006,17 @@ def _is_supervisor_settled_completion(item: Mapping[str, Any]) -> bool:
     )
 
 
-def _is_successful_completion_fields(
-    *,
-    state: object,
-    attempt_state: object,
-    latest_cao_review: object,
-    pending_supervisor_boundary: bool,
-    recovery_action: object,
-) -> bool:
-    return bool(
-        state in {"waiting_user", "completed"}
-        and attempt_state == "completed"
-        and latest_cao_review == "ok"
-        and not pending_supervisor_boundary
-        and recovery_action is None
-    )
-
-
 def _worker_category(
     raw: Mapping[str, Any],
     current: list[tuple[Mapping[str, Any], dict[str, Any]]],
 ) -> str:
     public_work = [item for _source, item in current]
+    purpose = raw.get("purpose_supervision")
+    if isinstance(purpose, Mapping):
+        if purpose.get("state") == "pending":
+            return "cao_processing"
+        if purpose.get("state") == "invalid":
+            return "stopped_or_failed"
     connection = raw.get("runner_connection_state")
     enrollment = raw.get("enrollment_state")
     if any(
@@ -1079,42 +1091,35 @@ def _attention_worker_sort_key(
 
 
 def _dashboard_projection(
-    projection: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
     *,
     operator: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Keep production-scoped integrity evidence without internal locators."""
+    """Describe visibility without claiming an unperformed integrity audit."""
 
-    snapshot = projection.get("snapshot", {})
-    values = snapshot if isinstance(snapshot, Mapping) else {}
-    violations = projection.get("violations", [])
-    safe_violations = [
-        item
-        for item in violations
-        if isinstance(item, Mapping)
-        and item.get("subject_type") in {"database", "control_authority"}
-    ]
+    authority = snapshot.get("authority", {})
+    authority_valid = isinstance(authority, Mapping) and authority.get("mode") == "canonical"
     counts = operator.get("counts", {})
     operator_counts = counts if isinstance(counts, Mapping) else {}
     return {
         "format": "cao-control-plane-dashboard-projection/v1",
-        "healthy": not safe_violations,
+        "healthy": None if authority_valid else False,
+        "integrity_check": "not-performed",
         "snapshot": {
             # Submitted intents do not yet carry an operator scope.  Failing
             # closed avoids folding acceptance/system traffic into a human
             # count until an attributable Work exists.
             "pending_intents": 0,
             "work_item_count": _nonnegative_int(operator_counts.get("current_work_items")),
-            "runtime_delivery": _runtime_delivery(values),
+            "runtime_delivery": _runtime_delivery(snapshot),
         },
         "violations": [
             {
-                "code": _safe_label(item.get("code")),
-                "subject_type": _safe_label(item.get("subject_type")),
-                "count": _nonnegative_int(item.get("count")),
+                "code": "authority.mode_invalid",
+                "subject_type": "control_authority",
+                "count": 1,
             }
-            for item in safe_violations
-        ],
+        ] if not authority_valid else [],
     }
 
 
