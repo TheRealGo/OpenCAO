@@ -198,11 +198,16 @@ def test_augment_creates_a_directive_without_rewriting_the_goal(system):
         evidence="base assignment incorporated before its augment",
     )
     messages = service.get_inbox(system["worker"], include_acknowledged=True)["items"]
-    assert any(
-        message["payload"].get("directive_id") == result["directive"]["id"]
-        and message["payload"].get("instruction") == "Include edge-case evidence"
-        for message in messages
+    instruction = next(
+        message for message in messages
+        if message["payload"].get("instruction") == "Include edge-case evidence"
     )
+    assert "directive_id" not in instruction["payload"]
+    persisted = service.db.fetchone(
+        "SELECT json_extract(payload_json, '$.directive_id') AS directive_id "
+        "FROM messages WHERE id = ?", (instruction["id"],)
+    )
+    assert persisted["directive_id"] == result["directive"]["id"]
 
 
 def test_independent_interrupt_and_replace_have_distinct_effects(system):
