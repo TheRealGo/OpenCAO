@@ -100,9 +100,10 @@ def test_documented_local_launcher_serves_authenticated_dashboard_and_stops_both
                 while True:
                     assert process.poll() is None, "local launcher exited"
                     try:
-                        ready = client.get(f"http://127.0.0.1:{cp_port}/ready")
+                        # Server startup is independent of an installed native Desktop host.
+                        health = client.get(f"http://127.0.0.1:{cp_port}/health")
                         page = client.get(edge + "/dashboard/")
-                        if ready.status_code == page.status_code == 200:
+                        if health.status_code == page.status_code == 200:
                             break
                     except httpx.HTTPError:
                         pass

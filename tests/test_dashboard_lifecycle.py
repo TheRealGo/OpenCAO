@@ -2836,7 +2836,8 @@ def test_codex_host_refresh_replaces_one_exact_stale_desktop_generation_then_rel
     old_socket_identity = (socket_path.stat().st_dev, socket_path.stat().st_ino)
     if socket_state != "present":
         old_listener.close()
-        socket_path.unlink()
+        # Retain the old inode so Linux cannot reuse it for the replacement.
+        socket_path.replace(retired_socket_path)
         if socket_state == "dangling":
             socket_path.symlink_to(control / "missing-target.sock")
 

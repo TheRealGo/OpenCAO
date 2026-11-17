@@ -548,6 +548,7 @@ def test_requester_source_restores_a_missing_desktop_connection_through_read_onl
     async def create(*_args, **_kwargs):
         return Process()
 
+    monkeypatch.setattr('cao_control_plane.runtime._default_codex_app_server_command', lambda: ['codex', 'app-server'])
     monkeypatch.setattr('cao_control_plane.runtime._JsonRpcDesktopSocket.connect', disconnected)
     monkeypatch.setattr('cao_control_plane.runtime.asyncio.create_subprocess_exec', create)
     monkeypatch.setattr('cao_control_plane.runtime._JsonRpcProcess', RPC)
