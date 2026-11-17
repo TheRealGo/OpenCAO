@@ -60,14 +60,14 @@ class FilesystemEvents:
     def _refresh(self) -> None:
         # Parent subscriptions admit WAL creation and atomic file replacement.
         needed = {path.parent for path in self.targets}
-        if self._queue is not None:
+        if sys.platform == "darwin" and self._queue is not None:
             needed |= {path for path in self.targets if path.exists()}
         for identity, path in list(self.watches.items()):
             if path not in needed or (self._queue is not None and not path.exists()):
                 self._remove(identity)
         existing = set(self.watches.values())
         for path in needed - existing:
-            if self._queue is not None:
+            if sys.platform == "darwin" and self._queue is not None:
                 identity = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
                 self._queue.control([select.kevent(
                     identity, filter=select.KQ_FILTER_VNODE,
@@ -86,7 +86,7 @@ class FilesystemEvents:
 
     def _remove(self, identity: int) -> None:
         self.watches.pop(identity, None)
-        if self._queue is not None:
+        if sys.platform == "darwin" and self._queue is not None:
             with suppress(OSError):
                 self._queue.control([select.kevent(identity, filter=select.KQ_FILTER_VNODE, flags=select.KQ_EV_DELETE)], 0, 0)
             os.close(identity)
@@ -103,7 +103,7 @@ class FilesystemEvents:
 
     def _drain(self) -> None:
         touched: set[Path] = set()
-        if self._queue is not None:
+        if sys.platform == "darwin" and self._queue is not None:
             for event in self._queue.control(None, max(1, len(self.watches)), 0):
                 path = self.watches.get(event.ident)
                 if path is not None:
@@ -152,7 +152,7 @@ class FilesystemEvents:
         self.loop.remove_reader(self.descriptor)
         for identity in list(self.watches):
             self._remove(identity)
-        if self._queue is not None:
+        if sys.platform == "darwin" and self._queue is not None:
             self._queue.close()
         else:
             os.close(self.descriptor)
