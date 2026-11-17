@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+import stat
 import subprocess
 import sys
 import zipfile
@@ -150,7 +151,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.archive:
         with zipfile.ZipFile(args.archive, "x", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, data in payloads.items():
-                archive.writestr(f"OpenCAO/{name}", data)
+                entry = zipfile.ZipInfo(f"OpenCAO/{name}")
+                entry.create_system = 3
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                entry.external_attr = (stat.S_IFREG | stat.S_IMODE((ROOT / name).stat().st_mode)) << 16
+                archive.writestr(entry, data)
             archive.writestr("OpenCAO/PUBLICATION-MANIFEST.json", json.dumps(manifest, indent=2) + "\n")
     print(
         f"Publication source check passed: {len(payloads)} files; no runtime or Git data included."
